@@ -32,7 +32,8 @@ impl Operators {
         if names.is_empty() || names.len() > 32 { return Err(fail("expected between 1 and 32 operators")); }
         let mut entries = Vec::<(String, [u8; 32], String)>::new();
         for (name, fields) in names {
-            let role = fields.get("role").filter(|role| matches!(role.as_str(), "proposer" | "reviewer" | "observer" | "worker" | "verifier" | "reconciler" | "curator"))
+            let role = fields.get("role").filter(|role| !role.is_empty() && role.len() <= 80
+                && role.bytes().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c)))
                 .ok_or_else(|| fail("invalid operator role"))?;
             let pin = fields.get("basicSha256").ok_or_else(|| fail("missing operator pin"))?;
             let mut digest = [0; 32];

@@ -2,9 +2,13 @@
 use crate::{Result, fail, rel::Facts};
 use std::path::{Path, PathBuf};
 
-pub enum Launch {
-    Image { image: PathBuf, pin: String, store: PathBuf, port: u16, attachment_root: Option<PathBuf>, operators: Option<PathBuf> },
-    Workgarden { root: PathBuf, journal: PathBuf, port: u16 },
+pub struct Launch {
+    pub image: PathBuf,
+    pub pin: String,
+    pub store: PathBuf,
+    pub port: u16,
+    pub attachment_root: Option<PathBuf>,
+    pub operators: Option<PathBuf>,
 }
 
 impl Launch {
@@ -16,15 +20,12 @@ impl Launch {
         if field("version")? != "encounter/launch/1" {
             return Err(fail("unsupported launch configuration version"));
         }
-        let mode = field("mode")?;
-        let fields: &[&str] = match mode {
-            "image" => &["image", "sha256", "store", "attachmentRoot", "operators"],
-            "workgarden-journal" => &["runtimeRoot", "journal"],
-            _ => return Err(fail("unsupported launch configuration mode")),
-        };
+        if field("mode")? != "image" {
+            return Err(fail("unsupported launch configuration mode"));
+        }
+        let fields = ["version", "mode", "port", "image", "sha256", "store", "attachmentRoot", "operators"];
         for [subject, property, _] in &facts.0 {
-            if subject != "launch" || !["version", "mode", "port"].contains(&property.as_str())
-                && !fields.contains(&property.as_str())
+            if subject != "launch" || !fields.contains(&property.as_str())
             {
                 return Err(fail(format!("unknown launch field {subject}.{property}")));
             }
@@ -40,13 +41,13 @@ impl Launch {
                 _ => path(name).map(Some),
             }
         };
-        let port = field("port")?.parse()?;
-        match mode {
-            "image" => Ok(Self::Image {
-                image: path("image")?, pin: field("sha256")?.to_owned(), store: path("store")?, port,
-                attachment_root: optional_path("attachmentRoot")?, operators: optional_path("operators")?,
-            }),
-            _ => Ok(Self::Workgarden { root: path("runtimeRoot")?, journal: path("journal")?, port }),
-        }
+        Ok(Self {
+            image: path("image")?,
+            pin: field("sha256")?.to_owned(),
+            store: path("store")?,
+            port: field("port")?.parse()?,
+            attachment_root: optional_path("attachmentRoot")?,
+            operators: optional_path("operators")?,
+        })
     }
 }

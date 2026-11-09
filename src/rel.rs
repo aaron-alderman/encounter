@@ -119,14 +119,6 @@ pub fn hash(bytes: impl AsRef<[u8]>) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-pub fn pinned(path: &Path, sha: &str) -> Result<String> {
-    let bytes = fs::read(path)?;
-    if hash(&bytes) != sha {
-        return Err(fail(format!("source pin mismatch at {}", path.display())));
-    }
-    Ok(String::from_utf8(bytes)?)
-}
-
 // Decode the ApplicationData value graph. Entries and values have single
 // ownership, and every declared node must be reached from the document root.
 pub fn application_data(text: &str) -> Result<serde_json::Value> {

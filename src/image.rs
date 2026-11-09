@@ -1,5 +1,5 @@
 // Pinned application source, data and ahead-of-time instructions.
-use crate::{Result, application::{Application, validate_path}, fail, process::{Meter, Programme}, rel, web::nonce};
+use crate::{Result, application::{Application, validate_path}, fail, process::{Meter, Programme}, rel, nonce::nonce};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},

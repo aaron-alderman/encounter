@@ -1,6 +1,6 @@
 [package]
 name = "encounter"
-version = "0.1.14"
+version = "0.1.15"
 edition = "2024"
 publish = false
 
@@ -8,7 +8,6 @@ publish = false
 test-faults = []
 
 [dependencies]
-temple3 = { path = "../../research/temple3/implementations/rust" }
 serde_json = "1.0"
 sha2 = "0.10"
 hex = "0.4"

@@ -33,7 +33,14 @@ fi
 grep -Fx 'test.greeting: Intentional demo test failure.' "$scratch/error"
 
 pin=$("$binary" build examples/web application.rel "$scratch/web.rel")
-"$binary" serve --image "$scratch/web.rel" "$pin" "$scratch/store" 0 >"$scratch/ready" &
+credential=$(printf '%s' 'demo:disposable-smoke-credential-only' | base64 -w0)
+operator_pin=$(printf '%s' "$credential" | sha256sum | cut -d' ' -f1)
+(
+  umask 077
+  printf '("operators", "version", "encounter/operators/1")\n("demo", "role", "demo-editor")\n("demo", "basicSha256", "%s")\n' "$operator_pin" > "$scratch/operators.rel"
+)
+printf '("launch", "version", "encounter/launch/1")\n("launch", "mode", "image")\n("launch", "image", "web.rel")\n("launch", "sha256", "%s")\n("launch", "store", "store")\n("launch", "port", "0")\n("launch", "operators", "operators.rel")\n' "$pin" > "$scratch/launch.rel"
+"$binary" --config "$scratch/launch.rel" serve >"$scratch/ready" &
 server=$!
 for attempt in {1..100}; do
   origin=$(sed -n 's/^Encounter \(http:\/\/127\.0\.0\.1:[0-9]\+\)$/\1/p' "$scratch/ready")
@@ -41,8 +48,9 @@ for attempt in {1..100}; do
   sleep .05
 done
 [[ -n $origin ]]
-curl --fail --silent --show-error --max-time 5 "$origin/" | grep -F '<h1>Hello from Encounter</h1>' >/dev/null
-curl --fail --silent --show-error --max-time 5 "$origin/styles.css" | grep -F 'system-ui' >/dev/null
+[[ $(curl --silent --max-time 5 -o /dev/null -w '%{http_code}' "$origin/") == 401 ]]
+curl --fail --silent --show-error --max-time 5 -H "Authorization: Basic $credential" "$origin/" | grep -F '<h1>Hello from Encounter</h1>' >/dev/null
+curl --fail --silent --show-error --max-time 5 -H "Authorization: Basic $credential" "$origin/styles.css" | grep -F 'system-ui' >/dev/null
 kill "$server"
 wait "$server"
 server=

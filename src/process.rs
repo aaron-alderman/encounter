@@ -431,10 +431,6 @@ impl Programme {
         Ok(())
     }
 
-    pub fn bind_data(&mut self, data: Value) {
-        self.bind_dataset(String::new(), data);
-    }
-
     pub fn bind_dataset(&mut self, name: String, data: Value) {
         self.datasets.insert(name, data);
     }
