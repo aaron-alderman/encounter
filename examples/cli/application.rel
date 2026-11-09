@@ -1,0 +1,7 @@
+("application", "stateProfile", "encounter/example-cli/1")
+("application", "module", "greet.encounter")
+("application", "entry", "cli.main")
+("application", "entry", "test.greeting")
+("application", "entry", "test.usage")
+("application", "grant", "kernel.invoke")
+("application", "grant", "text.trim")

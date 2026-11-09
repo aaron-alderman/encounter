@@ -1,0 +1,119 @@
+process-module "temple/surface-process-module/1"
+
+process release.editorsImage:
+  port release.editorsConfig {} → config
+  port release.rel { text = $config } → rows
+  let mode = filter($rows, "row", and(eq($row.s, "launch"), eq($row.p, "mode")))
+  let images = filter($rows, "row", and(eq($row.s, "launch"), eq($row.p, "image")))
+  let pins = filter($rows, "row", and(eq($row.s, "launch"), eq($row.p, "sha256")))
+  assert and(eq(count($mode), 1), eq(at(at($mode, 0), "o"), "image"), eq(count($images), 1), eq(count($pins), 1))
+    otherwise "The baseline launch must identify exactly one compiled editor image."
+  let pin = at(at($pins, 0), "o")
+  port release.copyEditorsImage { image = at(at($images, 0), "o") } → file
+  port release.image { file = $file } → observed
+  let packaged = $upgrade.images.claimipedia
+  assert and(eq($observed.digest, $pin), eq($observed.runtimeSha256, $baseline.runtimePin), eq($observed.basis, $packaged.basis), eq($observed.programmeSha256, $packaged.programmeSha256))
+    otherwise "The baseline image must match its launch pin, use the archived runtime, and compile the same editor sources as the new release."
+  let editorBaseline = { release = $baseline.release; images = { claimipedia = { file = $file; pin = $pin } } }
+
+process release.openEditor:
+  let arm = eq($editor, "arm")
+  let route = if($arm, "/?collection=research&arm=FRA-01", "/?collection=evidence&q=REF-26")
+  call release.open
+  when not($arm):
+    let title = if($edition, concat("Local paper index ", $edition), "Conscious Point Physics Papers")
+    let locator = list({ role = "link"; name = concat("Edit reference: ", $title) })
+    call release.click
+
+process release.saveEditors:
+  fold list("arm", "reference") as editor; previousStore starts $after:
+    call release.openEditor
+    let arm = eq($editor, "arm")
+    let label = if($arm, "Research arm title", "Reference title")
+    let value = concat(if($arm, "Local arm plan ", "Local paper index "), $nextEdition)
+    port release.fill { label = $label; value = $value } → _
+    port release.fill { label = "Revision reason"; value = concat("Rehearse ", $nextEdition) } → _
+    let locator = list({ role = "button"; name = if($arm, "Save research arm revision", "Save reference revision") })
+    call release.click
+    let locator = list({ role = "status" })
+    let property = "text"
+    let expected = if($arm, "Local research arm revision saved.", "Local reference revision saved.")
+    call release.expect
+    call release.store
+    let before = $previousStore
+    let after = $store
+    call release.append
+    yield $store → after
+
+process release.verifyEditors:
+  each list("arm", "reference") as editor:
+    call release.openEditor
+    let arm = eq($editor, "arm")
+    let label = if($arm, "Research arm title", "Reference title")
+    let locator = list({ label = $label })
+    let property = "value"
+    let expected = concat(if($arm, "Local arm plan ", "Local paper index "), $edition)
+    call release.expect
+    let property = "count"
+    let locator = list({ role = "list"; name = "Local revisions" }, { role = "listitem" })
+    let expected = count($editions)
+    call release.expect
+    let expected = 1
+    each $editions as entry:
+      let locator = list({ role = "list"; name = "Local revisions" }, { text = concat("Reason: Rehearse ", $entry) })
+      call release.expect
+    let locator = if($arm, list({ text = "Information → geometry → symmetry" }), list({ role = "link"; name = "https://hyperphysics.com/papers/index.html" }))
+    call release.expect
+  call release.store
+  assert eq($store, $after)
+    otherwise "Opening the editor and its history must preserve the exact stored rows."
+
+process release.editorsRoundTrip:
+  call release.editorsImage
+  let app = "claimipedia"
+  let directory = "research-editors"
+  let installed = $editorBaseline
+  call release.serve
+  call release.store
+  let after = $store
+  let edition = ""
+  let nextEdition = "before upgrade"
+  call release.saveEditors
+  call release.stop
+
+  let installed = $upgrade
+  call release.serve
+  let edition = $nextEdition
+  let editions = list($edition)
+  call release.verifyEditors
+  let nextEdition = "after upgrade"
+  call release.saveEditors
+  call release.stop
+
+  let installed = $editorBaseline
+  call release.serve
+  let edition = $nextEdition
+  let editions = append($editions, list($edition))
+  call release.verifyEditors
+  call release.stop
+  port test.report { text = "ok - both editors retained pre-upgrade and post-upgrade revisions after rolling back to the 0.1.13 preview image" } → _
+
+  let installed = $baseline
+  call release.serve
+  call release.frontier
+  call release.store
+  assert eq($store, $after)
+    otherwise "The archived image must open the editor store without changing its history."
+  let marker = "Assessment save by the archived image."
+  call release.saveFrontier
+  call release.stop
+  call release.store
+  let before = $after
+  let after = $store
+  call release.append
+
+  let installed = $upgrade
+  call release.serve
+  call release.verifyEditors
+  call release.stop
+  port test.report { text = "ok - research arm and reference edits and history survived a write from the archived 0.1.13 image" } → _

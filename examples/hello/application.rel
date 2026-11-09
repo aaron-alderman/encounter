@@ -1,0 +1,3 @@
+("application", "stateProfile", "encounter/example-hello/1")
+("application", "module", "hello.encounter")
+("application", "entry", "cli.main")

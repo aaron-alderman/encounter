@@ -1,0 +1,24 @@
+process-module "temple/surface-process-module/1"
+
+process cli.main:
+  let args = $eventInput
+  assert includes(list(0, 1), count($args))
+    otherwise "Expected one name."
+  let result = "Usage: greet NAME"
+  when count($args):
+    port text.trim { value = at($args, 0) } → name
+    assert $name
+      otherwise "Enter a name."
+    let result = concat("Hello, ", $name, "!")
+
+process test.greeting:
+  port kernel.invoke { query = "cli.main"; input = list("  Ada Lovelace  ") } → greeting
+  assert eq($greeting, "Hello, Ada Lovelace!")
+    otherwise "The greeting must preserve spaces inside the name."
+  let result = true
+
+process test.usage:
+  port kernel.invoke { query = "cli.main"; input = list() } → usage
+  assert eq($usage, "Usage: greet NAME")
+    otherwise "A missing name must show usage."
+  let result = true

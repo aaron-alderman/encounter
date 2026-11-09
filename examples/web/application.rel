@@ -1,0 +1,5 @@
+("application", "stateProfile", "encounter/example-web/1")
+("application", "module", "page.encounter")
+("application", "entry", "app.newSession")
+("application", "entry", "app.request")
+("application", "entry", "ui.styles")
