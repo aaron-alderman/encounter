@@ -1,0 +1,44 @@
+process-module "temple/surface-process-module/1"
+
+process browser.boot:
+  port dom.exists { selector = "#source" } → mounted
+  assert $mounted
+    otherwise "Missing source editor"
+  port storage.read { key = "encounter.example.source" } → saved
+  assert $saved.ok
+    otherwise "Saved work could not be read"
+  when not(eq($saved.value, null)):
+    port browser.write { ref = "#source"; name = "value"; value = $saved.value } → _
+    let source = $saved.value
+    call workspace.run
+  port browser.on { ref = "main"; event = "submit"; delegate = "#workspace"; query = "workspace.save"; preventDefault = true } → _
+  port browser.on { ref = "main"; event = "click"; delegate = "[data-verify]"; query = "workspace.verify" } → _
+  let result = true
+
+process workspace.save:
+  port browser.property { ref = $eventInput.matched.ref; name = "id" } → form
+  assert eq($form, "workspace")
+    otherwise "Missing delegated form"
+  port browser.property { ref = "#source"; name = "value" } → source
+  call workspace.run
+  port storage.write { key = "encounter.example.source"; value = $source } → saved
+  assert $saved.ok
+    otherwise "Saved work could not be written"
+  let result = true
+
+process workspace.run:
+  port kernel.prepare { text = $source; entry = "run" } → prepared
+  port state.set { key = "current"; value = $prepared.admission } → _
+  port browser.write { ref = "#ticket"; name = "textContent"; value = $prepared.admission } → _
+  port kernel.execute { admission = $prepared.admission; input = "saved work" } → value
+  port browser.write { ref = "#output"; name = "textContent"; value = $value } → _
+
+process workspace.verify:
+  port browser.property { ref = "#admission"; name = "value" } → offered
+  port state.get { key = "current" } → current
+  let chosen = if(eq($offered, ""), $current, $offered)
+  when eq($eventInput.matched.attributes.data-model, "true"):
+    port kernel.execute { model = { queries = list("run") }; input = "raw model" } → _
+  port kernel.execute { admission = $chosen; input = "current session" } → value
+  port browser.write { ref = "#output"; name = "textContent"; value = $value } → _
+  let result = true
