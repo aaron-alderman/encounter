@@ -1,0 +1,2 @@
+# The custody migration policy pins the exact bytes of this fixture.
+tests/fixtures/sourcery-google-identity.service -text
