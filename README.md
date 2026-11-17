@@ -829,3 +829,12 @@ offers a scoped metadata view over a private Unix socket for a trusted
 workspace host. The workspace host checks current provider admission before
 requesting any collection. See the AppDev workspace setup for socket
 permissions and gateway bindings.
+
+## Runtime variants
+
+The repository root builds the AppDev host. The standalone
+[server runtime](variants/server-runtime/README.md) retains its own
+manifest, lockfile, and CLI for the declaration host, including the
+QuickBASIC and game kernels and the Temple3 journal pilot. Build it with
+`cargo build --locked --release --manifest-path variants/server-runtime/Cargo.toml`.
+Install or run the binary from the selected manifest's target directory.
