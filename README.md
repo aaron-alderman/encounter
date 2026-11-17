@@ -838,3 +838,11 @@ manifest, lockfile, and CLI for the declaration host, including the
 QuickBASIC and game kernels and the Temple3 journal pilot. Build it with
 `cargo build --locked --release --manifest-path variants/server-runtime/Cargo.toml`.
 Install or run the binary from the selected manifest's target directory.
+
+### AppDev build inputs
+
+Place the Encounter Platform checkout beside this repository as
+`encounter-platform`, or set `ENCOUNTER_PLATFORM_ROOT` to its path. The
+AppDev build embeds the four renderer sources and two registry approval
+sources owned by Platform. The standalone server runtime builds with its
+own manifest and lockfile.

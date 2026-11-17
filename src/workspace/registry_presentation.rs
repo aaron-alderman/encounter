@@ -6,8 +6,8 @@ use std::{collections::BTreeSet, env, path::{Path, PathBuf}, sync::Arc};
 const FORMAT: &str = "encounter/registry-approval-presentation/1";
 const VIEW: &str = "registry-approval-view.encounter";
 const STYLE: &str = "registry-approval-style.encounter";
-const DEFAULT_VIEW: &str = include_str!("../../../applications/appdev-projects/registry-approval-view.encounter");
-const DEFAULT_STYLE: &str = include_str!("../../../applications/appdev-projects/registry-approval-style.encounter");
+const DEFAULT_VIEW: &str = include_str!(env!("ENCOUNTER_APPROVAL_VIEW"));
+const DEFAULT_STYLE: &str = include_str!(env!("ENCOUNTER_APPROVAL_STYLE"));
 
 pub(super) struct Presentation {
     copy: Value,

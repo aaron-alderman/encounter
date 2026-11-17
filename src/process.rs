@@ -22,13 +22,13 @@ use serde_json::{Map, Value, json};
 use std::{borrow::Cow, collections::{BTreeMap, BTreeSet}, rc::Rc, sync::Arc};
 
 #[cfg(feature = "hosted")]
-pub(crate) const CSS_RENDERER: &str = include_str!("../../applications/encounter/algebra/css/css.renderPlan.encounter");
+pub(crate) const CSS_RENDERER: &str = include_str!(env!("ENCOUNTER_CSS_RENDERER"));
 
 #[cfg(feature = "hosted")]
 pub(crate) const HTML_RENDERER: [&str; 3] = [
-    include_str!("../../applications/encounter/algebra/html/html.escape.encounter"),
-    include_str!("../../applications/encounter/algebra/html/html.cssText.encounter"),
-    include_str!("../../applications/encounter/algebra/html/html.serialize.encounter"),
+    include_str!(env!("ENCOUNTER_HTML_ESCAPE")),
+    include_str!(env!("ENCOUNTER_HTML_CSS_TEXT")),
+    include_str!(env!("ENCOUNTER_HTML_SERIALIZE")),
 ];
 
 #[cfg(feature = "hosted")]
