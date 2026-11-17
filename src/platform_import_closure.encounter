@@ -1,0 +1,136 @@
+process-module "temple/surface-process-module/1"
+
+process platformImports.target:
+  let input = $eventInput
+  port text.startsWith { value = $input.specifier; search = "." } → relative
+  let result = { target = null; dependency = null }
+  when $relative:
+    port path.resolvePosix { base = $input.directory; path = $input.specifier } → destination
+    port text.startsWith { value = $destination; search = "/sdk/" } → inside
+    port text.slice { value = $destination; start = 5 } → target
+    assert and($inside, at($input.files, $target))
+      otherwise "Platform runtime payload has unresolved relative imports."
+    let result = { target = $target; dependency = null }
+  when and(not($relative), not(at($input.builtins, $input.specifier))):
+    port text.split { value = $input.specifier; pattern = "/" } → parts
+    port text.startsWith { value = $input.specifier; search = "@" } → scoped
+    let name = if($scoped, concat(at($parts, 0), "/", at($parts, 1)), at($parts, 0))
+    let declaration = at($input.dependencies, $name)
+    assert $declaration
+      otherwise "Platform runtime payload has an undeclared bare dependency."
+    assert or(not(eq($declaration.availability, "optional-not-admitted")),
+      and(eq($declaration.loadMode, "dynamic-only"), eq($input.mode, "dynamic")))
+      otherwise "Optional Platform dependency is not confined to dynamic imports."
+    let result = { target = null; dependency = $name }
+
+process platformImports.exportPath:
+  let path = $eventInput
+  port text.startsWith { value = $path; search = "./" } → prefixed
+  when $prefixed:
+    port text.slice { value = $path; start = 2 } → path
+  let result = $path
+
+process platformImports.exportTargets:
+  let exports = $eventInput
+  port value.describe { value = $exports } → shape
+  assert not(and(eq($shape.type, "string"), count($exports)))
+    otherwise "Platform SDK exports must be declared as named targets."
+  let fields = list()
+  when or($shape.plain, $shape.array):
+    port record.entries { value = $exports } → fields
+  fold $fields as field; targets starts list():
+    let target = at($field, 1)
+    port value.describe { value = $target } → kind
+    let candidates = list()
+    when eq($kind.type, "string"):
+      let candidates = list($target)
+    when or($kind.plain, $kind.array):
+      port record.entries { value = $target } → conditions
+      let candidates = map($conditions, "condition", at($condition, 1))
+    fold $candidates as candidate; paths starts $targets:
+      port value.type { value = $candidate } → type
+      let next = $paths
+      when eq($type, "string"):
+        port kernel.invoke { query = "platformImports.exportPath"; input = $candidate } → path
+        let next = append($paths, list($path))
+      yield $next → paths
+    yield $paths → targets
+  let result = $targets
+
+process platformImports.consumerTargets:
+  let input = $eventInput
+  let package = "@temple2/platform-sdk"
+  let sdk = concat($input.workspace, "/node_modules/@temple2/platform-sdk")
+  fold $input.sources as source; targets starts list():
+    port path.resolvePosix { base = $input.workspace; path = concat($source.path, "/..") } → directory
+    fold $source.imports as edge; found starts $targets:
+      let specifier = $edge.specifier
+      port text.startsWith { value = $specifier; search = $package } → packageImport
+      port text.startsWith { value = $specifier; search = "." } → relative
+      let target = null
+      when $packageImport:
+        port text.slice { value = $specifier; start = count($package) } → suffix
+        let exported = at($input.exports, concat(".", $suffix))
+        port value.type { value = $exported } → type
+        assert eq($type, "string")
+          otherwise "Composed source imports unadvertised Platform SDK subpath."
+        port kernel.invoke { query = "platformImports.exportPath"; input = $exported } → target
+      when $relative:
+        port path.resolvePosix { base = $directory; path = $specifier } → destination
+        port text.startsWith { value = $destination; search = concat($sdk, "/") } → inside
+        when $inside:
+          port text.slice { value = $destination; start = count(concat($sdk, "/")) } → target
+        when eq($destination, $sdk):
+          let target = ""
+      let next = $found
+      when and(not(eq($target, null)), not(includes($found, $target))):
+        let next = append($found, list($target))
+      yield $next → found
+    yield $found → targets
+  let result = $targets
+
+process platformImports.verify:
+  let input = $eventInput
+  let paths = $input.paths
+  port number.calculate { operation = "lessEqual"; values = list(count($paths), 4096) } → bounded
+  assert and(isArray($paths), count($paths), $bounded, eq(count($paths), count(distinct($paths))))
+    otherwise "Platform import inventory is empty, ambiguous, or exceeds its file bound."
+  port record.fromEntries { entries = map($paths, "path", list($path, true)) } → files
+  port record.fromEntries { entries = map($input.builtins, "name", list($name, true)) } → builtins
+  let names = map($input.dependencies, "record", $record.name)
+  assert eq(count($names), count(distinct($names)))
+    otherwise "Platform dependency declarations are ambiguous."
+  port record.fromEntries { entries = map($input.dependencies, "record", list($record.name, $record)) } → dependencies
+  port kernel.invoke { query = "platformImports.exportTargets"; input = $input.exports } → exports
+  port kernel.invoke { query = "platformImports.consumerTargets"; input = { exports = $input.exports;
+    workspace = $input.workspace; sources = $input.consumerSources } } → discovered
+  let consumers = distinct(append($input.consumers, $discovered))
+  let entries = distinct(append($exports, $consumers))
+  each $entries as path:
+    assert at($files, $path)
+      otherwise "Platform SDK package export or consumer entrypoint is missing."
+  fold range(count($paths)) as index; visit starts { queue = $entries; dependencies = list() }:
+    let queue = $visit.queue
+    let bare = $visit.dependencies
+    port number.calculate { operation = "subtract"; values = list($index, 1) } → offset
+    let file = at($queue, $offset)
+    when $file:
+      port path.resolvePosix { base = "/sdk"; path = concat($file, "/..") } → directory
+      let imports = if(at($input.imports, $file), at($input.imports, $file), list())
+      fold $imports as edge; found starts { queue = $queue; dependencies = $bare }:
+        port kernel.invoke { query = "platformImports.target"; input = {
+          directory = $directory; specifier = $edge.specifier; mode = $edge.mode;
+          files = $files; builtins = $builtins; dependencies = $dependencies } } → destination
+        let next = $found.queue
+        let used = $found.dependencies
+        when and($destination.target, not(includes($next, $destination.target))):
+          let next = append($next, list($destination.target))
+        when and($destination.dependency, not(includes($used, $destination.dependency))):
+          let used = append($used, list($destination.dependency))
+        yield { queue = $next; dependencies = $used } → found
+      let queue = $found.queue
+      let bare = $found.dependencies
+    yield { queue = $queue; dependencies = $bare } → visit
+  port value.sort { values = $visit.dependencies } → bare
+  let result = { relativeImports = "resolved"; bareDependencies = $bare; packageExports = "resolved";
+    consumerEntrypoints = count($consumers); reachableFiles = count($visit.queue) }

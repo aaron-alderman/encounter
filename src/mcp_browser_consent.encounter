@@ -1,0 +1,112 @@
+process-module "temple/surface-process-module/1"
+
+process mcpBrowserConsent.form:
+  let input = $eventInput
+  let csrf = filter($input.fields, "field", eq(at($field, 0), "csrf"))
+  let decisions = filter($input.fields, "field", eq(at($field, 0), "decision"))
+  let decision = at(at($decisions, 0), 1)
+  port number.calculate { operation = "lessEqual"; values = list($input.size, 16384) } → fits
+  let result = { error = "encoding" }
+  when eq($input.mime, "application/x-www-form-urlencoded"):
+    let result = { error = "size" }
+    when $fits:
+      let result = { error = "csrf" }
+      when eq(count($csrf), 1):
+        let result = { error = "decision" }
+        when and(eq(count($decisions), 1), includes(list("approve", "deny"), $decision)):
+          let result = { csrf = at(at($csrf, 0), 1); decision = $decision; cookieName = "__Host-sourcery_mcp_consent" }
+
+process mcpBrowserConsent.binding:
+  let input = $eventInput
+  let claims = $input.claims
+  port value.describe { value = $claims.userId } → user
+  port value.describe { value = $claims.requestId } → request
+  port number.isNatural { value = $claims.expiresAt } → integer
+  let result = false
+  when and(eq($claims.protocol, "sourcery-mcp-consent-csrf/1"), eq($user.type, "string"), $claims.userId,
+    eq($request.type, "string"), $integer):
+    port text.matches { value = $claims.requestId; pattern = "\\Amcp_arq_[a-f0-9]{24}\\z" } → valid
+    port number.calculate { operation = "lessEqual"; values = list($claims.expiresAt, 9007199254740991) } → safe
+    port number.calculate { operation = "greater"; values = list($claims.expiresAt, $input.nowMs) } → current
+    let result = and($valid, $safe, $current)
+
+process mcpBrowserConsent.snapshot:
+  let snapshot = $eventInput
+  port value.describe { value = $snapshot.oauthRevision } → revision
+  assert and(eq($snapshot.consentProtocol, "encounter/hosted-mcp-browser-consent/1"), isArray($snapshot.requests),
+    eq($snapshot.oauthSchemaVersion, 1), eq($revision.type, "number"), eq($snapshot.oauthRevision, $snapshot.oauthDocumentRevision))
+    otherwise "The hosted browser consent journal is missing or crossed."
+  call mcpBrowserSession.snapshot
+
+process mcpBrowserConsent.plan:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  port kernel.invoke { query = "mcpBrowserConsent.snapshot"; input = $snapshot } → verified
+  call mcpBrowserSession.subject
+  let subject = $result
+  let result = { error = "session" }
+  when $subject:
+    let result = { error = "binding" }
+    port number.calculate { operation = "greater"; values = list($input.csrfExpiresAt, $input.nowMs) } → signedCurrent
+    when and(eq($subject.userId, $input.userId), $signedCurrent):
+      let result = { error = "pending" }
+      when eq(count($snapshot.requests), 1):
+        let pending = at($snapshot.requests, 0)
+        port value.describe { value = $input.requestExpiresMs } → expiry
+        when eq($expiry.type, "number"):
+          port number.calculate { operation = "greater"; values = list($input.requestExpiresMs, $input.nowMs) } → current
+          when and($current, eq($pending.completedAt, null), eq($pending.deniedAt, null),
+            eq($pending.userId, $subject.userId), eq($pending.id, $input.requestId)):
+            let result = { error = "scope" }
+            when and(eq($pending.scopes, list("authoring.read")), eq($pending.resource, $input.resource)):
+              let allowed = eq($input.decision, "deny")
+              when eq($input.decision, "approve"):
+                call mcpBrowserSession.portfolio
+                let matches = filter($result.portfolios, "entry",
+                  and(eq($entry.scope.tenantId, $pending.tenantId), eq($entry.scope.appId, $pending.appId)))
+                let allowed = eq(count($matches), 1)
+              let result = { error = "portfolio" }
+              when $allowed:
+                let result = { decision = $input.decision; requestId = $pending.id; userId = $subject.userId;
+                  oauthRevision = $snapshot.oauthRevision; controlRevision = $snapshot.controlRevision;
+                  redirectUri = $pending.redirectUri; state = $pending.state; csrfExpiry = $input.csrfExpiresAt }
+
+process mcpBrowserConsent.redirect:
+  let input = $eventInput
+  let target = $input.redirectUri
+  port kernel.invoke { query = "mcpClient.callback"; input = $target } → url
+  let result = null
+  when $url:
+    let pairs = if(eq($input.decision, "approve"), list(list("code", $input.code)), list(list("error", "access_denied")))
+    when not(eq($input.state, null)):
+      let pairs = append($pairs, list(list("state", $input.state)))
+    let result = append($pairs, list(list("iss", $input.issuer)))
+
+process mcpBrowserConsent.error:
+  let reason = $eventInput
+  let status = 503
+  let error = "server_error"
+  let description = "Consent could not be completed."
+  when eq($reason, "session"):
+    let status = 401
+    let error = "access_denied"
+    let description = "A valid signed-in Sourcery browser session is required."
+  when eq($reason, "encoding"):
+    let status = 415
+    let error = "invalid_request"
+    let description = "Consent decisions require form encoding."
+  when eq($reason, "size"):
+    let status = 413
+    let error = "invalid_request"
+    let description = "Consent decision is too large."
+  when includes(list("csrf", "binding", "portfolio", "scope"), $reason):
+    let status = 403
+    let error = "access_denied"
+    let description = if(eq($reason, "csrf"), "Consent CSRF validation failed.",
+      if(eq($reason, "binding"), "Consent binding is invalid or expired.", "The pending request is outside the current public read portfolio."))
+  when includes(list("decision", "pending", "stale"), $reason):
+    let status = 400
+    let error = "invalid_request"
+    let description = if(eq($reason, "decision"), "Consent requires one explicit decision.",
+      "The authorization request is missing, expired, or already completed.")
+  let result = { status = $status; body = { error = $error; error_description = $description } }

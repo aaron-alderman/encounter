@@ -1,0 +1,345 @@
+process-module "temple/surface-process-module/1"
+
+process diskPressure.indexStyles:
+  let cssRuleSeparator = ""
+  let cssRules = list(
+    { selector = ":root"; declarations = list(
+      { property = "color-scheme"; value = "dark" },
+      { property = "--bg"; value = "#0c0f0d" },
+      { property = "--panel"; value = "#151a17" },
+      { property = "--ink"; value = "#f2f5ef" },
+      { property = "--muted"; value = "#a6afa8" },
+      { property = "--line"; value = "#303a33" },
+      { property = "--ok"; value = "#85e6aa" },
+      { property = "--warn"; value = "#ffd17b" },
+      { property = "--bad"; value = "#ff8d82" },
+      { property = "--blue"; value = "#86cbff" }
+    ) },
+    { selector = "*"; declarations = list(
+      { property = "box-sizing"; value = "border-box" }
+    ) },
+    { selector = "body"; declarations = list(
+      { property = "margin"; value = "0" },
+      { property = "background"; value = "var(--bg)" },
+      { property = "color"; value = "var(--ink)" },
+      { property = "font"; value = "15px/1.45 ui-sans-serif,system-ui,-apple-system,\"Segoe UI\",sans-serif" }
+    ) },
+    { selector = ".shell"; declarations = list(
+      { property = "max-width"; value = "1200px" },
+      { property = "margin"; value = "auto" },
+      { property = "padding"; value = "36px 24px 60px" }
+    ) },
+    { selector = ".top"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "justify-content"; value = "space-between" },
+      { property = "gap"; value = "20px" },
+      { property = "align-items"; value = "flex-start" }
+    ) },
+    { selector = ".eyebrow"; declarations = list(
+      { property = "font-size"; value = "12px" },
+      { property = "text-transform"; value = "uppercase" },
+      { property = "letter-spacing"; value = ".14em" },
+      { property = "color"; value = "var(--ok)" },
+      { property = "font-weight"; value = "700" }
+    ) },
+    { selector = "h1"; declarations = list(
+      { property = "font-size"; value = "clamp(34px,5vw,64px)" },
+      { property = "line-height"; value = ".96" },
+      { property = "letter-spacing"; value = "-.05em" },
+      { property = "margin"; value = "10px 0 12px" }
+    ) },
+    { selector = ".stamp"; declarations = list(
+      { property = "color"; value = "var(--muted)" },
+      { property = "text-align"; value = "right" }
+    ) },
+    { selector = ".grid"; declarations = list(
+      { property = "display"; value = "grid" },
+      { property = "grid-template-columns"; value = "repeat(4,1fr)" },
+      { property = "gap"; value = "12px" },
+      { property = "margin"; value = "28px 0" }
+    ) },
+    { selector = ".card"; declarations = list(
+      { property = "background"; value = "var(--panel)" },
+      { property = "border"; value = "1px solid var(--line)" },
+      { property = "border-radius"; value = "16px" },
+      { property = "padding"; value = "18px" }
+    ) },
+    { selector = ".label"; declarations = list(
+      { property = "color"; value = "var(--muted)" },
+      { property = "font-size"; value = "12px" },
+      { property = "text-transform"; value = "uppercase" },
+      { property = "letter-spacing"; value = ".08em" }
+    ) },
+    { selector = ".value"; declarations = list(
+      { property = "font-size"; value = "30px" },
+      { property = "font-weight"; value = "700" },
+      { property = "letter-spacing"; value = "-.04em" },
+      { property = "margin-top"; value = "6px" }
+    ) },
+    { selector = ".healthy,.live,.rollback"; declarations = list(
+      { property = "color"; value = "var(--ok)" }
+    ) },
+    { selector = ".warning,.reconstructible"; declarations = list(
+      { property = "color"; value = "var(--warn)" }
+    ) },
+    { selector = ".critical,.unknown"; declarations = list(
+      { property = "color"; value = "var(--bad)" }
+    ) },
+    { selector = ".isolated"; declarations = list(
+      { property = "color"; value = "var(--blue)" }
+    ) },
+    { selector = ".meter"; declarations = list(
+      { property = "height"; value = "12px" },
+      { property = "background"; value = "#252b27" },
+      { property = "border-radius"; value = "999px" },
+      { property = "overflow"; value = "hidden" },
+      { property = "margin"; value = "14px 0 6px" }
+    ) },
+    { selector = ".meter span"; declarations = list(
+      { property = "display"; value = "block" },
+      { property = "height"; value = "100%" },
+      { property = "background"; value = "var(--ok)" },
+      { property = "width"; value = concat($slots.availablePercent, "%") }
+    ) },
+    { selector = ".section"; declarations = list(
+      { property = "margin-top"; value = "34px" }
+    ) },
+    { selector = ".section h2"; declarations = list(
+      { property = "font-size"; value = "24px" },
+      { property = "margin"; value = "0 0 12px" }
+    ) },
+    { selector = "table"; declarations = list(
+      { property = "width"; value = "100%" },
+      { property = "border-collapse"; value = "collapse" }
+    ) },
+    { selector = "th,td"; declarations = list(
+      { property = "text-align"; value = "left" },
+      { property = "padding"; value = "11px 10px" },
+      { property = "border-bottom"; value = "1px solid var(--line)" },
+      { property = "vertical-align"; value = "top" }
+    ) },
+    { selector = "th"; declarations = list(
+      { property = "color"; value = "var(--muted)" },
+      { property = "font-size"; value = "12px" },
+      { property = "text-transform"; value = "uppercase" },
+      { property = "letter-spacing"; value = ".06em" }
+    ) },
+    { selector = "code"; declarations = list(
+      { property = "font-family"; value = "ui-monospace,SFMono-Regular,Consolas,monospace" },
+      { property = "font-size"; value = "12px" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) },
+    { selector = ".state"; declarations = list(
+      { property = "font-weight"; value = "700" }
+    ) },
+    { selector = ".notice"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "gap"; value = "12px" },
+      { property = "align-items"; value = "center" },
+      { property = "border"; value = "1px solid var(--line)" },
+      { property = "border-radius"; value = "14px" },
+      { property = "padding"; value = "16px" },
+      { property = "background"; value = "var(--panel)" }
+    ) },
+    { selector = ".hash"; declarations = list(
+      { property = "color"; value = "var(--muted)" },
+      { property = "font-family"; value = "ui-monospace,SFMono-Regular,Consolas,monospace" },
+      { property = "font-size"; value = "12px" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) },
+    { selector = ".legend"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "gap"; value = "16px" },
+      { property = "flex-wrap"; value = "wrap" },
+      { property = "color"; value = "var(--muted)" },
+      { property = "margin-top"; value = "12px" }
+    ) },
+    { selector = ".legend span b"; declarations = list(
+      { property = "margin-right"; value = "5px" }
+    ) },
+    { selector = ".footer"; declarations = list(
+      { property = "margin-top"; value = "30px" },
+      { property = "color"; value = "var(--muted)" }
+    ) },
+    { atRule = "media"; prelude = "(max-width:850px)"; rules = list(
+      { selector = ".grid"; declarations = list(
+        { property = "grid-template-columns"; value = "1fr 1fr" }
+      ) },
+      { selector = ".top"; declarations = list(
+        { property = "display"; value = "block" }
+      ) },
+      { selector = ".stamp"; declarations = list(
+        { property = "text-align"; value = "left" }
+      ) },
+      { selector = ".table-wrap"; declarations = list(
+        { property = "overflow-x"; value = "auto" }
+      ) }
+    ) },
+    { atRule = "media"; prelude = "(max-width:480px)"; rules = list(
+      { selector = ".grid"; declarations = list(
+        { property = "grid-template-columns"; value = "1fr" }
+      ) },
+      { selector = ".shell"; declarations = list(
+        { property = "padding"; value = "24px 14px" }
+      ) }
+    ) }
+  )
+  call css.renderCompactRules
+
+process diskPressure.index:
+  call diskPressure.indexStyles
+  let stylesheet = $result
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+      { tag = "meta"; attrs = { "http-equiv" = "refresh"; content = "300" } },
+      { tag = "title"; children = list("Sourcery storage assurance") },
+      { tag = "style"; children = list($stylesheet) }
+    ) },
+    { tag = "body"; children = list(
+      { tag = "main"; attrs = { class = "shell" }; children = list(
+        { tag = "div"; attrs = { class = "top" }; children = list(
+          { tag = "div"; children = list(
+            { tag = "div"; attrs = { class = "eyebrow" }; children = list("Sourcery · continuous dry-run assurance") },
+            { tag = "h1"; children = list("Storage & health") },
+            { tag = "p"; children = list("No automatic deletion. Every candidate requires a fresh scan and explicit approval.") }
+          ) },
+          { tag = "div"; attrs = { class = "stamp" }; children = list(
+            "Updated",
+            { tag = "br" },
+            $slots.createdAt
+          ) }
+        ) },
+        "\n",
+        { tag = "section"; attrs = { class = "grid" }; children = list(
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Pressure") },
+            { tag = "div"; attrs = { class = concat("value ", $slots.pressureStatus) }; children = list($slots.pressureStatus) },
+            { tag = "div"; attrs = { class = "meter"; "aria-label" = concat("Available disk ", $slots.availableLabel) }; children = list(
+              { tag = "span" }
+            ) },
+            { tag = "small"; children = list(concat($slots.availableGib, " GiB available · ", $slots.availableLabel)) }
+          ) },
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Approval candidates") },
+            { tag = "div"; attrs = { class = "value" }; children = list($slots.candidateCount) },
+            { tag = "small"; children = list(concat($slots.candidateGib, " GiB reclaimable only after approval")) }
+          ) },
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Isolated") },
+            { tag = "div"; attrs = { class = "value isolated" }; children = list($slots.isolatedCount) },
+            { tag = "small"; children = list("Retained because evidence is incomplete") }
+          ) },
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Service health") },
+            { tag = "div"; attrs = { class = concat("value ", $slots.healthClass) }; children = list($slots.healthLabel) },
+            { tag = "small"; children = list(concat("MCP ", $slots.healthStatus, " · Allow ", $slots.healthAllow)) }
+          ) },
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Shared dependency closures") },
+            { tag = "div"; attrs = { class = "value" }; children = list($slots.closureCount) },
+            { tag = "small"; children = list(concat($slots.closureGib, " GiB retained once · ", $slots.completeCount, " evidence-complete releases")) }
+          ) },
+          { tag = "div"; attrs = { class = "card" }; children = list(
+            { tag = "div"; attrs = { class = "label" }; children = list("Avoided duplication") },
+            { tag = "div"; attrs = { class = "value healthy" }; children = list($slots.avoidedGib) },
+            { tag = "small"; children = list("GiB not copied across release views") }
+          ) }
+        ) },
+        "\n",
+        { tag = "section"; attrs = { class = "notice" }; children = list(
+          { tag = "strong"; children = list($slots.noticeTitle) },
+          { tag = "span"; children = list($slots.notice) }
+        ) },
+        "\n",
+        { tag = "section"; attrs = { class = "section" }; children = list(
+          { tag = "h2"; children = list("Classification") },
+          { tag = "div"; attrs = { class = "legend" }; children = list(
+            { tag = "span"; children = list(
+              { tag = "b"; attrs = { class = "live" }; children = list("●") },
+              concat("live ", $slots.liveCount)
+            ) },
+            { tag = "span"; children = list(
+              { tag = "b"; attrs = { class = "rollback" }; children = list("●") },
+              concat("rollback ", $slots.rollbackCount)
+            ) },
+            { tag = "span"; children = list(
+              { tag = "b"; attrs = { class = "reconstructible" }; children = list("●") },
+              concat("reconstructible ", $slots.reconstructibleCount)
+            ) },
+            { tag = "span"; children = list(
+              { tag = "b"; attrs = { class = "isolated" }; children = list("●") },
+              concat("isolated ", $slots.isolatedCount)
+            ) },
+            { tag = "span"; children = list(
+              { tag = "b"; attrs = { class = "unknown" }; children = list("●") },
+              concat("unknown ", $slots.unknownCount)
+            ) }
+          ) },
+          { tag = "div"; attrs = { class = "table-wrap" }; children = list(
+            { tag = "table"; children = list(
+              { tag = "thead"; children = list(
+                { tag = "tr"; children = list(
+                  { tag = "th"; children = list("Kind") },
+                  { tag = "th"; children = list("Identity") },
+                  { tag = "th"; children = list("Class") },
+                  { tag = "th"; children = list("Size / reason") }
+                ) }
+              ) },
+              { tag = "tbody"; children = $slots.classificationRows }
+            ) }
+          ) }
+        ) },
+        "\n",
+        { tag = "section"; attrs = { class = "section" }; children = list(
+          { tag = "h2"; children = list("Dependency closure references") },
+          { tag = "div"; attrs = { class = "table-wrap" }; children = list(
+            { tag = "table"; children = list(
+              { tag = "thead"; children = list(
+                { tag = "tr"; children = list(
+                  { tag = "th"; children = list("Closure") },
+                  { tag = "th"; children = list("Platform") },
+                  { tag = "th"; children = list("References") },
+                  { tag = "th"; children = list("Retained bytes") }
+                ) }
+              ) },
+              { tag = "tbody"; children = $slots.closureRows }
+            ) }
+          ) }
+        ) },
+        "\n",
+        { tag = "section"; attrs = { class = "section" }; children = list(
+          { tag = "h2"; children = list("Retention contract") },
+          { tag = "div"; attrs = { class = "grid" }; children = list(
+            { tag = "div"; attrs = { class = "card" }; children = list(
+              { tag = "div"; attrs = { class = "label" }; children = list("Rollback floor") },
+              { tag = "div"; attrs = { class = "value" }; children = list($slots.rollbackFloor) }
+            ) },
+            { tag = "div"; attrs = { class = "card" }; children = list(
+              { tag = "div"; attrs = { class = "label" }; children = list("Quarantine") },
+              { tag = "div"; attrs = { class = "value" }; children = list(concat($slots.quarantineDays, "d")) }
+            ) },
+            { tag = "div"; attrs = { class = "card" }; children = list(
+              { tag = "div"; attrs = { class = "label" }; children = list("Assessment history") },
+              { tag = "div"; attrs = { class = "value" }; children = list(concat($slots.historyDays, "d")) }
+            ) },
+            { tag = "div"; attrs = { class = "card" }; children = list(
+              { tag = "div"; attrs = { class = "label" }; children = list("Proofs") },
+              { tag = "div"; attrs = { class = "value" }; children = list("∞") },
+              { tag = "small"; children = list("Retained indefinitely") }
+            ) }
+          ) }
+        ) },
+        "\n",
+        { tag = "p"; attrs = { class = "hash" }; children = list(
+          concat("Assessment SHA-256 identity: ", $slots.assessmentHash),
+          { tag = "br" },
+          concat("Authority marker SHA-256: ", $slots.authoritySha256)
+        ) },
+        { tag = "p"; attrs = { class = "footer" }; children = list("Current view refreshes every five minutes. Scheduled assessment runs daily; it writes evidence and gates only.") }
+      ) }
+    ) }
+  ) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)

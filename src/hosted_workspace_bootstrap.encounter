@@ -1,0 +1,139 @@
+process-module "temple/surface-process-module/1"
+
+process bootstrap.bounded:
+  let input = $eventInput
+  port value.type { value = $input.value } → kind
+  assert eq($kind, "string")
+    otherwise "Bootstrap input requires bounded text."
+  port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.maximum) } → bounded
+  port text.trim { value = $input.value } → normalized
+  port text.matches { value = $input.value; pattern = "\\x00" } → invalid
+  assert and($bounded, $normalized, not($invalid))
+    otherwise "Bootstrap input requires bounded text."
+  let result = $normalized
+
+process bootstrap.input:
+  let input = $eventInput
+  port record.entries { value = $input.target } → entries
+  assert eq(count($entries), 6)
+    otherwise "Workspace target fields are not exact."
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = $input.target.storageNamespace; maximum = 512 } } → namespace
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = $input.target.region; maximum = 64 } } → region
+  port kernel.invoke { query = "workspaceStorage.allocation"; input = { operation = "resolve"; tenantId = $input.target.tenantId;
+    appId = $input.target.appId; projectId = $input.target.projectId; workspaceId = $input.target.workspaceId; storageNamespace = $namespace } } → workspace
+  port record.put { record = $workspace.identity; key = "region"; value = $region } → target
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = $input.operationId; maximum = 160 } } → operationId
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = or($input.actorId, "operator.sourcery"); maximum = 160 } } → actorId
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = $input.authorizationEvidenceHash; maximum = 64 } } → evidenceHash
+  port text.matches { value = $evidenceHash; pattern = "\\A[a-f0-9]{64}\\z" } → evidence
+  assert $evidence
+    otherwise "Authorization evidence hash is invalid."
+  port kernel.invoke { query = "bootstrap.bounded"; input = { value = $input.workspaceProjectFile; maximum = 512 } } → rawPlacement
+  port text.replaceAll { value = $rawPlacement; search = "\\"; replacement = "/" } → placement
+  port text.matches { value = $placement; pattern = "/" } → nested
+  assert $nested
+    otherwise "Workspace project file must be a normalized nested project.rel path."
+  let protocol = "sourcery.hosted/workspace-source-bootstrap.v1"
+  port kernel.invoke { query = "workerWorkspace.project"; input = { hasReceipt = true; target = $target;
+    receipt = { protocol = $protocol; target = $target; placement = { projectFile = $placement } } } } → projectFile
+  let result = { target = $target; marker = $workspace.marker; operationId = $operationId;
+    actorId = $actorId; authorizationEvidenceHash = $evidenceHash; projectFile = $projectFile }
+
+process bootstrap.plan:
+  let input = $eventInput
+  let manifest = $input.manifest
+  assert $manifest.projectHash
+    otherwise "hosted-workspace-source-project-missing|Bootstrap source does not contain project.rel."
+  port json.canonical { value = { entries = $manifest.entries; fileCount = $manifest.fileCount; totalBytes = $manifest.totalBytes } } → tree
+  port digest.sha256 { text = $tree } → treeHash
+  let body = { protocol = "sourcery.hosted/workspace-source-bootstrap.v1"; operationId = $input.request.operationId;
+    authorizationEvidenceHash = $input.request.authorizationEvidenceHash; actorId = $input.request.actorId;
+    target = $input.request.target; source = { treeHash = $treeHash; projectHash = $manifest.projectHash;
+      fileCount = $manifest.fileCount; totalBytes = $manifest.totalBytes };
+    placement = { projectFile = $input.request.projectFile }; actions = list("initialize-project-source") }
+  port json.canonical { value = $body } → canonical
+  port digest.sha256 { text = $canonical } → planHash
+  port record.put { record = $body; key = "planHash"; value = $planHash } → result
+
+process bootstrap.basis:
+  let input = $eventInput
+  when $input.execute:
+    port text.matches { value = $input.expected; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+    assert $valid
+      otherwise "Expected bootstrap plan hash is invalid."
+    assert eq($input.expected, $input.plan.planHash)
+      otherwise "hosted-workspace-source-bootstrap-plan-mismatch|Workspace source bootstrap plan is stale or crossed."
+  let result = true
+
+process bootstrap.retained:
+  let input = $eventInput
+  let receipt = $input.receipt
+  let plan = $input.plan
+  when $input.recovery:
+    assert and($receipt, $input.recovery.markerMatches, eq($receipt.workspaceIdentity, $input.recovery.identity),
+      eq($receipt.recovery.retainedPreSourceWorkspace, $input.recovery.backup))
+      otherwise "hosted-workspace-source-bootstrap-conflict|Prepared bootstrap recovery directory does not match the plan."
+  let result = "prepared"
+  when not(eq($receipt, null)):
+    port record.entries { value = $receipt } → entries
+    port record.fromEntries { entries = filter($entries, "entry", not(eq(at($entry, 0), "receiptHash"))) } → body
+    port json.canonical { value = $body } → canonical
+    port digest.sha256 { text = $canonical } → receiptHash
+    assert and(eq($receipt.protocol, $plan.protocol), eq($receipt.status, "applied"), eq($receipt.planHash, $plan.planHash),
+      eq($receipt.receiptHash, $receiptHash), eq($receipt.source, $plan.source), eq($receipt.placement, $plan.placement), eq($receipt.target, $plan.target),
+      eq($receipt.operationId, $plan.operationId), eq($receipt.authorizationEvidenceHash, $plan.authorizationEvidenceHash),
+      eq($receipt.actorId, $plan.actorId))
+      otherwise "hosted-workspace-source-bootstrap-conflict|Workspace already carries another or invalid source-bootstrap receipt."
+    let result = "already-applied"
+
+process bootstrap.receipt:
+  let input = $eventInput
+  let plan = $input.plan
+  port time.parseRfc3339 { value = $input.occurredAt } → observed
+  let body = { protocol = $plan.protocol; status = "applied"; operationId = $plan.operationId;
+    authorizationEvidenceHash = $plan.authorizationEvidenceHash; actorId = $plan.actorId;
+    target = $plan.target; source = $plan.source; placement = $plan.placement; planHash = $plan.planHash;
+    occurredAt = $input.occurredAt; workspaceIdentity = $input.identity;
+    recovery = { retainedPreSourceWorkspace = $input.backup } }
+  port json.canonical { value = $body } → canonical
+  port digest.sha256 { text = $canonical } → receiptHash
+  port record.put { record = $body; key = "receiptHash"; value = $receiptHash } → result
+
+process bootstrap.authorization:
+  let input = $eventInput
+  let evidence = $input.evidence
+  assert eq($evidence.protocol, "sourcery.hosted/operator-workspace-source-bootstrap-authorization.v1")
+    otherwise "Workspace source bootstrap authorization evidence protocol is invalid."
+  port value.type { value = $evidence.authorization } → authorizationType
+  assert eq($authorizationType, "string")
+    otherwise "Workspace source bootstrap requires operator authorization."
+  port text.trim { value = $evidence.authorization } → authorization
+  assert $authorization
+    otherwise "Workspace source bootstrap requires operator authorization."
+  port value.type { value = $evidence.sourceDirectory } → releaseType
+  port value.type { value = $evidence.sourceCustodyDirectory } → custodyType
+  let release = and(eq($releaseType, "string"), $evidence.sourceDirectory)
+  let custody = and(eq($custodyType, "string"), $evidence.sourceCustodyDirectory)
+  assert or(and($release, not($custody)), and($custody, not($release)))
+    otherwise "Workspace source bootstrap requires exactly one source directory."
+  let base = if($release, $input.releaseRoot, "/var/lib/sourcery/bootstrap-sources")
+  let name = if($release, $evidence.sourceDirectory, $evidence.sourceCustodyDirectory)
+  port path.resolvePosix { base = $base; path = $name } → resolved
+  let prefix = concat($base, "/")
+  port text.startsWith { value = $resolved; search = $prefix } → contained
+  port text.slice { value = $resolved; start = count($prefix) } → relative
+  assert and($contained, $relative)
+    otherwise "Bootstrap source directory must remain inside its authorized root."
+  port digest.sha256 { text = $input.evidenceText } → evidenceHash
+  let result = { base = $base; relative = $relative; custody = $custody; request = {
+    target = $evidence.target; operationId = $evidence.operationId; actorId = $evidence.actorId;
+    workspaceProjectFile = $evidence.workspaceProjectFile; authorizationEvidenceHash = $evidenceHash } }
+
+process bootstrap.sourceCustody:
+  let input = $eventInput
+  assert $input.directory
+    otherwise "Bootstrap source root must be a real directory."
+  when $input.required:
+    assert and(eq($input.uid, $input.owner), $input.private)
+      otherwise "Bootstrap custody source must be a root-owned private directory."
+  let result = true

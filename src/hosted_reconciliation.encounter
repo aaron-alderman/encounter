@@ -1,0 +1,202 @@
+process-module "temple/surface-process-module/1"
+
+process reconcile.integer:
+  port number.isNatural { value = $eventInput.value } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput.value, $eventInput.minimum) } → above
+  port number.calculate { operation = "lessEqual"; values = list($eventInput.value, $eventInput.maximum) } → below
+  let result = and($integer, $above, $below)
+
+process reconcile.limit:
+  port kernel.invoke { query = "reconcile.integer"; input = { value = $eventInput; minimum = 1; maximum = 128 } } → valid
+  assert $valid
+    otherwise "Capability reconciliation target limit must be between 1 and 128."
+  let result = $eventInput
+
+process reconcile.options:
+  let input = $eventInput
+  port value.describe { value = $input.actor } → actorShape
+  port number.calculate { operation = "lessEqual"; values = list(count($input.actor), 160) } → actorBound
+  assert and(eq($actorShape.type, "string"), $input.actor, $actorBound)
+    otherwise "Capability reconciliation actor is invalid."
+  port kernel.invoke { query = "reconcile.integer"; input = { value = $input.intervalMs; minimum = 1000; maximum = 3600000 } } → interval
+  assert $interval
+    otherwise "Capability reconciliation interval must be between 1000 and 3600000."
+  port kernel.invoke { query = "reconcile.limit"; input = $input.targetLimit } → limit
+  let result = { actor = $input.actor; intervalMs = $input.intervalMs; targetLimit = $limit }
+
+process reconcile.targets:
+  port kernel.invoke { query = "reconcile.limit"; input = $eventInput.limit } → limit
+  port kernel.invoke { query = "reconcile.integer"; input = { value = $eventInput.count; minimum = 0; maximum = $limit } } → bounded
+  assert $bounded
+    otherwise "Protected reconciliation inventory returned invalid targets."
+  let result = if(eq($eventInput.count, 0), "empty", "observe")
+
+process reconcile.summary:
+  let input = $eventInput
+  let result = if($input.active, "running", if($input.lastErrorCode, "degraded", if($input.stopped, "stopped", "idle")))
+
+process reconcile.retry:
+  let input = $eventInput
+  let result = null
+  when not(or($input.stopped, $input.timerPending)):
+    let result = if($input.initial, 0, $input.intervalMs)
+
+process reconcile.outcome:
+  let input = $eventInput
+  let counters = $input.counters
+  let result = $counters
+  when eq($input.outcome, "empty"):
+    let result = { successfulRuns = add($counters.successfulRuns, 1); failedRuns = $counters.failedRuns; lastErrorCode = null;
+      lastReportHash = $counters.lastReportHash; lastCounts = { total = 0; healthy = 0; degraded = 0; unavailable = 0; unbound = 0 } }
+  when eq($input.outcome, "retained"):
+    let counts = $input.counts
+    port text.matches { value = $input.reportHash; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+    port record.entries { value = $counts } → fields
+    each list($counts.total, $counts.healthy, $counts.degraded, $counts.unavailable, $counts.unbound) as count:
+      port kernel.invoke { query = "reconcile.integer"; input = { value = $count; minimum = 0; maximum = 128 } } → valid
+      assert $valid
+        otherwise "Invalid reconciliation report count."
+    assert and($hash, eq(count($fields), 5), eq($counts.total, $input.targetCount),
+      eq($counts.total, add(add($counts.healthy, $counts.degraded), add($counts.unavailable, $counts.unbound))))
+      otherwise "Reconciliation report did not match its admitted targets."
+    let result = { successfulRuns = add($counters.successfulRuns, 1); failedRuns = $counters.failedRuns; lastErrorCode = null;
+      lastReportHash = $input.reportHash; lastCounts = $input.counts }
+  when eq($input.outcome, "failed"):
+    let code = "capability-binding-reconciliation-failed"
+    port value.describe { value = $input.errorCode } → shape
+    when eq($shape.type, "string"):
+      port text.matches { value = $input.errorCode; pattern = "\\A[a-z][a-z0-9._:/-]{0,127}\\z" } → admitted
+      when $admitted:
+        let code = $input.errorCode
+    let result = { successfulRuns = $counters.successfulRuns; failedRuns = add($counters.failedRuns, 1); lastErrorCode = $code;
+      lastReportHash = $counters.lastReportHash; lastCounts = $counters.lastCounts }
+
+process storage.scope:
+  port value.describe { value = $eventInput } → shape
+  assert $shape.plain
+    otherwise "self-hosted-storage-scope|Self-hosted storage requires a protected host scope."
+  port record.entries { value = $eventInput } → fields
+  assert count($fields)
+    otherwise "self-hosted-storage-scope|Self-hosted storage requires a protected host scope."
+  port json.canonical { value = $eventInput } → canonical
+  port text.utf8Length { value = $canonical } → length
+  port number.calculate { operation = "lessEqual"; values = list($length, 16384) } → bounded
+  assert $bounded
+    otherwise "self-hosted-storage-scope|Self-hosted storage scope exceeds the private marker limit."
+  port digest.sha256 { text = $canonical } → scopeHash
+  let result = { scope = $eventInput; scopeHash = $scopeHash }
+
+process storage.resource:
+  let input = $eventInput
+  port text.matches { value = $input.activationId; pattern = "\\Abinding-activation[.][a-f0-9]{64}\\z" } → activation
+  port text.matches { value = $input.scopeHash; pattern = "\\A[a-f0-9]{64}\\z" } → scope
+  assert and($activation, $scope)
+    otherwise "self-hosted-storage-activation|Self-hosted storage requires a kernel-issued activation identity and protected scope."
+  port json.canonical { value = { provider = "provider.sourcery.self-hosted-storage"; activationId = $input.activationId } } → canonical
+  port digest.sha256 { text = $canonical } → activationHash
+  let result = { activationHash = $activationHash;
+    resourceRef = concat("resource.self-hosted-storage.", $input.scopeHash, ".", $activationHash) }
+
+process storage.location:
+  port text.match { value = $eventInput.resourceRef; pattern = "\\Aresource[.]self-hosted-storage[.]([a-f0-9]{64})[.]([a-f0-9]{64})\\z" } → match
+  assert $match
+    otherwise "self-hosted-storage-resource|Self-hosted storage resource is unavailable in this scope."
+  let scopeHash = at($match.groups, 0)
+  assert or(eq($eventInput.scopeHash, null), eq($eventInput.scopeHash, $scopeHash))
+    otherwise "self-hosted-storage-resource|Self-hosted storage resource is unavailable in this scope."
+  let result = { scopeHash = $scopeHash; activationHash = at($match.groups, 1) }
+
+process storage.marker:
+  let input = $eventInput
+  let marker = $input.marker
+  port value.describe { value = $marker } → shape
+  assert $shape.plain
+    otherwise "Self-hosted storage resource marker is invalid."
+  port record.entries { value = $marker } → fields
+  port value.describe { value = $marker.bindingKey } → binding
+  port number.calculate { operation = "lessEqual"; values = list(count($marker.bindingKey), 512) } → bounded
+  assert and(eq(count($fields), 8), eq($marker.protocol, "sourcery.hosted/self-hosted-storage-resource.v1"),
+    eq($marker.provider, "provider.sourcery.self-hosted-storage"), eq($binding.type, "string"), $marker.bindingKey, $bounded,
+    includes(list("active", "unbound"), $marker.status))
+    otherwise "Self-hosted storage resource marker is invalid."
+  port kernel.invoke { query = "storage.scope"; input = $marker.scope } → scope
+  port kernel.invoke { query = "storage.resource"; input = { activationId = $marker.activationId; scopeHash = $scope.scopeHash } } → identity
+  assert and(eq($marker.scopeHash, $scope.scopeHash), eq($marker.resourceRef, $identity.resourceRef),
+    or(eq($input.resourceRef, null), eq($input.resourceRef, $marker.resourceRef)),
+    or(eq($input.scopeHash, null), eq($input.scopeHash, $marker.scopeHash)),
+    or(eq($input.activationHash, null), eq($input.activationHash, $identity.activationHash)))
+    otherwise "Self-hosted storage resource marker failed identity verification."
+  let result = $marker
+
+process storage.target:
+  call storage.marker
+  let marker = $result
+  let result = null
+  when eq($marker.status, "active"):
+    port text.startsWith { value = $marker.bindingKey; search = concat("scope.", $marker.scopeHash, "/") } → matchesScope
+    assert $matchesScope
+      otherwise "Self-hosted storage reconciliation target crosses its protected scope."
+    let result = { bindingKey = $marker.bindingKey; scope = $marker.scope }
+
+process storage.activatePlan:
+  let input = $eventInput
+  assert and(eq($input.capability, "storage.private-files"), eq($input.offerKey, "offer.storage.private-files.self-hosted"))
+    otherwise "self-hosted-storage-plan|Self-hosted storage received an incompatible plan."
+  port kernel.invoke { query = "storage.scope"; input = $input.scope } → scope
+  port kernel.invoke { query = "storage.resource"; input = { activationId = $input.activationId; scopeHash = $scope.scopeHash } } → identity
+  let marker = { protocol = "sourcery.hosted/self-hosted-storage-resource.v1"; provider = "provider.sourcery.self-hosted-storage";
+    resourceRef = $identity.resourceRef; activationId = $input.activationId; bindingKey = $input.bindingKey;
+    scope = $scope.scope; scopeHash = $scope.scopeHash; status = "active" }
+  port kernel.invoke { query = "storage.target"; input = { marker = $marker; resourceRef = $identity.resourceRef;
+    scopeHash = $scope.scopeHash; activationHash = $identity.activationHash } } → target
+  let result = { scopeHash = $scope.scopeHash; activationHash = $identity.activationHash; marker = $marker }
+
+process storage.locatePlan:
+  port kernel.invoke { query = "storage.scope"; input = $eventInput.scope } → scope
+  port kernel.invoke { query = "storage.location"; input = { resourceRef = $eventInput.resourceRef; scopeHash = $scope.scopeHash } } → result
+
+process storage.replay:
+  port json.canonical { value = $eventInput.expected } → expected
+  port json.canonical { value = $eventInput.retained } → retained
+  assert eq($expected, $retained)
+    otherwise "self-hosted-storage-conflict|Self-hosted storage activation identity has conflicting retained state."
+  let result = true
+
+process storage.access:
+  call storage.marker
+  let marker = $result
+  assert eq($marker.bindingKey, $input.bindingKey)
+    otherwise "self-hosted-storage-binding|Self-hosted storage resource does not belong to the current binding."
+  when not(eq($input.operation, "unbind")):
+    assert eq($marker.status, "active")
+      otherwise "self-hosted-storage-unavailable|Self-hosted storage resource is not active."
+  let result = $marker
+
+process storage.grantBinding:
+  let input = $eventInput
+  assert and(eq($input.status, "active"), eq($input.resourceRef, $input.boundResourceRef),
+    eq($input.provider, "provider.sourcery.self-hosted-storage"))
+    otherwise "self-hosted-storage-binding|Self-hosted storage requires an authenticated current binding."
+  let result = true
+
+process storage.tombstone:
+  let result = null
+  when eq($eventInput.status, "active"):
+    port record.put { record = $eventInput; key = "status"; value = "unbound" } → result
+
+process storage.effect:
+  let active = eq($eventInput.status, "active")
+  let result = { resourceRef = $eventInput.resourceRef;
+    evidence = if($active, list("fsync-reopen-durability-probe", "scope-isolation", "private-permissions"),
+      list("access-revoked", "tombstone-retained"));
+    publicMetadata = { kind = "private-directory"; status = $eventInput.status;
+      recovery = if($active, "not-required", "operator-mediated") } }
+
+process storage.observation:
+  let result = { status = if($eventInput, "healthy", "unavailable");
+    evidence = if($eventInput, list("marker-integrity", "scope-isolation"), list("resource-unavailable"));
+    publicMetadata = { kind = "private-directory" } }
+
+process storage.grant:
+  let result = { protocol = "sourcery.hosted/private-directory-resource.v1"; resourceRef = $eventInput.resourceRef;
+    kind = "private-directory"; access = "read-write"; root = $eventInput.root }

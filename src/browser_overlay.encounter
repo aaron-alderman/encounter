@@ -1,0 +1,11 @@
+process-module "temple/surface-process-module/1"
+
+process browser.overlayStyles:
+  let cssRules = list({ selector = "[data-encounter-positioned]"; declarations = list(
+    { property = "position"; value = "fixed"; important = true },
+    { property = "inset"; value = "auto"; important = true },
+    { property = "margin"; value = "0"; important = true },
+    { property = "left"; value = "var(--encounter-overlay-left)"; important = true },
+    { property = "top"; value = "var(--encounter-overlay-top)"; important = true }
+  ) })
+  call css.renderRules

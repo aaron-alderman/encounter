@@ -1,0 +1,42 @@
+process-module "temple/surface-process-module/1"
+
+process gatewayIdentity.configure:
+  let request = $eventInput
+  let office = and(eq($request.mode, "appdev-office"), eq($request.prefix, "/identity-management"))
+  let shop = and(eq($request.mode, "appdev-shop"), eq($request.prefix, "/shop"))
+  let singleOwner = eq($request.mode, null)
+  let result = { admit = if(or($singleOwner, $office, $shop), true, false);
+    forwardPrincipal = if(or($office, $shop), true, false); workspaceControl = $office }
+
+process gatewayIdentity.admit:
+  let request = $eventInput
+  let provider = and(eq($request.kind, "user"), includes(list("https://accounts.google.com", "accounts.google.com"), $request.issuer))
+  let owner = or(eq($request.owner, null), eq($request.email, $request.owner))
+  let currentSession = or(not($request.recheck),
+    and(eq($request.id, $request.expectedId), eq($request.email, $request.expectedEmail)))
+  let result = if(and($provider, $owner, $currentSession), true, false)
+
+process gatewayIdentity.workspaceControl:
+  let request = $eventInput
+  let result = "route"
+  when and($request.enabled, includes(list("/workspace-access", "/workspace-sign-out"), $request.path)):
+    let access = eq($request.path, "/workspace-access")
+    let method = if($access, "GET", "POST")
+    let admit = and(eq($request.method, $method), not($request.hasQuery), not($request.hasBody), $request.authorized)
+    let result = if($admit, if($access, "access", "sign-out"), "refuse")
+
+# Apps still admit the request and enforce their own authority after return.
+process gatewayIdentity.workspaceReturn:
+  let request = $eventInput
+  let path = $request.path
+  let result = false
+  when eq($path, "/workspace/home"):
+    let result = true
+  when eq($path, "/workspace/platform"):
+    let result = true
+  when eq($path, "/workspace/vm-manager"):
+    let result = $request.vmQuery
+  when includes(list("/workspace/work", "/stripe/sandbox/billing/", "/assurance-clarify/workspace/home", "/aster-codex/", "/aster-codex/chat"), $path):
+    let result = true
+  when includes(list("life-board", "game", "store", "shop", "encounter-pilot"), $request.mount):
+    let result = true

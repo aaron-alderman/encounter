@@ -1,0 +1,77 @@
+process-module "temple/surface-process-module/1"
+
+process templeApplication.plan:
+  let config = $eventInput
+  each list("executable", "args", "env") as field:
+    let value = at($config, $field)
+    port value.type { value = $value } → kind
+    assert or(eq($kind, "undefined"), eq($value, null))
+      otherwise "Native Server Temple launch requires a pinned Encounter image declaration."
+  let application = $config.nativeApplication
+  port value.describe { value = $application } → shape
+  assert and($shape.plain, eq($application.protocol, "encounter/server-temple-application/1"))
+    otherwise "Expected a native Server Temple application declaration."
+  port record.entries { value = $application } → fields
+  assert eq(count($fields), 5)
+    otherwise "Native Server Temple application declaration has an unexpected shape."
+  each $fields as field:
+    assert includes(list("protocol", "image", "sha256", "store", "port"), at($field, 0))
+      otherwise "Unknown native Server Temple application field."
+  each list($application.image, $application.store) as path:
+    call checkpoint.absolutePath
+  port text.matches { value = $application.sha256; pattern = "\\A[a-f0-9]{64}\\z" } → pin
+  port number.isNatural { value = $application.port } → integer
+  port number.calculate { operation = "lessEqual"; values = list($application.port, 65535) } → port
+  assert and($pin, $integer, $port)
+    otherwise "Expected a native Server Temple image digest and loopback port."
+  let result = $application
+
+process templeApplication.event:
+  let input = $eventInput
+  let phase = $input.phase
+  let generation = $input.token.generation
+  let writerId = $input.token.holder
+  let startedAt = $input.token.acquired_at
+  let pid = $input.pid
+  let kind = null
+  let eventId = null
+  let payload = null
+  when eq($phase, "boot"):
+    let basis = { writerId = $writerId; startedAt = $startedAt; generation = $generation }
+    port json.canonical { value = $basis } → bytes
+    port digest.sha256 { text = $bytes } → digest
+    let eventId = concat("boot.", $digest)
+    let kind = "ServerTempleRestarted"
+    let payload = { localOnly = false; writerGeneration = $generation }
+  when includes(list("start", "stop", "transit"), $phase):
+    let basis = { pid = $pid; startedAt = $startedAt }
+    port json.canonical { value = $basis } → bytes
+    port digest.sha256 { text = $bytes } → digest
+    let runtimeId = concat("server-temple-runtime.", $digest)
+    when eq($phase, "start"):
+      let eventId = concat("runtime-start.", $runtimeId)
+      let kind = "ServerTempleRuntimeStarted"
+      let payload = { runtimeId = $runtimeId; pid = $pid; startedAt = $startedAt; executable = "/proc/self/exe";
+        args = $input.args; inheritedTempleBoundary = true; writerGeneration = $generation }
+    when eq($phase, "transit"):
+      let basis = { runtimeId = $runtimeId; url = $input.transport.url }
+      port json.canonical { value = $basis } → bytes
+      port digest.sha256 { text = $bytes } → digest
+      let eventId = concat("transit-listening.", $digest)
+      let kind = "ServerTempleTransitListening"
+      let payload = { runtimeId = $runtimeId; url = $input.transport.url; loopbackOnly = true;
+        maximumBytes = $input.transport.maximumBytes; writerGeneration = $generation }
+    when eq($phase, "stop"):
+      let eventId = concat("runtime-stop.", $runtimeId)
+      let kind = if(or($input.error, $input.checkpointError), "ServerTempleRuntimeFailed", "ServerTempleRuntimeStopped")
+      let payload = { runtimeId = $runtimeId; pid = $pid; code = $input.code; signal = $input.signal;
+        error = $input.error; checkpointError = $input.checkpointError; writerGeneration = $generation }
+  assert and($kind, $eventId, $payload)
+    otherwise "Invalid native Server Temple runtime lifecycle phase."
+  port json.canonical { value = $payload } → payloadJson
+  port digest.sha256 { text = $payloadJson } → payloadHash
+  let row = { sequence = add($input.journal.eventCount, 1); event_id = $eventId; kind = $kind;
+    actor = $writerId; occurred_at = if(eq($phase, "boot"), $startedAt, $input.now);
+    payload_hash = $payloadHash; previous_hash = $input.journal.headHash }
+  call capsule.eventHash
+  let result = { event = $row; payloadJson = $payloadJson; eventHash = $result }

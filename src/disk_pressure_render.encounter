@@ -1,0 +1,106 @@
+process-module "temple/surface-process-module/1"
+
+process diskPressure.gib:
+  port number.calculate { operation = "divide"; values = list($eventInput, 1073741824) } → size
+  port number.format { value = $size; digits = 2 } → result
+
+process diskPressure.rows:
+  let values = $eventInput.rows
+  let profile = $eventInput.profile
+  let result = list({ tag = "tr"; children = list({ tag = "td"; attrs = { colspan = "4" }; children = list("None") }) })
+  when count($values):
+    fold $values as row; rows starts list():
+      port kernel.invoke { query = "diskPressure.gib"; input = $row.bytes } → size
+      let cells = list()
+      when eq($profile, "classification"):
+        let cells = list(
+          { tag = "td"; children = list($row.kind) },
+          { tag = "td"; children = list({ tag = "code"; children = list($row.name) }) },
+          { tag = "td"; attrs = { class = concat("state ", $row.classification) }; children = list($row.classification) },
+          { tag = "td"; children = list(concat($size, " GiB · ", $row.reason)) }
+        )
+      when eq($profile, "closure"):
+        let platform = "unverified"
+        when $row.platform:
+          let platform = concat($row.platform.os, "/", $row.platform.architecture, " · ", $row.platform.runtime, " ", $row.platform.runtimeVersion)
+        let cells = list(
+          { tag = "td"; children = list({ tag = "code"; children = list(or($row.closureHash, $row.id)) }) },
+          { tag = "td"; children = list($platform) },
+          { tag = "td"; children = list(concat(count($row.references), " · ", $row.reason)) },
+          { tag = "td"; children = list(concat($size, " GiB")) }
+        )
+      when eq($profile, "candidate"):
+        let label = ""
+        when eq($row.kind, "runtime"):
+          port text.slice { value = $row.evidence.evidenceSha256; start = 0; end = 12 } → prefix
+          let label = concat("Evidence ", $prefix, " · ", count($row.evidence.artifacts), " retained artifacts verified")
+        when eq($row.kind, "release"):
+          port text.slice { value = $row.evidence.manifestSha256; start = 0; end = 12 } → manifest
+          port text.slice { value = $row.evidence.releaseRecordSha256; start = 0; end = 12 } → record
+          let label = concat("Manifest ", $manifest, " · ", $row.evidence.capsuleCount, " capsules · release record ", $record)
+        let cells = list(
+          { tag = "td"; children = list($row.kind) },
+          { tag = "td"; children = list({ tag = "code"; children = list($row.path) }) },
+          { tag = "td"; children = list(concat($size, " GiB")) },
+          { tag = "td"; attrs = { class = "ok" }; children = list($label) }
+        )
+      yield append($rows, list({ tag = "tr"; children = $cells })) → result
+
+process diskPressure.render:
+  let report = $eventInput
+  port number.isNatural { value = $report.pressure.availablePercent } → natural
+  port number.calculate { operation = "lessEqual"; values = list($report.pressure.availablePercent, 100) } → withinRange
+  assert and($natural, $withinRange)
+    otherwise "Invalid available disk percentage."
+  let inventory = $report.inventory
+  let summary = $report.summary
+  each list($report.retention.minimumRollbackReleases, $report.retention.quarantineDays, $report.retention.assessmentHistoryDays) as days:
+    port number.isNatural { value = $days } → valid
+    assert $valid
+      otherwise "Invalid disk-pressure retention value."
+  fold $inventory.runtimes as row; rows starts list():
+    port text.slice { value = $row.referenceHash; start = 0; end = 12 } → name
+    let classification = if(eq($row.status, "retained"), "live", if(eq($row.status, "candidate"), "reconstructible", "isolated"))
+    let reason = concat($row.reason, if($row.releaseEvidence, "; release-evidence-complete", "; release-evidence-legacy-or-incomplete"))
+    yield append($rows, list({ kind = "Runtime"; name = $name; bytes = $row.bytes; classification = $classification; reason = $reason })) → rows
+  let rows = append($rows, map($inventory.releases, "row",
+    { kind = "Release"; name = $row.id; bytes = $row.bytes; classification = $row.classification; reason = $row.reason }))
+  fold $inventory.dependencyClosures as row; classifications starts $rows:
+    port text.slice { value = if($row.closureHash, $row.closureHash, $row.id); start = 0; end = 12 } → name
+    yield append($classifications, list({ kind = "Dependency closure"; name = $name;
+      bytes = $row.bytes; classification = $row.classification; reason = $row.reason })) → rows
+  let rows = append($rows, map($inventory.ancillary, "row",
+    { kind = "Tree"; name = $row.id; bytes = $row.bytes; classification = $row.classification; reason = $row.reason }))
+  port kernel.invoke { query = "diskPressure.rows"; input = { rows = $rows; profile = "classification" } } → classificationRows
+  port kernel.invoke { query = "diskPressure.rows"; input = { rows = $inventory.dependencyClosures; profile = "closure" } } → closureRows
+  port kernel.invoke { query = "diskPressure.rows"; input = { rows = $report.candidates; profile = "candidate" } } → candidateRows
+  port record.entries { value = $report.health.services } → services
+  let health = and($report.health.readiness.passed, every($services, "service", eq(at($service, 1), "active")))
+  port kernel.invoke { query = "diskPressure.gib"; input = $report.pressure.availableBytes } → availableGib
+  port kernel.invoke { query = "diskPressure.gib"; input = $summary.candidateBytes } → candidateGib
+  port kernel.invoke { query = "diskPressure.gib"; input = $summary.dependencyClosureBytes } → closureGib
+  port kernel.invoke { query = "diskPressure.gib"; input = $summary.avoidedDependencyBytes } → avoidedGib
+  let candidates = $summary.candidateCount
+  let notice = if($candidates, concat($candidates, " exact path(s) have complete reconstruction evidence; inspect the generated approval gate before any action."),
+    "Nothing is both unreferenced and proven reconstructible in the current scan.")
+  let slots = {
+    createdAt = $report.createdAt; pressureStatus = $report.pressure.status; availablePercent = $report.pressure.availablePercent;
+    availableLabel = concat($report.pressure.availablePercent, "%"); availableGib = $availableGib;
+    candidateCount = $candidates; candidateGib = $candidateGib; isolatedCount = $summary.isolatedCount;
+    healthClass = if($health, "healthy", "critical"); healthLabel = if($health, "passing", "attention"); healthStatus = $report.health.readiness.status; healthAllow = $report.health.readiness.allow;
+    closureCount = $summary.dependencyClosureCount; closureGib = $closureGib; avoidedGib = $avoidedGib;
+    completeCount = add($summary.evidenceCompleteRuntimeCount, $summary.evidenceCompleteApplicationReleaseCount);
+    noticeTitle = if($candidates, "Approval required", "No retirement proposed"); notice = $notice;
+    liveCount = count(filter($rows, "row", eq($row.classification, "live"))); rollbackCount = count(filter($rows, "row", eq($row.classification, "rollback")));
+    reconstructibleCount = count(filter($rows, "row", eq($row.classification, "reconstructible")));
+    isolatedLegend = count(filter($rows, "row", eq($row.classification, "isolated")));
+    unknownCount = count(filter($rows, "row", eq($row.classification, "unknown")));
+    classificationRows = $classificationRows; closureRows = $closureRows; candidateRows = $candidateRows;
+    rollbackFloor = $report.retention.minimumRollbackReleases; quarantineDays = $report.retention.quarantineDays;
+    historyDays = $report.retention.assessmentHistoryDays; assessmentHash = $report.assessmentHash; authoritySha256 = $report.authority.markerSha256;
+    gateTitle = if($candidates, "Retirement candidates found.", "No retirement proposed.")
+  }
+  call diskPressure.index
+  let index = $result
+  call diskPressure.gate
+  let result = { index = $index; gate = $result }

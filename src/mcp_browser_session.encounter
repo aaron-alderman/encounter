@@ -1,0 +1,65 @@
+process-module "temple/surface-process-module/1"
+
+process mcpBrowserSession.cookie:
+  let matches = filter($eventInput, "entry", eq(at($entry, 0), "__Host-sourcery_session"))
+  let result = if(eq(count($matches), 1), at(at($matches, 0), 1), null)
+
+process mcpBrowserSession.coordinate:
+  port text.matches { value = $eventInput; pattern = "\\Asrc_session_[A-Za-z0-9_-]{1,2036}\\z" } → valid
+  let result = null
+  when $valid:
+    port digest.sha256 { text = $eventInput } → result
+
+process mcpBrowserSession.snapshot:
+  let snapshot = $eventInput
+  port value.describe { value = $snapshot.controlRevision } → revision
+  assert and(eq($snapshot.projectionProtocol, "encounter/hosted-mcp-browser-session/1"),
+    includes(list(1, 2), $snapshot.controlSchemaVersion), eq($revision.type, "number"),
+    eq($snapshot.controlRevision, $snapshot.controlDocumentRevision), isArray($snapshot.sessions))
+    otherwise "The hosted MCP browser session snapshot is missing or crossed."
+  let result = true
+
+process mcpBrowserSession.subject:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  port kernel.invoke { query = "mcpBrowserSession.snapshot"; input = $snapshot } → admitted
+  let result = null
+  when eq(count($snapshot.sessions), 1):
+    let session = at($snapshot.sessions, 0)
+    port value.describe { value = $session.id } → sessionId
+    port value.describe { value = $session.userId } → user
+    port value.describe { value = $input.expiresMs } → expiry
+    when and(eq($sessionId.type, "string"), $session.id, eq($user.type, "string"), $session.userId,
+      eq($session.identityCount, 1), eq($session.revokedAt, null), eq($expiry.type, "number")):
+      port number.calculate { operation = "greater"; values = list($input.expiresMs, $input.nowMs) } → current
+      when $current:
+        let result = { kind = "user"; userId = $session.userId; sessionId = $session.id }
+
+process mcpBrowserSession.portfolio:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  assert and(eq($snapshot.portfolioProtocol, "encounter/hosted-mcp-browser-portfolio/1"), isArray($snapshot.candidates))
+    otherwise "The hosted MCP browser portfolio snapshot is missing or crossed."
+  call mcpBrowserSession.subject
+  let subject = $result
+  let result = { subject = $subject; portfolios = list() }
+  when $subject:
+    port kernel.invoke { query = "mcpWorkspaceAccess.inventory"; input = { snapshot = $snapshot; allPortfolios = true } } → rows
+    fold $rows as row; state starts { seen = {}; portfolios = list() }:
+      let scope = { tenantId = $row.tenantId; appId = $row.appId }
+      port value.describe { value = $scope.tenantId } → tenant
+      port value.describe { value = $scope.appId } → app
+      assert and(eq($tenant.type, "string"), $scope.tenantId, eq($app.type, "string"), $scope.appId)
+        otherwise "The hosted MCP browser portfolio has missing scope coordinates."
+      port json.stringify { value = $scope } → coordinate
+      port digest.sha256 { text = $coordinate } → id
+      let next = $state
+      when not(at($state.seen, $id)):
+        let labels = $row.labels
+        let portfolio = { id = $id; scope = $scope; summary = {
+          tenant = if($labels.tenant, $labels.tenant, $scope.tenantId);
+          application = if($labels.app, $labels.app, $scope.appId) } }
+        port record.put { record = $state.seen; key = $id; value = true } → seen
+        let next = { seen = $seen; portfolios = append($state.portfolios, list($portfolio)) }
+      yield $next → inventory
+    let result = { subject = $subject; portfolios = $inventory.portfolios }

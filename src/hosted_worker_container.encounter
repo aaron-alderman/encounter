@@ -1,0 +1,91 @@
+process-module "temple/surface-process-module/1"
+
+process workerContainer.authority:
+  call workerContainer.socket
+  assert eq($eventInput, $result)
+    otherwise "Self-hosted Podman authority must use the dedicated local Unix socket."
+
+process workerContainer.socket:
+  let result = "unix:///run/sourcery-podman/podman.sock"
+
+process workerContainer.ready:
+  let input = $eventInput
+  port kernel.invoke { query = "workerImage.digest"; input = $input.image } → image
+  assert eq($input.observed, $image)
+    otherwise "Rootless Podman local image identity does not match the admitted digest."
+  let result = { status = "ready"; image = $image; pullPolicy = "never"; localIdentityVerified = true }
+
+process workerContainer.limit:
+  let input = $eventInput
+  port number.isNatural { value = $input.value } → whole
+  port number.calculate { operation = "greaterEqual"; values = list($input.value, $input.min) } → lower
+  port number.calculate { operation = "lessEqual"; values = list($input.value, $input.max) } → upper
+  assert and($whole, $lower, $upper)
+    otherwise "Container resource limits must be bounded integers."
+  let result = $input.value
+
+process workerContainer.dispatchLimits:
+  let input = $eventInput
+  port kernel.invoke { query = "workerContainer.limit"; input = { value = $input.maximumOutputBytes; min = 1024; max = 16777216 } } → output
+  port kernel.invoke { query = "workerContainer.limit"; input = { value = $input.maximumErrorBytes; min = 1024; max = 1048576 } } → error
+  port number.calculate { operation = "lessEqual"; values = list($error, 8192) } → small
+  let result = { maximumOutputBytes = $output; maximumErrorBytes = $error; diagnosticBytes = if($small, $error, 8192) }
+
+process workerContainer.failure:
+  port text.replace { value = $eventInput.stderr; pattern = "\\x00"; replacement = ""; flags = "g" } → stderr
+  port text.split { value = $stderr; pattern = "\\r?\\n" } → rawLines
+  fold $rawLines as line; lines starts list():
+    port text.trim { value = $line } → trimmed
+    port number.calculate { operation = "less"; values = list(count($lines), 4) } → remaining
+    yield if(and($trimmed, $remaining), append($lines, list($trimmed)), $lines) → lines
+  port text.join { values = $lines; separator = " | " } → joined
+  port text.replace { value = $joined; pattern = "[A-Za-z0-9_-]{80,}"; replacement = "<redacted>"; flags = "g" } → redacted
+  port text.slice { value = $redacted; start = 0; end = 2048 } → diagnostic
+  port text.matches { value = $diagnostic; pattern = "ProjectValidationError" } → invalid
+  port text.matches { value = $diagnostic; pattern = "EACCES|permission denied"; flags = "i" } → permission
+  port text.matches { value = $diagnostic; pattern = "ENOENT|no such file"; flags = "i" } → missing
+  let code = if($invalid, "authoring-worker-project-invalid", if($permission, "authoring-worker-workspace-permission",
+    if($missing, "authoring-worker-source-missing", "authoring-worker-unavailable")))
+  let message = if($diagnostic, concat("The isolated container worker failed: ", $diagnostic), "The isolated container worker failed.")
+  let result = { code = $code; message = $message }
+
+process workerContainer.launch:
+  let input = $eventInput
+  port kernel.invoke { query = "workerContainer.authority"; input = $input.socket } → socket
+  port kernel.invoke { query = "workerImage.digest"; input = $input.image } → image
+  each list($input.sourceRoot, $input.workspaceRoot) as mount:
+    port text.matches { value = $mount; pattern = "\\A/[^:,\\p{Cc}]+\\z" } → absolute
+    assert $absolute
+      otherwise "Container worker mount paths contain unsupported delimiters."
+  assert not(eq($input.sourceRoot, $input.workspaceRoot))
+    otherwise "Container worker release and workspace roots must be distinct."
+  port kernel.invoke { query = "workerContainer.limit"; input = { value = $input.memoryMegabytes; min = 128; max = 16384 } } → memory
+  port kernel.invoke { query = "workerContainer.limit"; input = { value = $input.cpuLimit; min = 1; max = 64 } } → cpus
+  port kernel.invoke { query = "workerContainer.limit"; input = { value = $input.pidLimit; min = 16; max = 4096 } } → pids
+  port text.matches { value = $input.containerUser; pattern = "\\A[0-9]{1,10}:[0-9]{1,10}\\z" } → user
+  assert $user
+    otherwise "Container worker user identity is invalid."
+  let key = $input.assignmentPublicJwk
+  port text.matches { value = $key.x; pattern = "\\A[A-Za-z0-9_-]{43}\\z" } → keyBytes
+  assert and(eq($key.kty, "OKP"), eq($key.crv, "Ed25519"), $keyBytes)
+    otherwise "Container worker assignment key must be Ed25519."
+  let target = $input.target
+  port kernel.invoke { query = "workspaceStorage.allocation"; input = { operation = "resolve";
+    tenantId = $target.tenantId; appId = $target.appId; projectId = $target.projectId;
+    workspaceId = $target.workspaceId; storageNamespace = $target.storageNamespace } } → allocation
+  port json.stringify { value = $input.target } → targetJson
+  port json.stringify { value = $key } → keyJson
+  port text.base64url { value = $targetJson } → target
+  port text.base64url { value = $keyJson } → publicKey
+  let source = $input.sourceRoot
+  let result = { socket = $socket; arguments = list("run", "--rm", "--interactive", "--pull=never", "--network=none",
+    "--read-only", "--cap-drop=all", "--security-opt=no-new-privileges", "--http-proxy=false", "--unsetenv-all",
+    "--env=PATH=/usr/local/bin",
+    "--image-volume=ignore", "--no-healthcheck", "--entrypoint=/usr/local/bin/node", "--userns=keep-id",
+    "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=64m", "--workdir=/workspace", concat("--user=", $input.containerUser),
+    concat("--memory=", $memory, "m"), concat("--cpus=", $cpus), concat("--pids-limit=", $pids),
+    concat("--volume=", $source, ":/opt/sourcery:ro"), concat("--volume=", $input.workspaceRoot, ":/workspace:rw"),
+    concat("--volume=", $source, "/node_modules:/workspace/node_modules:ro"),
+    concat("--volume=", $source, "/plugins:/workspace/plugins:ro"),
+    $image, "/opt/sourcery/plugins/hosted-control-plane/container-authoring-worker.mjs", $target, $publicKey,
+    $input.workerId, $input.issuer, $input.audience, $input.projectFile) }

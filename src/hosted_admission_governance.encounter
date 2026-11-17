@@ -1,0 +1,305 @@
+process-module "temple/surface-process-module/1"
+
+process admissionGovernance.text:
+  port value.string { value = or($eventInput, "") } → string
+  port text.trim { value = $string } → result
+  assert $result
+    otherwise "Admission governance requires nonempty text."
+
+process admissionGovernance.hash:
+  port kernel.invoke { query = "admissionGovernance.text"; input = $eventInput } → result
+  port text.matches { value = $result; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert $valid
+    otherwise "Admission governance requires a SHA-256 hash."
+
+process admissionGovernance.textList:
+  let source = or($eventInput, list())
+  assert isArray($source)
+    otherwise "Admission governance requires a text list."
+  fold $source as item; result starts list():
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item } → text
+    yield append($result, list($text)) → result
+
+process admissionGovernance.digest:
+  port json.canonical { value = $eventInput } → encoded
+  port digest.sha256 { text = $encoded } → result
+
+process admissionGovernance.artifact:
+  let result = null
+  when $eventInput.manifest:
+    port kernel.invoke { query = "admissionGovernance.stewardship"; input = $eventInput } → result
+  when $eventInput.lineage:
+    port kernel.invoke { query = "admissionGovernance.lineage"; input = $eventInput } → lineage
+
+process admissionGovernance.lineage:
+  let lineage = $eventInput.lineage
+  let production = $lineage.production
+  port value.type { value = at($lineage, "parents") } → parentsType
+  let parents = if(eq($parentsType, "undefined"), list(), $lineage.parents)
+  let evidence = or($production.evidence, list())
+  let principals = or($production.principals, list())
+  assert and(eq($lineage.protocol, "sourcery-admission-lineage/1"),
+    eq($production.protocol, "sourcery-admission-production/1"), isArray($parents),
+    isArray($evidence), count($evidence), isArray($principals), count($principals))
+    otherwise "Invalid admission lineage."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $lineage.application } → application
+  assert eq($application, $eventInput.application)
+    otherwise "Admission lineage belongs to another application."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $production.kind } → kind
+  assert includes(list("change", "merge", "recovery", "import"), $kind)
+    otherwise "Invalid admission lineage production kind."
+  fold $parents as item; normalizedParents starts list():
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $item.artifactHash } → artifactHash
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item.relation } → relation
+    yield append($normalizedParents, list({ artifactHash = $artifactHash; relation = $relation })) → normalizedParents
+  let parentIds = map($normalizedParents, "item", $item.artifactHash)
+  assert eq(count(distinct($parentIds)), count($parentIds))
+    otherwise "Admission lineage contains duplicate parents."
+  fold $evidence as item; normalizedEvidence starts list():
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $item.hash } → hash
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item.kind } → kind
+    yield append($normalizedEvidence, list({ kind = $kind; hash = $hash })) → normalizedEvidence
+  fold $principals as item; normalizedPrincipals starts list():
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item.id } → id
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item.role } → role
+    port kernel.invoke { query = "admissionGovernance.text"; input = $item.source } → source
+    yield append($normalizedPrincipals, list({ id = $id; role = $role; source = $source })) → normalizedPrincipals
+  let parentKeys = map($normalizedParents, "item", concat($item.relation, "\u0000", $item.artifactHash))
+  let evidenceKeys = map($normalizedEvidence, "item", concat($item.kind, "\u0000", $item.hash))
+  let principalKeys = map($normalizedPrincipals, "item", concat($item.role, "\u0000", $item.id))
+  assert and(eq(count(distinct($evidenceKeys)), count($evidenceKeys)),
+    eq(count(distinct($principalKeys)), count($principalKeys)))
+    otherwise "Admission lineage evidence and principals must be unique."
+  port value.sort { values = $parentKeys; mode = "locale" } → parentOrder
+  port value.sort { values = $evidenceKeys; mode = "locale" } → evidenceOrder
+  port value.sort { values = $principalKeys; mode = "locale" } → principalOrder
+  let sortedParents = map($parentOrder, "key", at(filter($normalizedParents, "item", eq($key, concat($item.relation, "\u0000", $item.artifactHash))), 0))
+  let sortedEvidence = map($evidenceOrder, "key", at(filter($normalizedEvidence, "item", eq($key, concat($item.kind, "\u0000", $item.hash))), 0))
+  let sortedPrincipals = map($principalOrder, "key", at(filter($normalizedPrincipals, "item", eq($key, concat($item.role, "\u0000", $item.id))), 0))
+  port kernel.invoke { query = "admissionGovernance.digest";
+    input = { protocol = $lineage.protocol; application = $application; parents = $sortedParents;
+      production = { protocol = $production.protocol; kind = $kind; evidence = $sortedEvidence; principals = $sortedPrincipals } } } → digest
+  assert eq($digest, $lineage.hash)
+    otherwise "Admission lineage hash does not verify."
+  let result = true
+
+process admissionGovernance.adjudication:
+  let input = $eventInput.adjudication
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.mode } → mode
+  port kernel.invoke { query = "admissionGovernance.textList"; input = $input.adjudicators } → actors
+  assert and(count($actors), eq(count(distinct($actors)), count($actors)),
+    every($actors, "actor", includes($eventInput.stewards, $actor)))
+    otherwise "Adjudicators must be a nonempty unique subset of the stewards."
+  assert includes(list("quorum", "designated-adjudicator"), $mode)
+    otherwise "Invalid stewardship adjudication mode."
+  let result = { mode = $mode; adjudicators = $actors }
+  when eq($mode, "quorum"):
+    port number.calculate { operation = "multiply"; values = list($input.quorum, 1) } → quorum
+    port number.isNatural { value = $quorum } → integer
+    port number.calculate { operation = "lessEqual"; values = list($quorum, count($actors)) } → attainable
+    assert and($integer, $quorum, $attainable)
+      otherwise "Invalid stewardship adjudication quorum."
+    port record.put { record = $result; key = "quorum"; value = $quorum } → result
+  when eq($mode, "designated-adjudicator"):
+    port kernel.invoke { query = "admissionGovernance.text"; input = $input.designatedAdjudicator } → actor
+    assert includes($actors, $actor)
+      otherwise "Designated adjudicator is not declared."
+    port record.put { record = $result; key = "designatedAdjudicator"; value = $actor } → result
+
+process admissionGovernance.determination:
+  let input = $eventInput
+  assert eq($input.protocol, "sourcery-resolution-determination/1")
+    otherwise "Invalid stewardship resolution protocol."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.id } → id
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.version } → version
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.strategy } → strategy
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.scope.component } → component
+  port kernel.invoke { query = "admissionGovernance.textList"; input = $input.stewards } → stewards
+  assert includes(list("unanimous", "priority", "designated-steward", "manual"), $strategy)
+    otherwise "Invalid stewardship resolution strategy."
+  assert and(count($stewards), eq(count(distinct($stewards)), count($stewards)))
+    otherwise "Invalid steward list."
+  let scope = { component = $component }
+  when $input.scope.path:
+    port kernel.invoke { query = "admissionGovernance.text"; input = $input.scope.path } → path
+    port record.put { record = $scope; key = "path"; value = $path } → scope
+  let result = { protocol = $input.protocol; id = $id; version = $version; scope = $scope; stewards = $stewards; strategy = $strategy }
+  when eq($strategy, "priority"):
+    port kernel.invoke { query = "admissionGovernance.textList"; input = $input.priority } → priority
+    assert and(eq(count($priority), count($stewards)), eq(count(distinct($priority)), count($priority)),
+      every($priority, "actor", includes($stewards, $actor)))
+      otherwise "Stewardship priority must order every steward once."
+    port record.put { record = $result; key = "priority"; value = $priority } → result
+  when eq($strategy, "designated-steward"):
+    port kernel.invoke { query = "admissionGovernance.text"; input = $input.designatedSteward } → actor
+    assert includes($stewards, $actor)
+      otherwise "Designated steward is not declared."
+    port record.put { record = $result; key = "designatedSteward"; value = $actor } → result
+  when and(eq($strategy, "manual"), $input.adjudication):
+    port kernel.invoke { query = "admissionGovernance.adjudication";
+      input = { adjudication = $input.adjudication; stewards = $stewards } } → adjudication
+    port record.put { record = $result; key = "adjudication"; value = $adjudication } → result
+
+process admissionGovernance.authority:
+  let input = $eventInput
+  assert eq($input.protocol, "sourcery-stewardship-authority/1")
+    otherwise "Invalid stewardship authority protocol."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.kind } → kind
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.declaredBy } → declaredBy
+  port kernel.invoke { query = "admissionGovernance.text"; input = $input.rationale } → rationale
+  port kernel.invoke { query = "admissionGovernance.hash"; input = $input.evidenceHash } → evidenceHash
+  assert includes(list("genesis-explicit", "admitted-succession"), $kind)
+    otherwise "Invalid stewardship authority kind."
+  let result = { protocol = $input.protocol; kind = $kind; declaredBy = $declaredBy; rationale = $rationale; evidenceHash = $evidenceHash }
+  when eq($kind, "admitted-succession"):
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $input.basisArtifactHash } → basis
+    port record.put { record = $result; key = "basisArtifactHash"; value = $basis } → result
+
+process admissionGovernance.stewardship:
+  let manifest = $eventInput.manifest
+  assert and(eq($manifest.protocol, "sourcery-stewardship-manifest/1"),
+    isArray($manifest.determinations), count($manifest.determinations))
+    otherwise "Invalid stewardship manifest."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $manifest.application } → application
+  assert eq($application, $eventInput.application)
+    otherwise "Stewardship manifest belongs to another application."
+  port kernel.invoke { query = "admissionGovernance.authority"; input = $manifest.authority } → authority
+  fold $manifest.determinations as item; determinations starts list():
+    port kernel.invoke { query = "admissionGovernance.determination"; input = $item } → determination
+    yield append($determinations, list($determination)) → determinations
+  let ids = map($determinations, "item", $item.id)
+  let scopes = map($determinations, "item", concat($item.scope.component, "\u0000", or($item.scope.path, "*")))
+  assert and(eq(count(distinct($ids)), count($ids)), eq(count(distinct($scopes)), count($scopes)))
+    otherwise "Stewardship determinations must have unique IDs and scopes."
+  port value.sort { values = $ids; mode = "locale" } → order
+  let sorted = map($order, "id", at(filter($determinations, "item", eq($item.id, $id)), 0))
+  port kernel.invoke { query = "admissionGovernance.digest";
+    input = { protocol = $manifest.protocol; application = $application; authority = $authority; determinations = $sorted } } → digest
+  assert eq($digest, $manifest.hash)
+    otherwise "Stewardship manifest hash does not verify."
+  let result = { application = $application; hash = $digest; determinations = $sorted }
+
+process admissionGovernance.authorizationBasis:
+  let receipt = $eventInput
+  let result = null
+  when $receipt:
+    assert eq($receipt.protocol, "sourcery-governance-authorization-receipt/1")
+      otherwise "Invalid governance authorization protocol."
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $receipt.basisArtifactHash } → result
+    assert eq($result, $receipt.basisArtifactHash)
+      otherwise "Governance authorization requires an exact admitted basis address."
+
+process admissionGovernance.authoringParent:
+  let parent = $eventInput.parent
+  let result = null
+  when $parent:
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $parent.artifactHash } → artifact
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $parent.intentHash } → intent
+    assert and(eq($artifact, $parent.artifactHash), eq($intent, $parent.intentHash))
+      otherwise "Authoring intent requires exact parent artifact and intent hashes."
+    assert and(isArray($eventInput.lineageParents),
+      some($eventInput.lineageParents, "item", eq($item.artifactHash, $artifact)))
+      otherwise "The retained authoring intent parent is not declared in admission lineage."
+    let result = { artifactHash = $artifact; intentHash = $intent }
+
+process admissionGovernance.authoringParentBinding:
+  assert eq($eventInput.expected, $eventInput.observed)
+    otherwise "The retained parent does not contain the declared authoring intent."
+  let result = true
+
+process admissionGovernance.decision:
+  let decision = $eventInput
+  assert eq($decision.protocol, "sourcery-governance-decision/1")
+    otherwise "Invalid governance decision protocol."
+  port kernel.invoke { query = "admissionGovernance.text"; input = $decision.disposition } → disposition
+  port kernel.invoke { query = "admissionGovernance.text"; input = $decision.principal } → principal
+  port kernel.invoke { query = "admissionGovernance.text"; input = $decision.attestation } → attestation
+  port kernel.invoke { query = "admissionGovernance.hash"; input = $decision.subjectHash } → subjectHash
+  port kernel.invoke { query = "admissionGovernance.hash"; input = $decision.evidenceHash } → evidenceHash
+  assert includes(list("approve", "reject", "withdraw"), $disposition)
+    otherwise "Invalid governance decision disposition."
+  let result = { protocol = $decision.protocol; principal = $principal; disposition = $disposition;
+    subjectHash = $subjectHash; evidenceHash = $evidenceHash; attestation = $attestation }
+  when $decision.identityEvidenceHash:
+    port kernel.invoke { query = "admissionGovernance.hash"; input = $decision.identityEvidenceHash } → identity
+    port record.put { record = $result; key = "identityEvidenceHash"; value = $identity } → result
+
+process admissionGovernance.outcome:
+  let determination = $eventInput.determination
+  let strategy = $determination.strategy
+  let adjudication = or($determination.adjudication, {})
+  let decisions = $eventInput.decisions
+  let present = map($decisions, "item", $item.principal)
+  let approvals = map(filter($decisions, "item", eq($item.disposition, "approve")), "item", $item.principal)
+  let result = null
+  when eq($strategy, "unanimous"):
+    assert every($determination.stewards, "actor", includes($approvals, $actor))
+      otherwise "Governance authorization lacks unanimous approval."
+    let result = { authorized = true; principals = $determination.stewards; rule = "unanimous" }
+  when eq($strategy, "priority"):
+    let first = at(filter($determination.priority, "actor", includes($present, $actor)), 0)
+    assert includes($approvals, $first)
+      otherwise "Governance authorization lacks the required priority approval."
+    let result = { authorized = true; principals = list($first); rule = "priority" }
+  when eq($strategy, "designated-steward"):
+    assert includes($approvals, $determination.designatedSteward)
+      otherwise "Governance authorization lacks the designated steward's approval."
+    let result = { authorized = true; principals = list($determination.designatedSteward); rule = "designated-steward" }
+  when and(eq($strategy, "manual"), eq($adjudication.mode, "designated-adjudicator")):
+    assert includes($approvals, $adjudication.designatedAdjudicator)
+      otherwise "Governance authorization lacks the designated adjudicator's approval."
+    let result = { authorized = true; principals = list($adjudication.designatedAdjudicator); rule = "manual-designated-adjudicator" }
+  when and(eq($strategy, "manual"), not(eq($adjudication.mode, "designated-adjudicator"))):
+    let eligible = or($adjudication.adjudicators, $determination.stewards)
+    let approved = filter($eligible, "actor", includes($approvals, $actor))
+    let quorum = if(eq($adjudication.mode, "quorum"), $adjudication.quorum, count($eligible))
+    port number.calculate { operation = "greaterEqual"; values = list(count($approved), $quorum) } → sufficient
+    assert $sufficient
+      otherwise "Governance authorization lacks quorum."
+    let result = { authorized = true; principals = $approved;
+      rule = if(eq($adjudication.mode, "quorum"), "manual-quorum", "manual-unanimous-stewards"); quorum = $quorum }
+  assert $result
+    otherwise "No authorized governance outcome."
+
+process admissionGovernance.authorization:
+  let input = $eventInput
+  let receipt = $input.receipt
+  port kernel.invoke { query = "admissionGovernance.authorizationBasis"; input = $receipt } → basis
+  port kernel.invoke { query = "admissionGovernance.text"; input = $receipt.application } → application
+  port kernel.invoke { query = "admissionGovernance.hash"; input = $receipt.subject.hash } → subject
+  assert and(eq($application, $input.application), eq($basis, $input.parentHash), eq($subject, $input.successorHash))
+    otherwise "Governance authorization does not bind this application, basis and successor."
+  assert eq($input.priorManifest.application, $application)
+    otherwise "Governance authorization requires a verified prior manifest."
+  let matches = filter($input.priorManifest.determinations, "item",
+    and(eq($item.scope.component, "$governance"), eq($item.scope.path, "$manifest")))
+  assert eq(count($matches), 1)
+    otherwise "The admitted basis lacks an exact amendment determination."
+  let determination = at($matches, 0)
+  let source = or($receipt.decisionLog, $receipt.decisions)
+  port value.type { value = $source } → sourceType
+  let source = if(eq($sourceType, "undefined"), list(), $source)
+  assert isArray($source)
+    otherwise "Governance authorization requires a decision log."
+  fold $source as item; log starts list():
+    port kernel.invoke { query = "admissionGovernance.decision"; input = $item } → decision
+    assert and(eq($decision.subjectHash, $subject), includes($determination.stewards, $decision.principal))
+      otherwise "Governance decision does not bind the successor or a declared steward."
+    yield append($log, list($decision)) → log
+  let principals = distinct(map($log, "item", $item.principal))
+  port value.sort { values = $principals; mode = "locale" } → order
+  fold $order as principal; decisions starts list():
+    let entries = filter($log, "item", eq($item.principal, $principal))
+    port number.calculate { operation = "subtract"; values = list(count($entries), 1) } → last
+    let decision = at($entries, $last)
+    yield if(eq($decision.disposition, "withdraw"), $decisions, append($decisions, list($decision))) → decisions
+  port kernel.invoke { query = "admissionGovernance.outcome";
+    input = { determination = $determination; decisions = $decisions } } → outcome
+  let body = { protocol = $receipt.protocol; application = $application; basisArtifactHash = $basis;
+    priorManifestHash = $input.priorManifest.hash; subject = { kind = "stewardship-manifest"; hash = $subject };
+    determination = { id = $determination.id; version = $determination.version; strategy = $determination.strategy };
+    decisionLog = $log; decisions = $decisions; outcome = $outcome; status = "authorized" }
+  port kernel.invoke { query = "admissionGovernance.digest"; input = $body } → digest
+  assert eq($digest, $receipt.receiptHash)
+    otherwise "Governance authorization receipt hash does not verify."
+  let result = true

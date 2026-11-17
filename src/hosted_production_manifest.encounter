@@ -1,0 +1,430 @@
+process-module "temple/surface-process-module/1"
+
+process productionManifest.section:
+  let input = $eventInput
+  port value.describe { value = $input.value } → shape
+  assert $shape.plain
+    otherwise "Production manifest section must be an object."
+  port record.entries { value = $input.value } → entries
+  let keys = map($entries, "entry", at($entry, 0))
+  let allowed = map($input.schema, "field", at($field, 0))
+  assert not(some($keys, "key", not(includes($allowed, $key))))
+    otherwise "Production manifest section has unsupported fields."
+  fold $input.schema as field; result starts {}:
+    let name = at($field, 0)
+    let value = at($input.value, $name)
+    let kind = at($field, 1)
+    when eq($kind, "path"):
+      port kernel.invoke { query = "productionManifest.path"; input = $value } → value
+    when and(eq($kind, "optionalPath"), includes($keys, $name)):
+      port kernel.invoke { query = "productionManifest.path"; input = $value } → value
+    when and(eq($kind, "optionalPath"), not(includes($keys, $name))):
+      let value = null
+    when eq($kind, "identity"):
+      port text.matches { value = $value; pattern = "\\A[a-z][a-z0-9._:/-]{0,159}\\z" } → valid
+      assert $valid
+        otherwise "Production manifest identity is invalid."
+    when eq($kind, "hash"):
+      port text.matches { value = $value; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+      assert $valid
+        otherwise "Production custody evidence hash is invalid."
+    when eq($kind, "integer"):
+      port number.isNatural { value = $value } → integer
+      port number.calculate { operation = "greaterEqual"; values = list($value, at($field, 2)) } → lower
+      port number.calculate { operation = "lessEqual"; values = list($value, at($field, 3)) } → upper
+      assert and($integer, $lower, $upper)
+        otherwise "Production manifest integer is outside its admitted bounds."
+    port record.put { record = $result; key = $name; value = $value } → next
+    yield $next → result
+
+process productionManifest.path:
+  port text.matches { value = $eventInput; pattern = "\\A/[^\\x00]*\\z" } → absolute
+  assert $absolute
+    otherwise "Production manifest path must be absolute."
+  port path.resolvePosix { base = "/"; path = $eventInput } → result
+
+process productionManifest.admit:
+  let input = $eventInput
+  let fields = list(list("protocol"), list("postgres"), list("sourceRoot", "path"), list("workspaceRoot", "path"),
+    list("capabilityRoot", "path"), list("oauthClientsFile", "path"), list("oauthClientMetadataHosts"),
+    list("assignmentPrivateKeyFile", "path"), list("interactionSecretsFile", "path"),
+    list("runtime"), list("worker"), list("capability"), list("operations"))
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $input; schema = $fields } } → paths
+  assert eq($input.protocol, "sourcery.hosted/self-hosted-production-infrastructure.v1")
+    otherwise "Self-hosted production manifest protocol is unsupported."
+  port kernel.invoke { query = "hostedPostgres.config"; input = { options = $input.postgres; manifest = true } } → postgres
+  port kernel.invoke { query = "mcpClient.hosts"; input = $input.oauthClientMetadataHosts } → metadata
+  let runtimeFields = list(list("socketPath", "path"), list("keyId", "identity"), list("verificationKeysFile", "path"),
+    list("issuer", "identity"), list("audience", "identity"))
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $input.runtime; schema = $runtimeFields } } → runtime
+  let workerFields = list(list("image"), list("podman"), list("imageAdmissionFile", "path"),
+    list("memoryMegabytes", "integer", 128, 16384), list("cpuLimit", "integer", 1, 64), list("pidLimit", "integer", 16, 4096))
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $input.worker; schema = $workerFields } } → worker
+  port kernel.invoke { query = "workerImage.digest"; input = $worker.image } → image
+  assert eq($worker.podman, "/usr/bin/podman")
+    otherwise "Container worker requires the platform Podman executable."
+  let capabilityFields = list(list("conformanceEvidenceFile", "path"), list("catalogPublicationFile", "path"),
+    list("maximumHistoryEntries", "integer", 100, 1000000), list("policyId", "identity"), list("currency"), list("monthlyLimit"),
+    list("maxActiveBindings", "integer", 1, 10000), list("reconciliationIntervalMs"), list("reconciliationTargetLimit"))
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $input.capability; schema = $capabilityFields } } → capability
+  assert eq($capability.currency, "AUD")
+    otherwise "Self-hosted capacity policy currency must be AUD."
+  port value.type { value = $capability.monthlyLimit } → limitType
+  port number.calculate { operation = "greaterEqual"; values = list($capability.monthlyLimit, 0) } → monthlyLimit
+  assert and(eq($limitType, "number"), $monthlyLimit)
+    otherwise "Self-hosted monthly capacity limit is invalid."
+  port kernel.invoke { query = "reconcile.options"; input = { actor = "actor.capability-reconciler";
+    intervalMs = $capability.reconciliationIntervalMs; targetLimit = $capability.reconciliationTargetLimit } } → reconciliation
+  let operations = null
+  port record.entries { value = $input } → entries
+  when some($entries, "entry", eq(at($entry, 0), "operations")):
+    let operationFields = list(list("socketPath", "path"), list("keyId", "identity"), list("privateKeyFile", "path"),
+      list("approvalAuthorityFile", "path"), list("maximumApprovalAgeMs", "integer", 60000, 86400000),
+      list("envelopeLifetimeMs", "integer", 1000, 60000), list("requestTimeoutMs", "integer", 1000, 60000),
+      list("releaseProposalFile", "optionalPath"))
+    port kernel.invoke { query = "productionManifest.section"; input = { value = $input.operations; schema = $operationFields } } → operations
+  let result = { protocol = $input.protocol; postgres = $postgres; sourceRoot = $paths.sourceRoot;
+    workspaceRoot = $paths.workspaceRoot; capabilityRoot = $paths.capabilityRoot; oauthClientsFile = $paths.oauthClientsFile;
+    oauthClientMetadataHosts = $metadata.hosts; assignmentPrivateKeyFile = $paths.assignmentPrivateKeyFile;
+    interactionSecretsFile = $paths.interactionSecretsFile; runtime = $runtime;
+    worker = { image = $image; imageAdmissionFile = $worker.imageAdmissionFile; memoryMegabytes = $worker.memoryMegabytes;
+      cpuLimit = $worker.cpuLimit; pidLimit = $worker.pidLimit };
+    capability = { conformanceEvidenceFile = $capability.conformanceEvidenceFile; catalogPublicationFile = $capability.catalogPublicationFile;
+      maximumHistoryEntries = $capability.maximumHistoryEntries; policyId = $capability.policyId; currency = $capability.currency;
+      monthlyLimit = $capability.monthlyLimit; maxActiveBindings = $capability.maxActiveBindings;
+      reconciliationIntervalMs = $reconciliation.intervalMs; reconciliationTargetLimit = $reconciliation.targetLimit }; operations = $operations }
+
+process productionManifest.source:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.path"; input = $input.supervised } → supervised
+  assert eq($input.sourceRoot, $supervised)
+    otherwise "Self-hosted worker source must be the exact supervisor-attested Sourcery source root."
+  let result = $supervised
+
+process productionManifest.interactionSecrets:
+  let input = $eventInput
+  port value.describe { value = $input } → shape
+  assert $shape.plain
+    otherwise "Interaction secrets must be an object."
+  port record.entries { value = $input } → entries
+  assert eq(count($entries), 2)
+    otherwise "Interaction secrets must contain exactly workspaceSelection and consent."
+  each list($input.workspaceSelection, $input.consent) as secret:
+    port text.matches { value = $secret; pattern = "\\A[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=\\z" } → valid
+    assert $valid
+      otherwise "Each interaction secret must encode exactly 32 bytes in canonical base64."
+  assert not(eq($input.workspaceSelection, $input.consent))
+    otherwise "Interaction secrets must be distinct."
+  let result = { workspaceSelection = $input.workspaceSelection; consent = $input.consent }
+
+process productionManifest.operationsRoster:
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $eventInput;
+    schema = list(list("protocol"), list("approvers"), list("expiresAt"), list("evidenceHash", "hash")) } } → roster
+  let approvers = $roster.approvers
+  port number.calculate { operation = "lessEqual"; values = list(count($approvers), 8) } → bounded
+  assert and(eq($roster.protocol, "sourcery.hosted/operations-approval-authority-roster.v1"),
+    isArray($approvers), count($approvers), $bounded)
+    otherwise "Operations approval authority roster is invalid."
+  port time.parseRfc3339 { value = $roster.expiresAt } → expiry
+  port time.formatUtc { milliseconds = $expiry; fractional = true } → canonical
+  assert eq($canonical, $roster.expiresAt)
+    otherwise "Operations approval authority expiry must be canonical UTC."
+  fold $approvers as candidate; actors starts list():
+    port kernel.invoke { query = "productionManifest.section"; input = { value = $candidate;
+      schema = list(list("actor", "identity"), list("authorityBasisHash", "hash")) } } → approver
+    assert not(includes($actors, $approver.actor))
+      otherwise "Operations approval authority roster contains duplicate actors."
+    yield append($actors, list($approver.actor)) → actors
+  let result = $roster
+
+process productionManifest.operationsApprover:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.operationsRoster"; input = $input.roster } → roster
+  port time.parseRfc3339 { value = $roster.expiresAt } → expiry
+  port number.calculate { operation = "lessEqual"; values = list($input.nowMs, $expiry) } → fresh
+  let result = { status = "denied"; actor = $input.actor; authorityBasisHash = $roster.evidenceHash }
+  fold $roster.approvers as approver; result starts $result:
+    let allowed = { status = "authorized"; actor = $approver.actor; authorityBasisHash = $approver.authorityBasisHash }
+    yield if(and($fresh, eq($approver.actor, $input.actor)), $allowed, $result) → result
+
+process productionManifest.cataloguePublication:
+  let input = $eventInput
+  port record.entries { value = $input } → entries
+  assert eq(count($entries), 8)
+    otherwise "Catalogue publication authority requires its exact fields."
+  port kernel.invoke { query = "productionManifest.section"; input = { value = $input;
+    schema = list(list("protocol"), list("operationId", "identity"), list("provider"),
+      list("catalogHash", "hash"), list("expectedRevision", "integer", 0, 1000000),
+      list("expectedPredecessorCatalogHash"), list("actor", "identity"), list("evidenceHash", "hash")) } } → publication
+  assert and(eq($publication.protocol, "sourcery.hosted/self-hosted-catalog-publication.v1"),
+    eq($publication.provider, "provider.sourcery.self-hosted-storage"))
+    otherwise "Catalogue publication authority requires the self-hosted storage provider."
+  when not(eq($publication.expectedPredecessorCatalogHash, null)):
+    port text.matches { value = $publication.expectedPredecessorCatalogHash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+    assert $valid
+      otherwise "Catalogue publication predecessor hash is invalid."
+  let result = $publication
+
+process productionManifest.catalogueAuthorize:
+  let input = $eventInput
+  let request = $input.request
+  port kernel.invoke { query = "productionManifest.cataloguePublication"; input = $input.publication } → publication
+  let authorized = and(eq($request.action, "publish"), eq($request.provider, $publication.provider),
+    eq($request.catalogHash, $publication.catalogHash), eq($request.predecessorCatalogHash, $publication.expectedPredecessorCatalogHash),
+    eq($request.actor, $publication.actor), eq($request.evidenceHash, $publication.evidenceHash))
+  let result = { authorized = $authorized; evidenceHash = $request.evidenceHash }
+
+process productionManifest.runtimeVerificationKeys:
+  let input = $eventInput
+  port value.describe { value = $input.keys } → shape
+  assert $shape.plain
+    otherwise "Runtime verification keyring must be an object."
+  port record.entries { value = $input.keys } → entries
+  port number.calculate { operation = "lessEqual"; values = list(count($entries), 4) } → bounded
+  assert and(count($entries), $bounded)
+    otherwise "Runtime verification keyring requires between one and four keys."
+  assert some($entries, "entry", eq(at($entry, 0), $input.activeKeyId))
+    otherwise "Runtime verification keyring omits the active key."
+  fold $entries as entry; result starts {}:
+    let id = at($entry, 0)
+    let key = at($entry, 1)
+    port text.matches { value = $id; pattern = "\\A[a-z][a-z0-9._:/-]{0,159}\\z" } → identifier
+    assert $identifier
+      otherwise "Runtime verification key identity is invalid."
+    port text.matches { value = $key.x; pattern = "\\A[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]\\z" } → encoded
+    assert and(eq($key.kty, "OKP"), eq($key.crv, "Ed25519"), $encoded)
+      otherwise "Runtime verification key must be an Ed25519 public JWK."
+    port record.put { record = $result; key = $id; value = { kty = "OKP"; crv = "Ed25519"; x = $key.x } } → next
+    yield $next → result
+
+process productionManifest.storageConformance:
+  let evidence = $eventInput
+  assert and(eq($evidence.protocol, "sourcery-capability-binding-conformance/1"),
+    eq($evidence.status, "passed"), isArray($evidence.checks), count($evidence.checks),
+    not(some($evidence.checks, "check", not(eq($check.status, "passed")))))
+    otherwise "Passing capability binding conformance evidence is required."
+  port record.entries { value = $evidence } → entries
+  port record.fromEntries { entries = filter($entries, "entry", not(eq(at($entry, 0), "evidenceHash"))) } → body
+  port json.canonical { value = $body } → wire
+  port digest.sha256 { text = $wire } → hash
+  assert eq($hash, $evidence.evidenceHash)
+    otherwise "Passing capability binding conformance evidence is required."
+  assert and(eq($evidence.provider, "provider.sourcery.self-hosted-storage"),
+    eq($evidence.providerOffer, "offer.storage.private-files.self-hosted"))
+    otherwise "Self-hosted storage conformance evidence names another provider or offer."
+  let result = $evidence
+
+process productionManifest.createReleaseArtifact:
+  let input = $eventInput
+  port value.describe { value = $input } → shape
+  port record.entries { value = $input } → fields
+  assert and($shape.plain, eq(count($fields), 6))
+    otherwise "HostedReleaseArtifact fields are not exact."
+  port text.matches { value = $input.application; pattern = "\\A[A-Za-z][A-Za-z0-9._:@/-]{0,159}\\z" } → application
+  assert $application
+    otherwise "Release application identity is invalid."
+  each list($input.artifactHash, $input.admissionReceiptHash, $input.compatibilityHash) as hash:
+    port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+    assert $valid
+      otherwise "Release artifact, admission receipt, or compatibility hash is invalid."
+  port kernel.invoke { query = "hostedRelease.generation"; input = $input.generationIdentity } → generation
+  port record.entries { value = $input.generationIdentity } → generationFields
+  assert and(eq(count($generationFields), 4), eq($input.generationIdentity.protocol, $generation.protocol),
+    eq($input.generationIdentity.generationHash, $generation.generationHash))
+    otherwise "Generation identity is not derived from the exact source and release pointer."
+  port kernel.invoke { query = "productionManifest.releaseInstant"; input = $input.createdAt } → createdAt
+  let body = { protocol = "sourcery.hosted/release-artifact.v1"; application = $input.application; artifactHash = $input.artifactHash;
+    admissionReceiptHash = $input.admissionReceiptHash; generationIdentity = $generation;
+    compatibilityHash = $input.compatibilityHash; createdAt = $createdAt }
+  port json.canonical { value = $body } → wire
+  port digest.sha256 { text = $wire } → hash
+  port record.put { record = $body; key = "releaseHash"; value = $hash } → result
+
+process productionManifest.releaseAddress:
+  let input = $eventInput
+  let retained = at($input.value, $input.field)
+  assert eq($input.value.protocol, $input.protocol)
+    otherwise "Release proposal artifact or assessment protocol is invalid."
+  port record.entries { value = $input.value } → entries
+  port record.fromEntries { entries = filter($entries, "entry", not(eq(at($entry, 0), $input.field))) } → body
+  port json.canonical { value = $body } → wire
+  port digest.sha256 { text = $wire } → hash
+  assert eq($retained, $hash)
+    otherwise "Release proposal artifact or assessment hash does not match."
+  let result = $hash
+
+process productionManifest.retainedArtifact:
+  port kernel.invoke { query = "productionManifest.releaseAddress"; input = {
+    value = $eventInput; protocol = "sourcery.hosted/release-artifact.v1"; field = "releaseHash" } } → hash
+  let result = $eventInput
+
+process productionManifest.retainedAssessment:
+  port kernel.invoke { query = "productionManifest.releaseAddress"; input = {
+    value = $eventInput; protocol = "sourcery.hosted/release-promotion-assessment.v1"; field = "assessmentHash" } } → hash
+  let result = $eventInput
+
+process productionManifest.promotionCommand:
+  let input = $eventInput
+  assert and(eq($input.command.policyHash, $input.policyHash), eq($input.command.target.subject, "sourcery-mcp"))
+    otherwise "operations-policy-stale|Release promotion command is stale or crossed."
+  let result = true
+
+process productionManifest.promotionArtifacts:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.retainedArtifact"; input = $input.candidate } → candidate
+  port kernel.invoke { query = "productionManifest.retainedArtifact"; input = $input.predecessor } → predecessor
+  assert and(eq($candidate.releaseHash, $input.candidateHash), eq($predecessor.releaseHash, $input.predecessorHash),
+    eq($candidate.application, "sourcery"), eq($predecessor.application, "sourcery"))
+    otherwise "sourcery-release-artifact-crossed|Resolved release artifacts cross the exact command bindings."
+  let result = true
+
+process productionManifest.promotionAssessment:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.retainedAssessment"; input = $input.assessment } → assessment
+  assert and(eq($assessment.policyHash, $input.policyHash), eq($assessment.targetId, "sourcery-mcp"),
+    eq($assessment.candidateReleaseHash, $input.candidateHash), eq($assessment.predecessorReleaseHash, $input.predecessorHash),
+    eq($assessment.status, "promotable"))
+    otherwise "sourcery-release-assessment-crossed|Release promotion assessment is stale or crossed."
+  let result = true
+
+process productionManifest.promotionEffect:
+  let input = $eventInput
+  let stateful = includes(list("pre-cutover", "cutover", "post-cutover", "rollback"), $input.phase)
+  let expected = if(includes(list("pre-cutover", "post-cutover"), $input.phase), "ready",
+    if(eq($input.phase, "cutover"), "switched", if(eq($input.phase, "continuity"), "passed",
+      if(eq($input.phase, "drain"), "drained", if(eq($input.phase, "rollback"), "restored", null)))))
+  assert $expected
+    otherwise "Unsupported release promotion effect."
+  let effect = $input.effect
+  port value.describe { value = $effect } → shape
+  port record.entries { value = if($shape.plain, $effect, {}) } → fields
+  let names = if($stateful, list("status", "stateHash", "evidence"), list("status", "evidence"))
+  assert and($shape.plain, eq(count($fields), count($names)),
+    not(some($fields, "field", not(includes($names, at($field, 0))))))
+    otherwise "Release promotion effect fields are not exact."
+  assert eq($effect.status, $expected)
+    otherwise "sourcery-release-promotion-check-failed|Release promotion effect did not pass."
+  when $stateful:
+    port text.matches { value = $effect.stateHash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+    assert $valid
+      otherwise "Release promotion effect state hash is invalid."
+  port number.calculate { operation = "lessEqual"; values = list(count($effect.evidence), 32) } → bounded
+  assert and(isArray($effect.evidence), count($effect.evidence), $bounded)
+    otherwise "Release promotion effect evidence is invalid."
+  fold $effect.evidence as item; evidence starts list():
+    port value.type { value = $item } → type
+    assert eq($type, "string")
+      otherwise "Release promotion effect evidence is invalid."
+    port text.trim { value = $item } → trimmed
+    assert $trimmed
+      otherwise "Release promotion effect evidence is invalid."
+    yield append($evidence, list($trimmed)) → evidence
+  let result = { evidence = $evidence; stateHash = $effect.stateHash }
+
+process productionManifest.releaseBindings:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.retainedArtifact"; input = $input.candidate } → candidate
+  port kernel.invoke { query = "productionManifest.retainedArtifact"; input = $input.predecessor } → predecessor
+  port kernel.invoke { query = "productionManifest.retainedAssessment"; input = $input.assessment } → assessment
+  assert and(eq($assessment.candidateReleaseHash, $candidate.releaseHash),
+    eq($assessment.predecessorReleaseHash, $predecessor.releaseHash))
+    otherwise "Release assessment lineage is crossed."
+  let ontology = "sourcery.hosted/release-artifact.v1"
+  let result = list(
+    { role = "candidate-release"; subject = concat("release.", $candidate.releaseHash); type = "HostedReleaseArtifact"; ontology = $ontology; revisionHash = $candidate.releaseHash },
+    { role = "predecessor-release"; subject = concat("release.", $predecessor.releaseHash); type = "HostedReleaseArtifact"; ontology = $ontology; revisionHash = $predecessor.releaseHash })
+
+process productionManifest.releaseProposal:
+  let proposal = $eventInput
+  port record.entries { value = $proposal } → entries
+  assert eq(count($entries), 5)
+    otherwise "Release proposal fields are not exact."
+  port text.matches { value = $proposal.operationId; pattern = "\\A[A-Za-z][A-Za-z0-9._:@/-]{0,159}\\z" } → id
+  port value.type { value = $proposal.reason } → reasonType
+  assert and($id, eq($reasonType, "string"))
+    otherwise "Release proposal identity or reason is invalid."
+  port text.trim { value = $proposal.reason } → reason
+  port number.calculate { operation = "lessEqual"; values = list(count($proposal.reason), 4096) } → bounded
+  assert and($reason, $bounded)
+    otherwise "Release proposal identity or reason is invalid."
+  let artifact = "sourcery.hosted/release-artifact.v1"
+  port kernel.invoke { query = "productionManifest.releaseAddress";
+    input = { value = $proposal.candidate; protocol = $artifact; field = "releaseHash" } } → candidate
+  port kernel.invoke { query = "productionManifest.releaseAddress";
+    input = { value = $proposal.predecessor; protocol = $artifact; field = "releaseHash" } } → predecessor
+  port kernel.invoke { query = "productionManifest.releaseAddress"; input = { value = $proposal.assessment;
+    protocol = "sourcery.hosted/release-promotion-assessment.v1"; field = "assessmentHash" } } → assessment
+  assert and(eq($proposal.assessment.targetId, "sourcery-mcp"),
+    eq($proposal.assessment.candidateReleaseHash, $candidate), eq($proposal.assessment.predecessorReleaseHash, $predecessor))
+    otherwise "Release proposal lineage is crossed."
+  let result = $proposal
+
+process productionManifest.releaseInstant:
+  port time.parseRfc3339 { value = $eventInput } → milliseconds
+  port time.formatUtc { milliseconds = $milliseconds; fractional = true } → canonical
+  assert eq($canonical, $eventInput)
+    otherwise "Release assessment timestamp is invalid."
+  let result = $canonical
+
+process productionManifest.assessRelease:
+  let input = $eventInput
+  let artifact = "sourcery.hosted/release-artifact.v1"
+  port kernel.invoke { query = "productionManifest.releaseAddress";
+    input = { value = $input.candidate; protocol = $artifact; field = "releaseHash" } } → candidate
+  port kernel.invoke { query = "productionManifest.releaseAddress";
+    input = { value = $input.predecessor; protocol = $artifact; field = "releaseHash" } } → predecessor
+  assert and(eq($input.candidate.application, $input.predecessor.application), not(eq($candidate, $predecessor)))
+    otherwise "Release promotion requires distinct releases for one application."
+  let required = list("backup-freshness", "candidate-readiness", "database-compatibility", "rollback-readiness", "timesheet-continuity")
+  assert and(isArray($input.checks), eq(count($input.checks), count($required)))
+    otherwise "Release promotion checks are incomplete."
+  fold $input.checks as check; admitted starts list():
+    port record.entries { value = $check } → fields
+    assert eq(count($fields), 4)
+      otherwise "Release promotion check fields are not exact."
+    assert and(includes($required, $check.kind), eq($check.status, "passed"))
+      otherwise "hosted-release-not-promotable|A required release promotion check did not pass."
+    port text.matches { value = $check.evidenceHash; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+    assert $hash
+      otherwise "Release promotion evidence hash is invalid."
+    port kernel.invoke { query = "productionManifest.releaseInstant"; input = $check.observedAt } → observedAt
+    yield append($admitted, list({ kind = $check.kind; status = "passed"; evidenceHash = $check.evidenceHash; observedAt = $observedAt })) → admitted
+  let kinds = map($admitted, "check", $check.kind)
+  assert eq(count(distinct($kinds)), count($required))
+    otherwise "Release promotion checks are duplicated or incomplete."
+  fold $required as kind; ordered starts list():
+    yield append($ordered, filter($admitted, "check", eq($check.kind, $kind))) → ordered
+  port kernel.invoke { query = "productionManifest.releaseInstant"; input = $input.assessedAt } → assessedAt
+  let body = { protocol = "sourcery.hosted/release-promotion-assessment.v1"; policyHash = $input.policyHash;
+    topologyHash = $input.topologyHash; targetId = $input.targetId; candidateReleaseHash = $candidate;
+    predecessorReleaseHash = $predecessor; checks = $ordered; assessedAt = $assessedAt; status = "promotable" }
+  port json.canonical { value = $body } → wire
+  port digest.sha256 { text = $wire } → hash
+  port record.put { record = $body; key = "assessmentHash"; value = $hash } → result
+
+process productionManifest.coordinateRelease:
+  let input = $eventInput
+  port kernel.invoke { query = "productionManifest.releaseProposal"; input = $input.proposal } → current
+  assert and(eq($current.assessment.policyHash, $input.policyHash),
+    eq($current.assessment.topologyHash, $input.topologyHash))
+    otherwise "Release proposal assessment is stale or foreign to the active operations policy."
+  port kernel.invoke { query = "productionManifest.releaseBindings"; input = $current } → bindings
+  let replay = not(eq($input.retained, null))
+  when $replay:
+    let plan = $input.retained
+    port json.canonical { value = $plan.bindings } → retainedBindings
+    port json.canonical { value = $bindings } → expectedBindings
+    assert and(eq($plan.operationKind, "release-promote"), eq($plan.target.subject, "sourcery-mcp"),
+      eq($plan.policyHash, $input.policyHash), eq($plan.requestedBy, $input.actor), eq($plan.reason, $current.reason),
+      eq($retainedBindings, $expectedBindings))
+      otherwise "Release proposal operation identity belongs to another retained plan."
+  let result = { bindings = $bindings; replay = $replay }
+
+process productionManifest.custody:
+  let input = $eventInput
+  port number.calculate { operation = "lessEqual"; values = list($input.bytes, $input.maximum) } → bounded
+  assert and($input.regular, $input.bytes, $bounded)
+    otherwise "Self-hosted custody file must be a bounded regular file."
+  assert and(eq($input.uid, $input.owner), $input.private)
+    otherwise "Self-hosted custody file must be root-owned, group-read-only at most, and inaccessible publicly."
+  let result = true

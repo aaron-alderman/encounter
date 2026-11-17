@@ -1,0 +1,96 @@
+process-module "temple/surface-process-module/1"
+
+process workerImage.digest:
+  port text.matches { value = $eventInput; pattern = "\\Asha256:[a-f0-9]{64}\\z" } → digest
+  assert $digest
+    otherwise "Worker image must have an immutable lowercase SHA-256 identity (a content-addressed digest)."
+  let result = $eventInput
+
+process workerImage.base:
+  let input = $eventInput
+  port kernel.invoke { query = "workerImage.digest"; input = $input.expected } → digest
+  assert and(eq($input.observed, $digest), eq($input.os, "linux"), eq($input.arch, "amd64"))
+    otherwise "Worker base image must match the exact local Linux amd64 image."
+  let result = true
+
+process workerImage.files:
+  let result = list("usr/local/bin/node", "lib/x86_64-linux-gnu/libdl.so.2",
+    "lib/x86_64-linux-gnu/libstdc++.so.6", "lib/x86_64-linux-gnu/libm.so.6",
+    "lib/x86_64-linux-gnu/libgcc_s.so.1", "lib/x86_64-linux-gnu/libpthread.so.0",
+    "lib/x86_64-linux-gnu/libc.so.6", "lib64/ld-linux-x86-64.so.2", "etc/os-release", "etc/debian_version")
+
+process workerImage.packageStatus:
+  let packages = list("libc6", "libstdc++6", "libgcc-s1")
+  fold $packages as package; paragraphs starts list():
+    let candidates = filter($eventInput, "entry", and(eq(at($entry, "Package"), $package), eq(at($entry, "Architecture"), "amd64")))
+    assert eq(count($candidates), 1)
+      otherwise "Worker base image requires exactly one amd64 status record for each retained package."
+    let entry = at($candidates, 0)
+    let version = at($entry, "Version")
+    port text.matches { value = $version; pattern = "\\A[0-9][0-9A-Za-z.+:~\\-]{0,127}\\z" } → valid
+    assert and(eq(at($entry, "Status"), "install ok installed"), $valid)
+      otherwise "Worker base package must be installed with a valid Debian version."
+    let paragraph = concat("Package: ", $package, "\nStatus: install ok installed\nArchitecture: amd64\nVersion: ", $version, "\n\n")
+    yield append($paragraphs, list($paragraph)) → paragraphs
+  port text.join { values = $paragraphs; separator = "" } → result
+
+process workerImage.recipe:
+  let result = "FROM scratch\nCOPY rootfs/ /\nENV PATH=/usr/local/bin\nWORKDIR /workspace\nLABEL org.opencontainers.image.title=\"Sourcery isolated authoring worker\" org.opencontainers.image.description=\"Minimal no-shell Node runtime; Sourcery source is mounted read-only at execution\"\n"
+
+process workerImage.admissionFields:
+  let input = $eventInput
+  port record.entries { value = $input.value } → entries
+  let keys = map($entries, "entry", at($entry, 0))
+  assert and(eq(count($keys), count($input.fields)), not(some($keys, "key", not(includes($input.fields, $key)))))
+    otherwise "Worker image admission contains missing or unsupported fields."
+  let result = $input.value
+
+process workerImage.admissionCustody:
+  let input = $eventInput
+  port number.calculate { operation = "lessEqual"; values = list($input.bytes, 16384) } → bounded
+  assert and($input.regular, $input.bytes, $bounded)
+    otherwise "Worker image admission must be a bounded regular custody file."
+  assert and(eq($input.uid, $input.expectedUid), not($input.groupWritable), not($input.groupExecutable), not($input.public))
+    otherwise "Worker image admission custody must have the expected owner and be group-read-only at most."
+  let result = true
+
+process workerImage.admission:
+  let input = $eventInput
+  port kernel.invoke { query = "workerImage.digest"; input = $input.image } → image
+  port kernel.invoke { query = "workerImage.admissionFields"; input = { value = $input.evidence;
+    fields = list("protocol", "imageId", "baseImageId", "baseManifestDigest", "nodeVersion", "platform", "sizeBytes",
+      "sourceCommit", "containerfileSha256", "scanner", "scanReportSha256", "findings", "functional", "qualifiedAt") } } → evidence
+  port kernel.invoke { query = "workerImage.admissionFields"; input = { value = $evidence.scanner;
+    fields = list("name", "version", "databaseUpdatedAt") } } → scanner
+  port kernel.invoke { query = "workerImage.admissionFields"; input = { value = $evidence.findings;
+    fields = list("high", "critical", "packagesAssessed", "osFamily", "osVersion") } } → findings
+  port kernel.invoke { query = "workerImage.admissionFields"; input = { value = $evidence.functional;
+    fields = list("nodeVersion", "shellAbsent", "productionIsolationProbe") } } → functional
+  assert and(eq($evidence.protocol, "sourcery.hosted/self-hosted-worker-image-admission.v1"),
+    eq($evidence.imageId, $image), eq($evidence.platform, "linux/amd64"))
+    otherwise "Worker image admission does not match the exact Linux amd64 image."
+  port kernel.invoke { query = "workerImage.digest"; input = $evidence.baseImageId } → base
+  port kernel.invoke { query = "workerImage.digest"; input = $evidence.baseManifestDigest } → baseManifest
+  port text.matches { value = $evidence.nodeVersion; pattern = "\\Av[0-9]+\\.[0-9]+\\.[0-9]+\\z" } → nodeVersion
+  port text.matches { value = $evidence.sourceCommit; pattern = "\\A[a-f0-9]{40}\\z" } → sourceCommit
+  port text.matches { value = $evidence.containerfileSha256; pattern = "\\A[a-f0-9]{64}\\z" } → recipeHash
+  port text.matches { value = $evidence.scanReportSha256; pattern = "\\A[a-f0-9]{64}\\z" } → scanHash
+  port value.type { value = $evidence.sizeBytes } → sizeType
+  assert eq($sizeType, "number")
+    otherwise "Worker image admission size must be numeric."
+  port number.calculate { operation = "remainder"; values = list($evidence.sizeBytes, 1) } → fractional
+  port number.calculate { operation = "greater"; values = list($evidence.sizeBytes, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($evidence.sizeBytes, 9007199254740991) } → bounded
+  assert and($nodeVersion, $sourceCommit, $recipeHash, $scanHash, eq($fractional, 0), $positive, $bounded)
+    otherwise "Worker image admission does not bind the runtime, recipe, and scan report."
+  port text.matches { value = $scanner.version; pattern = "\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z" } → scannerVersion
+  port time.parseRfc3339 { value = $scanner.databaseUpdatedAt } → scanDatabaseTime
+  port time.parseRfc3339 { value = $evidence.qualifiedAt } → qualifiedTime
+  port text.matches { value = $findings.osVersion; pattern = "\\A12\\." } → debianVersion
+  assert and(eq($scanner.name, "trivy"), $scannerVersion, eq($findings.high, 0), eq($findings.critical, 0),
+    eq($findings.packagesAssessed, 3), eq($findings.osFamily, "debian"), $debianVersion)
+    otherwise "Worker image admission does not prove the exact scanned minimal runtime."
+  assert and(eq($functional.nodeVersion, $evidence.nodeVersion), eq($functional.shellAbsent, true),
+    eq($functional.productionIsolationProbe, true))
+    otherwise "Worker image admission does not prove the runtime isolation checks."
+  let result = $evidence

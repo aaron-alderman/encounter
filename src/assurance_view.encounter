@@ -1,0 +1,15 @@
+process-module "temple/surface-process-module/1"
+
+process assuranceView.route:
+  let request = $eventInput
+  let result = { status = "501 Not Implemented" }
+  when includes(list("GET", "HEAD"), $request.method):
+    let result = { status = "404 Not Found" }
+    let path = if(eq($request.path, "/"), "/index.html", $request.path)
+    port text.matches { value = $path; pattern = "\\A/(?:index|approval-gate|a1-[a-z0-9][a-z0-9-]{0,160})[.]html\\z" } → html
+    port text.matches { value = $path; pattern = "\\A/(?:assessment|a1-[a-z0-9][a-z0-9-]{0,160})[.]json\\z" } → json
+    let identity = eq($path, "/assessment.identity")
+    when or($html, $json, $identity):
+      port text.slice { value = $path; start = 1 } → file
+      let mime = if($html, "text/html", if($json, "application/json", "application/octet-stream"))
+      let result = { status = "200 OK"; file = $file; mime = $mime }

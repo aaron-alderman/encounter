@@ -1,0 +1,230 @@
+process-module "temple/surface-process-module/1"
+
+process temple.startupStyles:
+  let cssRuleSeparator = "\n"
+  let cssRules = list(
+    { selector = ":root"; declarations = list(
+      { property = "color-scheme"; value = "light" },
+      { property = "--ink"; value = "#172441" },
+      { property = "--frame"; value = "#e9e5d9" },
+      { property = "--paper"; value = "#fffdf3" },
+      { property = "--border"; value = "#a6a394" },
+      { property = "font"; value = "15px/1.45 Tahoma,Verdana,sans-serif" }
+    ) },
+    { selector = "*"; declarations = list(
+      { property = "box-sizing"; value = "border-box" }
+    ) },
+    { selector = "[hidden]"; declarations = list(
+      { property = "display"; value = "none"; important = true }
+    ) },
+    { selector = "body"; declarations = list(
+      { property = "margin"; value = "0" },
+      { property = "height"; value = "100dvh" },
+      { property = "display"; value = "grid" },
+      { property = "grid-template-rows"; value = "auto 1fr auto" },
+      { property = "background"; value = "#275f69" },
+      { property = "color"; value = "var(--ink)" }
+    ) },
+    { selector = ".os-bar"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "flex-wrap"; value = "wrap" },
+      { property = "align-items"; value = "center" },
+      { property = "gap"; value = ".5rem 1rem" },
+      { property = "padding"; value = ".55rem 1rem" },
+      { property = "background"; value = "var(--frame)" },
+      { property = "border-block"; value = "1px solid var(--border)" }
+    ) },
+    { selector = ".os-bar nav"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "flex-wrap"; value = "wrap" },
+      { property = "gap"; value = ".35rem" }
+    ) },
+    { selector = "#connection"; declarations = list(
+      { property = "margin-inline-start"; value = "auto" }
+    ) },
+    { selector = "main"; declarations = list(
+      { property = "display"; value = "grid" },
+      { property = "grid-template-rows"; value = "minmax(0,1fr)" },
+      { property = "min-width"; value = "0" },
+      { property = "min-height"; value = "0" },
+      { property = "overflow"; value = "auto" }
+    ) },
+    { selector = "main>section,main>div"; declarations = list(
+      { property = "grid-area"; value = "1/1" },
+      { property = "min-width"; value = "0" },
+      { property = "min-height"; value = "0" }
+    ) },
+    { selector = "#chooser,#loading"; declarations = list(
+      { property = "align-self"; value = "safe center" },
+      { property = "justify-self"; value = "center" },
+      { property = "width"; value = "min(34rem,calc(100% - 1.5rem))" },
+      { property = "margin"; value = "1rem" },
+      { property = "padding"; value = "clamp(1rem,4vw,2rem)" },
+      { property = "background"; value = "var(--paper)" },
+      { property = "border"; value = "1px solid var(--border)" },
+      { property = "box-shadow"; value = "5px 6px #132d35" }
+    ) },
+    { selector = "#chooser h1"; declarations = list(
+      { property = "margin"; value = "0 0 1rem" },
+      { property = "font-size"; value = "clamp(1.4rem,5vw,2rem)" }
+    ) },
+    { selector = "#chooser form,#chooser details,#saved:not(:empty)"; declarations = list(
+      { property = "margin-block"; value = "1rem" }
+    ) },
+    { selector = "#chooser label"; declarations = list(
+      { property = "display"; value = "block" },
+      { property = "margin-block-end"; value = ".35rem" }
+    ) },
+    { selector = ".actions,#saved"; declarations = list(
+      { property = "display"; value = "flex" },
+      { property = "flex-wrap"; value = "wrap" },
+      { property = "gap"; value = ".5rem" }
+    ) },
+    { selector = "button,input"; declarations = list(
+      { property = "font"; value = "inherit" }
+    ) },
+    { selector = "button"; declarations = list(
+      { property = "padding"; value = ".35rem .65rem" },
+      { property = "background"; value = "var(--frame)" },
+      { property = "border"; value = "1px solid var(--border)" },
+      { property = "color"; value = "var(--ink)" },
+      { property = "cursor"; value = "pointer" }
+    ) },
+    { selector = "input"; declarations = list(
+      { property = "min-width"; value = "0" },
+      { property = "flex"; value = "1" },
+      { property = "padding"; value = ".4rem" },
+      { property = "border"; value = "1px solid var(--border)" }
+    ) },
+    { selector = "button[aria-current=page]"; declarations = list(
+      { property = "font-weight"; value = "bold" },
+      { property = "background"; value = "var(--paper)" }
+    ) },
+    { selector = "#problem:empty"; declarations = list(
+      { property = "display"; value = "none" }
+    ) },
+    { selector = "#problem"; declarations = list(
+      { property = "color"; value = "#8d322b" }
+    ) },
+    { selector = "#surface:empty"; declarations = list(
+      { property = "display"; value = "none" }
+    ) },
+    { selector = "iframe"; declarations = list(
+      { property = "display"; value = "block" },
+      { property = "width"; value = "100%" },
+      { property = "height"; value = "100%" },
+      { property = "border"; value = "0" },
+      { property = "background"; value = "var(--paper)" }
+    ) },
+    { selector = "#loading"; declarations = list(
+      { property = "z-index"; value = "1" }
+    ) },
+    { atRule = "media"; prelude = "(max-width:680px)"; rules = list(
+      { selector = "button,input"; declarations = list(
+        { property = "min-height"; value = "44px" }
+      ) }
+    ) },
+    { selector = ".platform-launcher"; declarations = list(
+      { property = "width"; value = "min(48rem,calc(100% - 2rem))" },
+      { property = "margin"; value = "clamp(1rem,5vw,3rem) auto" },
+      { property = "padding"; value = "clamp(1rem,4vw,2rem)" },
+      { property = "background"; value = "var(--frame)" },
+      { property = "border"; value = "1px solid var(--border)" }
+    ) },
+    { selector = ".platform-launcher h1"; declarations = list(
+      { property = "margin"; value = "0 0 1rem" },
+      { property = "font-size"; value = "clamp(1.4rem,5vw,2rem)" }
+    ) },
+    { selector = ".platform-launcher nav"; declarations = list(
+      { property = "display"; value = "grid" },
+      { property = "grid-template-columns"; value = "repeat(auto-fit,minmax(min(100%,14rem),1fr))" },
+      { property = "gap"; value = ".75rem" }
+    ) },
+    { selector = ".platform-launcher a"; declarations = list(
+      { property = "display"; value = "grid" },
+      { property = "gap"; value = ".25rem" },
+      { property = "padding"; value = ".85rem 1rem" },
+      { property = "border"; value = "1px solid var(--border)" },
+      { property = "background"; value = "var(--paper)" },
+      { property = "color"; value = "var(--ink)" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) },
+    { selector = ".platform-launcher small"; declarations = list(
+      { property = "color"; value = "var(--ink)" },
+      { property = "text-decoration"; value = "none" }
+    ) },
+    { selector = ".platform-launcher .platform-mailbox"; declarations = list(
+      { property = "margin-top"; value = ".75rem" }
+    ) },
+    { selector = ".platform-performance-warnings"; declarations = list(
+      { property = "margin-top"; value = ".75rem" },
+      { property = "padding"; value = ".85rem 1rem" },
+      { property = "border"; value = "1px solid var(--border)" },
+      { property = "background"; value = "var(--paper)" }
+    ) },
+    { selector = ".platform-performance-warnings mark"; declarations = list(
+      { property = "display"; value = "inline-block" },
+      { property = "padding"; value = ".15rem .45rem" },
+      { property = "background"; value = "#ffdf80" },
+      { property = "color"; value = "#392e1c" },
+      { property = "font-weight"; value = "bold" }
+    ) },
+    { selector = ".platform-performance-warnings p"; declarations = list(
+      { property = "margin"; value = ".4rem 0" }
+    ) },
+    { selector = ".platform-performance-warnings ul"; declarations = list(
+      { property = "margin"; value = "0" },
+      { property = "padding"; value = "0" },
+      { property = "list-style"; value = "none" }
+    ) },
+    { selector = ".platform-performance-warnings li+li,.platform-performance-warnings li>div:has(>.regression-time)+div"; declarations = list(
+      { property = "margin-top"; value = ".35rem" }
+    ) },
+    { selector = ".platform-performance-warnings .overage,.platform-performance-warnings .active-regression"; declarations = list(
+      { property = "color"; value = "#8d2616" }
+    ) },
+    { selector = ".platform-performance-warnings .recovered"; declarations = list(
+      { property = "color"; value = "#216138" }
+    ) }
+  )
+  call css.renderCompactRules
+  let result = concat("", $result, "\n")
+
+process temple.embeddedChromeStyles:
+  let cssRules = list({
+    selector = "html[data-temple-embedded=true] :is(.sourcery-os-header,.sourcery-os-tray)";
+    declarations = list({ property = "display"; value = "none"; important = true })
+  })
+  call css.renderRules
+
+process temple.browserPresentation:
+  call temple.embeddedChromeStyles
+  let css = $result
+  let input = { tag = "section"; attrs = { class = "platform-launcher"; "aria-labelledby" = "platform-title" }; children = list(
+    { tag = "h1"; attrs = { id = "platform-title" }; children = list("Platform") },
+    { tag = "nav"; attrs = { "aria-label" = "Platform apps" } }
+  ) }
+  call html.serialize
+  let launcher = $result
+  let input = { tag = "a"; children = list({ tag = "strong" }, { tag = "small" }) }
+  call html.serialize
+  let card = $result
+  let input = list(
+    { tag = "a"; attrs = { class = "platform-mailbox"; href = "/workspace/platform/performance-mailbox" }; children = list("Performance Mailbox") },
+    { tag = "section"; attrs = { class = "platform-performance-warnings"; hidden = true; "aria-label" = "Unread performance warnings" }; children = list(
+      { tag = "mark"; attrs = { role = "status" } },
+      { tag = "p" },
+      { tag = "ul"; attrs = { "aria-label" = "Latest unread measurement per regressed check" } }
+    ) }
+  )
+  call html.serialize
+  let warnings = $result
+  let input = { tag = "button"; attrs = { type = "button" } }
+  call html.serialize
+  let button = $result
+  let input = { tag = "iframe"; attrs = { hidden = true } }
+  call html.serialize
+  let frame = $result
+  let input = { tag = "a"; attrs = { target = "_blank"; rel = "noopener" } }
+  call html.serialize
+  let result = { css = $css; launcher = $launcher; card = $card; warnings = $warnings; button = $button; frame = $frame; signIn = $result }

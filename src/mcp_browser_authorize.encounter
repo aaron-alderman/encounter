@@ -1,0 +1,183 @@
+process-module "temple/surface-process-module/1"
+
+process mcpBrowserAuthorize.request:
+  let fields = $eventInput.fields
+  let names = list("response_type", "client_id", "redirect_uri", "resource", "scope", "state",
+    "code_challenge", "code_challenge_method")
+  fold $names as name; form starts { missing = ""; values = {} }:
+    let entries = map(filter($fields, "field", eq(at($field, 0), $name)), "field", at($field, 1))
+    let valid = or(and(eq(count($entries), 1), at($entries, 0)), and(eq($name, "state"), eq(count($entries), 0)))
+    let value = if(count($entries), at($entries, 0), null)
+    port record.put { record = $form.values; key = $name; value = $value } → values
+    yield { missing = if(or($form.missing, $valid), $form.missing, $name); values = $values } → form
+  let result = { error = "parameter"; detail = $form.missing }
+  when not($form.missing):
+    let values = $form.values
+    port text.matches { value = $values.code_challenge; pattern = "\\A[A-Za-z0-9._~-]{43,128}\\z" } → pkce
+    port text.split { value = $values.scope; pattern = "\\s+" } → scopes
+    let state = null
+    when $values.state:
+      port text.slice { value = $values.state; start = 0; end = 2048 } → state
+    port digest.sha256 { text = $values.code_challenge } → proof
+    let result = { error = ""; clientId = $values.client_id; redirectUri = $values.redirect_uri; scopeText = $values.scope;
+      resource = $values.resource; state = $state; codeChallengeDigest = $proof }
+    when not(eq(distinct($scopes), list("authoring.read"))):
+      let result = { error = "outside" }
+    when not(eq($values.resource, $eventInput.resource)):
+      let result = { error = "authorizationTarget" }
+    when not(and(eq($values.code_challenge_method, "S256"), $pkce)):
+      let result = { error = "challenge" }
+    when not(eq($values.response_type, "code")):
+      let result = { error = "responseType" }
+
+process mcpBrowserAuthorize.portfolio:
+  let input = $eventInput
+  let browser = $input.browser
+  let portfolios = $browser.portfolios
+  let proof = $input.selection
+  let choices = filter($input.fields, "field", eq(at($field, 0), "sourcery_portfolio"))
+  let result = { error = "session" }
+  when $browser.subject:
+    let result = { error = "portfolio" }
+    when eq(count($choices), 0):
+      when eq(count($portfolios), 1):
+        let result = { selected = at($portfolios, 0) }
+      port number.calculate { operation = "greater"; values = list(count($portfolios), 1) } → multiple
+      when $multiple:
+        let result = { portfolios = $portfolios }
+    when eq(count($choices), 1):
+      let result = { error = "selection" }
+      when $proof:
+        let retained = filter($input.fields, "field", not(eq(at($field, 0), "sourcery_portfolio")))
+        port json.stringify { value = $retained } → query
+        port digest.sha256 { text = $query } → hash
+        port value.describe { value = $proof.expiresAt } → expires
+        when and(eq($proof.protocol, "sourcery-mcp-workspace-selection/1"),
+          eq($proof.userId, $browser.subject.userId), eq($proof.requestHash, $hash), eq($expires.type, "number")):
+          port number.calculate { operation = "greater"; values = list($proof.expiresAt, $input.nowMs) } → current
+          let matches = filter($portfolios, "item",
+            and(eq($item.scope.tenantId, $proof.scope.tenantId), eq($item.scope.appId, $proof.scope.appId)))
+          when and($current, eq(count($matches), 1)):
+            let selected = at($matches, 0)
+            let result = { selected = { scope = $selected.scope; summary = $proof.summary } }
+    when not(includes(list(0, 1), count($choices))):
+      let result = { error = "duplicateSelection" }
+
+process mcpBrowserAuthorize.record:
+  let input = $eventInput
+  let request = $input.request
+  let registration = $input.registration
+  let client = $registration.client
+  assert and(eq($client.clientId, $request.clientId),
+    includes(list("preRegisteredClientV1", "clientIdMetadataDocumentV1"), $client.registrationMode))
+    otherwise "The hosted MCP client resolution differs from the authorization request."
+  let result = { id = $input.id; clientId = $client.clientId; clientName = $client.name;
+    clientRegistrationMode = $client.registrationMode; redirectUri = $registration.redirectUri;
+    resource = $request.resource; state = $request.state; scopes = list("authoring.read");
+    codeChallengeDigest = $request.codeChallengeDigest;
+    grant = { principal = { kind = "user"; userId = $input.userId }; scope = $input.portfolio.scope;
+      summary = $input.portfolio.summary } }
+
+process mcpBrowserAuthorize.form:
+  let input = $eventInput
+  let expires = add($input.nowMs, 300000)
+  let result = { protocol = "sourcery-mcp-workspace-csrf/1"; userId = $input.userId;
+    authorizeHref = $input.href; nonce = $input.nonce; expiresAt = $expires }
+  when $input.requestId:
+    let result = { protocol = "sourcery-mcp-consent-csrf/1"; userId = $input.userId;
+      requestId = $input.requestId; nonce = $input.nonce; expiresAt = $expires }
+
+process mcpBrowserAuthorize.page:
+  let page = $eventInput
+  let csrf = { tag = "input"; attrs = { type = "hidden"; name = "csrf"; value = $page.csrf } }
+  let cookie = null
+  let result = null
+  when eq($page.kind, "portfolio"):
+    let cookie = "__Host-sourcery_mcp_portfolio"
+    let path = "/oauth/portfolio"
+    let title = "Select a Sourcery organizational boundary"
+    let choices = map($page.portfolios, "item", { tag = "li"; children = list(
+      { tag = "label"; children = list(
+        { tag = "input"; attrs = { type = "radio"; name = "portfolio"; value = $item.id } },
+        { tag = "strong"; children = list($item.summary.tenant, " / ", $item.summary.application) }
+      ) }
+    ) })
+    let content = list(
+      { tag = "h1"; children = list("Choose which organization and application this connection may enter") },
+      { tag = "p"; children = list("The client requested ", $page.scopeText,
+        ". Project access is not granted here: projects are opened explicitly during use and current membership is rechecked for every operation.") },
+      { tag = "form"; attrs = { method = "post"; action = $path }; children = list(
+        $csrf, { tag = "ul"; children = $choices }, { tag = "button"; attrs = { type = "submit" }; children = list("Continue") }
+      ) }
+    )
+  when eq($page.kind, "consent"):
+    let cookie = "__Host-sourcery_mcp_consent"
+    let path = "/oauth/consent"
+    let title = concat("Authorize ", $page.clientName)
+    port record.entries { value = $page.summary } → summary
+    let pairs = map($summary, "entry", list(
+      { tag = "dt"; children = list(at($entry, 0)) }, { tag = "dd"; children = list(at($entry, 1)) }
+    ))
+    let context = if(count($pairs), list(
+      { tag = "h2"; children = list("Connection boundary") }, { tag = "dl"; children = $pairs }
+    ), null)
+    let content = list(
+      { tag = "h1"; children = list("Allow ", $page.clientName, " to author with Sourcery?") },
+      { tag = "p"; children = list("This client will act only against ", { tag = "code"; children = list($page.resource) },
+        ". No project is granted by this step. Projects must be opened explicitly during use and current membership is rechecked for every operation.") },
+      $context,
+      { tag = "form"; attrs = { method = "post"; action = $path }; children = list(
+        $csrf, { tag = "h2"; children = list("Requested capabilities") },
+        { tag = "ul"; children = list({ tag = "li"; children = list(
+          { tag = "strong"; children = list("authoring.read") },
+          { tag = "p"; children = list("Observe the application and its authoring evidence.") }
+        ) }) },
+        { tag = "p"; children = list("You can deny this request now. A later request can explore a different scope without changing this application.") },
+        { tag = "button"; attrs = { type = "submit"; name = "decision"; value = "approve" }; children = list("Allow this client") },
+        { tag = "button"; attrs = { type = "submit"; name = "decision"; value = "deny" }; children = list("Deny and return") }
+      ) }
+    )
+  when $cookie:
+    let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+      { tag = "head"; children = list(
+        { tag = "meta"; attrs = { charset = "utf-8" } },
+        { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+        { tag = "title"; children = list($title) }
+      ) },
+      { tag = "body"; children = list({ tag = "main"; children = $content }) }
+    ) }
+    call html.serialize
+    let result = { cookie = $cookie; path = $path; body = concat("<!doctype html>", $result) }
+
+process mcpBrowserAuthorize.loginPath:
+  port text.matches { value = $eventInput; pattern = "\\A/(?!/)[!-~]{1,255}\\z" } → shape
+  port text.matches { value = $eventInput; pattern = "[?#\\\\]" } → forbidden
+  let result = and($shape, not($forbidden))
+
+process mcpBrowserAuthorize.error:
+  let reason = $eventInput
+  let status = "503 Service Unavailable"
+  let error = "server_error"
+  let description = "The authorization server could not complete the request."
+  when eq($reason, "session"):
+    let status = "401 Unauthorized"
+    let error = "access_denied"
+    let description = "A valid signed-in Sourcery browser session is required."
+  when eq($reason, "client"):
+    let status = "401 Unauthorized"
+    let error = "invalid_client"
+    let description = "The OAuth client could not be resolved."
+  when includes(list("portfolio", "selection"), $reason):
+    let status = "403 Forbidden"
+    let error = "access_denied"
+    let description = if(eq($reason, "portfolio"), "This identity has no current MCP-authorable application portfolio.",
+      "Application-portfolio selection is invalid, expired, or belongs to another request.")
+  when eq($reason, "duplicateSelection"):
+    let status = "400 Bad Request"
+    let error = "invalid_request"
+    let description = "Workspace selection is repeated."
+  when eq($reason, "callback"):
+    let status = "400 Bad Request"
+    let error = "invalid_request"
+    let description = "The redirect URI is not registered for this client."
+  let result = { status = $status; body = { error = $error; error_description = $description } }

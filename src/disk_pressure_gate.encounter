@@ -1,0 +1,112 @@
+process-module "temple/surface-process-module/1"
+
+process diskPressure.gateStyles:
+  let cssRuleSeparator = ""
+  let cssRules = list(
+    { selector = "body"; declarations = list(
+      { property = "margin"; value = "0" },
+      { property = "background"; value = "#0c0f0d" },
+      { property = "color"; value = "#f2f5ef" },
+      { property = "font"; value = "15px/1.5 system-ui,sans-serif" }
+    ) },
+    { selector = ".shell"; declarations = list(
+      { property = "max-width"; value = "980px" },
+      { property = "margin"; value = "auto" },
+      { property = "padding"; value = "42px 24px" }
+    ) },
+    { selector = ".eyebrow"; declarations = list(
+      { property = "color"; value = "#ffd17b" },
+      { property = "text-transform"; value = "uppercase" },
+      { property = "letter-spacing"; value = ".14em" },
+      { property = "font-size"; value = "12px" },
+      { property = "font-weight"; value = "700" }
+    ) },
+    { selector = "h1"; declarations = list(
+      { property = "font-size"; value = "clamp(36px,6vw,70px)" },
+      { property = "line-height"; value = ".95" },
+      { property = "letter-spacing"; value = "-.05em" }
+    ) },
+    { selector = ".box"; declarations = list(
+      { property = "background"; value = "#151a17" },
+      { property = "border"; value = "1px solid #303a33" },
+      { property = "border-radius"; value = "16px" },
+      { property = "padding"; value = "20px" },
+      { property = "margin"; value = "18px 0" }
+    ) },
+    { selector = ".metric"; declarations = list(
+      { property = "font-size"; value = "34px" },
+      { property = "font-weight"; value = "700" }
+    ) },
+    { selector = ".muted"; declarations = list(
+      { property = "color"; value = "#a6afa8" }
+    ) },
+    { selector = "table"; declarations = list(
+      { property = "width"; value = "100%" },
+      { property = "border-collapse"; value = "collapse" }
+    ) },
+    { selector = "th,td"; declarations = list(
+      { property = "text-align"; value = "left" },
+      { property = "border-bottom"; value = "1px solid #303a33" },
+      { property = "padding"; value = "10px" }
+    ) },
+    { selector = "code"; declarations = list(
+      { property = "font-size"; value = "12px" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) },
+    { selector = ".danger"; declarations = list(
+      { property = "color"; value = "#ff8d82" }
+    ) },
+    { selector = ".ok"; declarations = list(
+      { property = "color"; value = "#85e6aa" }
+    ) },
+    { selector = ".hash"; declarations = list(
+      { property = "font-family"; value = "monospace" },
+      { property = "font-size"; value = "12px" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) }
+  )
+  call css.renderCompactRules
+
+process diskPressure.gate:
+  call diskPressure.gateStyles
+  let stylesheet = $result
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+      { tag = "title"; children = list("Sourcery retirement approval gate") },
+      { tag = "style"; children = list($stylesheet) }
+    ) },
+    { tag = "body"; children = list(
+      { tag = "main"; attrs = { class = "shell" }; children = list(
+        { tag = "div"; attrs = { class = "eyebrow" }; children = list("Dry-run result · explicit approval required") },
+        { tag = "h1"; children = list($slots.gateTitle) },
+        { tag = "div"; attrs = { class = "box" }; children = list(
+          { tag = "div"; attrs = { class = "metric" }; children = list(concat($slots.candidateGib, " GiB")) },
+          { tag = "div"; attrs = { class = "muted" }; children = list(concat("Expected recovery from ", $slots.candidateCount, " exact candidate path(s)")) }
+        ) },
+        { tag = "div"; attrs = { class = "box" }; children = list(
+          { tag = "strong"; attrs = { class = "danger" }; children = list("This assessment does not authorize deletion.") },
+          { tag = "p"; children = list("Any future executor must re-scan live references, verify exact paths and reconstruction evidence, preserve the rollback floor, and obtain approval for the assessment hash below.") },
+          { tag = "p"; children = list(
+            { tag = "strong"; children = list("Consequence if later approved:") },
+            " remove only the listed installed projections; retain the cited reconstruction evidence, authority, active service, and rollback release."
+          ) }
+        ) },
+        { tag = "table"; children = list(
+          { tag = "thead"; children = list(
+            { tag = "tr"; children = list(
+              { tag = "th"; children = list("Kind") },
+              { tag = "th"; children = list("Exact path") },
+              { tag = "th"; children = list("Size") },
+              { tag = "th"; children = list("Verified evidence") }
+            ) }
+          ) },
+          { tag = "tbody"; children = $slots.candidateRows }
+        ) },
+        { tag = "p"; attrs = { class = "hash" }; children = list(concat("Assessment hash: ", $slots.assessmentHash)) }
+      ) }
+    ) }
+  ) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)

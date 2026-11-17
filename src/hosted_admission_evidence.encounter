@@ -1,0 +1,209 @@
+process-module "temple/surface-process-module/1"
+
+process admissionEvidence.digest:
+  port record.entries { value = $eventInput.record } → fields
+  let committed = filter($fields, "field", not(includes($eventInput.omit, at($field, 0))))
+  port record.fromEntries { entries = $committed } → body
+  port json.canonical { value = $body } → encoded
+  port digest.sha256 { text = $encoded } → result
+
+process admissionEvidence.hash:
+  port text.matches { value = concat($eventInput); pattern = "\\A[a-f0-9]{64}\\z" } → matches
+  assert $matches
+    otherwise "Retained authoring evidence requires a SHA-256 hash."
+  let result = true
+
+process admissionEvidence.exactText:
+  port text.trim { value = $eventInput.text } → trimmed
+  assert $trimmed
+    otherwise "Retained authoring evidence requires nonempty text."
+  port digest.sha256 { text = $eventInput.text } → digest
+  assert eq($digest, $eventInput.hash)
+    otherwise "Retained authoring evidence text hash does not verify."
+  let result = true
+
+process admissionEvidence.provider:
+  let provider = $eventInput
+  assert and(at($provider, "id"), at($provider, "source"), at($provider, "assurance"))
+    otherwise "Retained human evidence requires an attributed provider."
+  port value.type { value = $provider.evidenceHash } → kind
+  when not(eq($kind, "undefined")):
+    port kernel.invoke { query = "admissionEvidence.hash"; input = $provider.evidenceHash } → evidence
+  let result = includes(list("cryptographically-verified", "direct-authenticated"), concat($provider.assurance))
+
+process admissionEvidence.humanContext:
+  let input = $eventInput
+  assert eq(at($input, "protocol"), "sourcery-human-context-evidence/1")
+    otherwise "Invalid retained human context protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $input; omit = list("hash") } } → hash
+  assert eq($hash, $input.hash)
+    otherwise "Retained human context hash does not verify."
+  port kernel.invoke { query = "admissionEvidence.exactText"; input = { text = $input.text; hash = $input.textHash } } → verified
+  port kernel.invoke { query = "admissionEvidence.provider"; input = $input.provider } → authenticated
+  assert eq($input.attribution, if($authenticated, "authenticated-intent-provider", "caller-attested-human-context"))
+    otherwise "Retained human context attribution does not match its provider."
+  assert includes(list("sourcery-change-start", "sourcery-change-context"), $input.channel)
+    otherwise "Invalid retained human context channel."
+  when eq($input.channel, "sourcery-change-context"):
+    port text.startsWith { value = concat($input.checkpoint); search = "branch." } → checkpoint
+    assert $checkpoint
+      otherwise "Retained continuation context requires a branch checkpoint."
+  when eq($input.channel, "sourcery-change-start"):
+    port value.type { value = $input.checkpoint } → kind
+    assert eq($kind, "undefined")
+      otherwise "Retained start context cannot specify a checkpoint."
+  let result = true
+
+process admissionEvidence.positiveInteger:
+  let input = $eventInput
+  port value.type { value = $input.value } → type
+  port number.calculate { operation = "multiply"; values = list($input.value, 1) } → value
+  port number.isNatural { value = $value } → whole
+  port number.calculate { operation = "lessEqual"; values = list($value, $input.maximum) } → bounded
+  assert and(eq($type, "number"), $whole, $value, $bounded)
+    otherwise "Retained authoring evidence requires a positive safe integer."
+  let result = true
+
+process admissionEvidence.asset:
+  let asset = $eventInput
+  assert eq(at($asset, "protocol"), "sourcery-authoring-context-asset/1")
+    otherwise "Invalid retained authoring context asset protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $asset; omit = list("assetHash") } } → hash
+  assert eq($hash, $asset.assetHash)
+    otherwise "Retained authoring context asset hash does not verify."
+  port value.type { value = $asset.contentHash } → hashType
+  assert eq($hashType, "string")
+    otherwise "Retained authoring context asset requires a content hash string."
+  port kernel.invoke { query = "admissionEvidence.hash"; input = $asset.contentHash } → content
+  port kernel.invoke { query = "admissionEvidence.positiveInteger";
+    input = { value = $asset.byteLength; maximum = 9007199254740991 } } → length
+  let source = $asset.source
+  let kind = at($source, "kind")
+  let locator = at($source, "locator")
+  assert includes(list("workspace-file", "host-blob"), $kind)
+    otherwise "Invalid retained authoring context asset source."
+  port text.trim { value = $locator } → trimmed
+  port number.calculate { operation = "lessEqual"; values = list(count($locator), 1024) } → bounded
+  assert and($trimmed, eq($locator, $trimmed), $bounded)
+    otherwise "Invalid retained authoring context asset locator."
+  when eq($kind, "workspace-file"):
+    port text.matches { value = $locator; pattern = "\\A(?:[a-z]:|[/\\\\])|(?:\\A|[/\\\\])\\.\\.(?:[/\\\\]|\\z)"; flags = "iu" } → outside
+    assert not($outside)
+      otherwise "Retained authoring context asset locator escapes its workspace."
+  when eq($kind, "host-blob"):
+    port text.matches { value = $locator; pattern = "\\Ablob:[a-z0-9][a-z0-9._-]{0,255}\\z"; flags = "iu" } → opaque
+    assert $opaque
+      otherwise "Retained authoring context asset requires an opaque blob locator."
+  assert and(includes(list("audio", "image", "spatial", "video"), $asset.kind),
+    includes(list("captured", "generated", "imported", "uploaded"), $asset.provenance),
+    or(not(eq($asset.provenance, "generated")), $asset.generationPrompt), eq($asset.authority, "proposal-context-only"))
+    otherwise "Retained authoring context asset kind, provenance, or authority is invalid."
+  when eq($asset.kind, "image"):
+    each list("width", "height") as dimension:
+      port kernel.invoke { query = "admissionEvidence.positiveInteger";
+        input = { value = at($asset.dimensions, $dimension); maximum = 100000 } } → pixels
+  let result = true
+
+process admissionEvidence.humanPolicy:
+  let expected = { isa = "HumanInteractionPolicy"; presentationMode = "conversation"; autonomyMode = "reversible-exploration";
+    meaningGate = "explicit-person"; externalEffectGate = "joined-authority"; scopeGate = "oauth-consent";
+    governanceGate = "admitted-stewardship"; outcomeMode = "producer-declared"; inputEnforcement = "conversational-context";
+    authorityEnforcement = "connected-authority"; continuityMode = "subject-hash-exact-call"; refusalMode = "retain-checkpoint";
+    resumeMode = "exact-contextual-call"; evidenceMode = "receipt-bound"; decisionCostMode = "consequence-reversibility-and-authority";
+    blockingThreshold = "expensive-or-boundary-crossing"; cheapDecisionMode = "provisional-agent-default-with-rollback";
+    trivialAlternativeMode = "bounded-parallel-contextual-selection"; unansweredInteractionMode = "retain-once-no-escalation" }
+  port record.entries { value = $expected } → fields
+  let facts = filter($eventInput, "fact", eq($fact.s, "policy.sourcery.humanInteraction"))
+  let predicates = map($facts, "fact", $fact.p)
+  assert and(eq(count($facts), count($fields)), eq(count(distinct($predicates)), count($facts)),
+    every($facts, "fact", and(eq($fact.pol, "is"), eq(at($expected, $fact.p), $fact.o))))
+    otherwise "Installed human interaction authority does not match its authored policy."
+  let result = true
+
+process admissionEvidence.interaction:
+  let gate = $eventInput
+  assert eq(at($gate, "protocol"), "sourcery-human-interaction/1")
+    otherwise "Invalid retained human interaction protocol."
+  port record.entries { value = $gate } → fields
+  let allowed = list("protocol", "policy", "state", "gate", "authority", "enforcement", "prompt", "subject", "subjectHash",
+    "consequence", "options", "responseKind", "resumeOutcome", "refusal", "resume", "interactionId")
+  assert every($fields, "field", includes($allowed, at($field, 0)))
+    otherwise "Retained human interaction contains unsupported fields."
+  port kernel.invoke { query = "admissionEvidence.hash"; input = $gate.policy } → policy
+  port kernel.invoke { query = "admissionEvidence.hash"; input = $gate.subjectHash } → subject
+  assert and(includes(list("input-required", "authority-required"), $gate.state),
+    includes(list("product-meaning", "external-effect", "scope-elevation", "governance"), $gate.gate),
+    includes(list("person", "joined-human", "account-holder", "declared-stewards"), $gate.authority))
+    otherwise "Retained human interaction state, gate or authority is invalid."
+  each list("enforcement", "refusal") as field:
+    port text.trim { value = concat(at($gate, $field)) } → trimmed
+    assert $trimmed
+      otherwise "Retained human interaction requires enforcement and refusal behavior."
+  each list("prompt", "subject", "consequence", "resume") as field:
+    port text.trim { value = at($gate, $field) } → trimmed
+    assert $trimmed
+      otherwise "Retained human interaction requires exact text fields."
+  assert isArray($gate.options)
+    otherwise "Retained human interaction requires outcome options."
+  port number.calculate { operation = "greaterEqual"; values = list(count($gate.options), 2) } → enough
+  assert and($enough, eq(count(distinct($gate.options)), count($gate.options)), includes($gate.options, $gate.resumeOutcome),
+    includes(list("clarification", "choice", "approval"), $gate.responseKind),
+    eq(eq($gate.gate, "product-meaning"), includes(list("clarification", "choice"), $gate.responseKind)))
+    otherwise "Retained human interaction response kind or outcome options are invalid."
+  each $gate.options as option:
+    port text.matches { value = $option; pattern = "\\A[a-z][a-z0-9-]{0,63}\\z" } → outcome
+    assert $outcome
+      otherwise "Retained human interaction outcome identifier is invalid."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $gate; omit = list("interactionId") } } → hash
+  assert eq($gate.interactionId, concat("interaction.", $hash))
+    otherwise "Retained human interaction content identity does not verify."
+  let result = true
+
+process admissionEvidence.humanResponse:
+  let input = $eventInput
+  assert eq(at($input, "protocol"), "sourcery-human-interaction-response-evidence/1")
+    otherwise "Invalid retained human response protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $input; omit = list("hash") } } → hash
+  assert eq($hash, $input.hash)
+    otherwise "Retained human response hash does not verify."
+  port kernel.invoke { query = "admissionEvidence.interaction"; input = $input.interaction } → interaction
+  assert includes($input.interaction.options, at($input.response, "outcome"))
+    otherwise "Retained human response outcome is outside the interaction."
+  port kernel.invoke { query = "admissionEvidence.exactText";
+    input = { text = $input.response.text; hash = $input.response.textHash } } → verified
+  port text.matches { value = concat($input.checkpoint); pattern = "\\Abranch\\.[A-Za-z0-9._-]+\\z" } → checkpoint
+  port kernel.invoke { query = "admissionEvidence.hash"; input = $input.continuationHash } → continuity
+  port kernel.invoke { query = "admissionEvidence.provider"; input = $input.provider } → authenticated
+  assert and($checkpoint, eq($input.channel, "sourcery-conversational-human-response"),
+    eq($input.attribution, if($authenticated, "authenticated-human-response", "caller-attested-human-response")))
+    otherwise "Retained human response checkpoint, channel, or attribution is invalid."
+  let result = true
+
+process admissionEvidence.verify:
+  let generation = $eventInput
+  let result = false
+  when eq(at($generation, "kind"), "change"):
+    let lists = list(
+      { records = "humanContext"; identity = "hash" },
+      { records = "contextAssets"; identity = "assetHash" },
+      { records = "humanResponses"; identity = "hash" },
+      { records = "semanticAuthoringHandoffs"; identity = "hash" })
+    each $lists as declaration:
+      let records = at($generation, $declaration.records)
+      port value.type { value = $records } → kind
+      when not(eq($kind, "undefined")):
+        assert isArray($records)
+          otherwise "Retained authoring evidence requires an array."
+        let identities = map($records, "record", at($record, $declaration.identity))
+        assert eq(count(distinct($identities)), count($records))
+          otherwise "Retained authoring evidence contains duplicate identities."
+        each $records as record:
+          when eq($declaration.records, "humanContext"):
+            port kernel.invoke { query = "admissionEvidence.humanContext"; input = $record } → valid
+          when eq($declaration.records, "contextAssets"):
+            port kernel.invoke { query = "admissionEvidence.asset"; input = $record } → valid
+          when eq($declaration.records, "humanResponses"):
+            port kernel.invoke { query = "admissionEvidence.humanResponse"; input = $record } → valid
+          when eq($declaration.records, "semanticAuthoringHandoffs"):
+            port kernel.invoke { query = "admissionHandoff.verify"; input = $record } → valid
+    let result = not(not(count(at($generation, "humanResponses"))))

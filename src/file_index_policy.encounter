@@ -1,0 +1,134 @@
+process-module "temple/surface-process-module/1"
+
+process fileIndex.policy:
+  let request = $eventInput
+  let platformRule = "platform-steward"
+  let platformLabel = "Platform steward"
+  let northRule = "north-river-project-owner"
+  let northLabel = "North River project owner"
+  let providers = {
+    "home-release" = list({ root = "Platform/Releases/Home"; rule = $platformRule; label = $platformLabel; media = true; authority = "/workspace/platform" });
+    "kernel-release" = list({ root = "Platform/Kernel/Releases"; rule = $platformRule; label = $platformLabel; media = true; authority = "/workspace/platform" });
+    "scheduled-receipts" = list({ root = "Platform/Scheduled run receipts"; rule = $platformRule; label = $platformLabel; authority = "publication.rel" });
+    "game-hub" = list(
+      { root = "Apps/Game Hub/Assets"; rule = "game-hub-gateway-reader"; label = "Game Hub sign-in"; authority = "game-hub/https.rel" },
+      { root = "Apps/Game Hub/Store/Published assets"; rule = "store-gateway-reader"; label = "Store sign-in"; authority = "platform-store/https.rel" });
+    "north-river" = list(
+      { root = "Apps/North River/Source"; rule = $northRule; label = $northLabel; authority = "north-river/project.encounter" },
+      { root = "Apps/North River/Receipts"; rule = $northRule; label = $northLabel; authority = "north-river/project.encounter" })
+  }
+  let rules = or(at($providers, $request.provider), list())
+  let result = list()
+  when eq($request.operation, "media"):
+    let result = map(filter($rules, "rule", eq($rule.media, true)), "rule", $rule.root)
+  when eq($request.operation, "publish"):
+    let owner = $request.owner
+    let steward = $request.steward
+    let ownership = { owner = $owner; steward = $steward;
+      ownerSource = if($owner, "provider-record", null); stewardSource = if($steward, "operator-configuration", null);
+      status = if(or($owner, $steward), "declared", "unrecorded") }
+    let result = map($rules, "rule", { root = $rule.root; ownership = $ownership;
+      permissions = { metadataAndRead = if(and(eq($rule.rule, $northRule), not($owner)), "deny", $rule.rule);
+        authority = $rule.authority; write = false; requiresCurrentAdmission = true } })
+  when eq($request.operation, "collections"):
+    let owner = null
+    let ownsProject = false
+    when $request.north:
+      let owner = $request.north.projectOwner
+      let phase = $request.north.taskPhase
+      let ownsProject = and($owner, eq($owner, $request.north.taskOwner), not(eq($phase, null)), not(eq($phase, "empty")))
+    fold $rules as rule; admitted starts list():
+      let matches = filter($request.collections, "collection",
+        and(eq($collection.root, $rule.root), eq($collection.permissions.metadataAndRead, $rule.rule),
+          or(not(eq($rule.rule, $northRule)), and($ownsProject, eq($collection.ownership.owner, $owner)))))
+      let include = and(includes($request.roots, $rule.root), not(eq(count($matches), 0)))
+      yield if($include, append($admitted, list({ root = $rule.root; label = $rule.label })), $admitted) → admitted
+    let result = $admitted
+
+
+process fileIndex.userUnit:
+  port text.matches { value = $eventInput.unit; pattern = "\\A[A-Za-z0-9_-]{1,128}[.]service\\z" } → canonical
+  let result = and($canonical, includes(list("game-hub", "north-river"), $eventInput.provider))
+
+process fileIndex.relFilter:
+  port text.matches { value = $eventInput; pattern = "\\A[^\\p{Cc}]{0,120}\\z" } → result
+
+process fileIndex.httpRequest:
+  let request = $eventInput
+  let media = eq($request.kind, "media")
+  let file = or($request.file, "")
+  let fileValid = false
+  when $file:
+    port text.matches { value = $file; pattern = "\\A[a-f0-9]{64}\\z" } → fileValid
+  let originValid = and(or(eq($request.fetchSite, ""), eq($request.fetchSite, "same-origin")),
+    or(eq($request.origin, ""), eq($request.origin, $request.publicOrigin)))
+  let status = 200
+  let relFilter = null
+  let selectedOnly = false
+  let authoring = false
+  when $media:
+    when not($originValid):
+      let status = 403
+    when not(and($fileValid, eq($request.fieldCount, 1))):
+      let status = 404
+  when not($media):
+    when not(eq($request.relFilter, null)):
+      port kernel.invoke { query = "fileIndex.relFilter"; input = $request.relFilter } → valid
+      when $valid:
+        let relFilter = $request.relFilter
+    let selectedOnly = eq($request.view, "file")
+    let expected = add(1, add(if(eq($relFilter, null), 0, 1), if($selectedOnly, 1, 0)))
+    when or(not($originValid), and($request.hasQuery, not(and($fileValid, eq($request.fieldCount, $expected))))):
+      let status = 403
+    when eq($request.view, "authoring"):
+      let authoring = true
+      let revisionValid = false
+      port text.matches { value = or($request.revision, ""); pattern = "\\A[a-f0-9]{64}\\z" } → revisionValid
+      let status = if(and($originValid, $fileValid, $revisionValid, eq($request.fieldCount, 3), eq($request.relFilter, null)), 200, 403)
+  let result = { status = $status; file = if($fileValid, $file, null); relFilter = $relFilter; selectedOnly = $selectedOnly; authoring = $authoring;
+    revision = if($authoring, $request.revision, null) }
+
+process fileIndex.httpMediaAccess:
+  port number.calculate { operation = "lessEqual"; values = list($eventInput.rangeBytes, 80) } → bounded
+  let result = if(eq($eventInput.platform, true), if($bounded, 200, 416), 403)
+
+process fileIndex.httpGateway:
+  let gateways = {
+    game = { prefix = "/game"; route = "/game/?document=recent-folio"; marker = "class=\"navigation pane\"" };
+    store = { prefix = "/store"; route = "/store/?workspace-fragment=1"; marker = "id=\"store-content\"" };
+    north = { prefix = "/encounter-pilot"; route = "/encounter-pilot/project"; marker = "Project home · Tasks and decisions" }
+  }
+  let result = at($gateways, $eventInput)
+
+process fileIndex.httpGatewaySession:
+  port text.matches { value = $eventInput; pattern = "\\A[A-Za-z0-9_-]{1,128}\\z" } → result
+
+process fileIndex.httpGatewayResponse:
+  port text.startsWith { value = $eventInput.contentType; search = "text/html" } → html
+  let result = and(eq($eventInput.status, 200), $html, eq($eventInput.markerPresent, true))
+
+process fileIndex.httpMediaFrame:
+  let input = $eventInput
+  let result = 404
+  when $input.total:
+    port number.calculate { operation = "lessEqual"; values = list($input.total, $input.maximum) } → bounded
+    when $bounded:
+      when eq($input.status, 416):
+        let result = 416
+      when and(includes(list(200, 206), $input.status), includes(list("video/mp4", "video/webm"), $input.mime),
+        not(eq($input.start, null)), not(eq($input.end, null))):
+        port number.calculate { operation = "lessEqual"; values = list($input.start, $input.end) } → ordered
+        port number.calculate { operation = "less"; values = list($input.end, $input.total) } → within
+        when and($ordered, $within, or(eq($input.status, 206), and(eq($input.start, 0), eq(add($input.end, 1), $input.total)))):
+          let result = $input.status
+
+process fileIndex.httpImage:
+  let result = null
+  let name = $eventInput.name
+  port number.calculate { operation = "lessEqual"; values = list(count($name), 128) } → bounded
+  when $bounded:
+    port text.matches { value = $name; pattern = "\\A[A-Za-z0-9_.-]*\\.(?i:jpg|jpeg|png)\\z" } → allowed
+    when $allowed:
+      port text.match { value = $eventInput.path; pattern = "\\AApps/Game Hub/Assets/[^/]*/([^/]*)\\z" } → declared
+      when and($declared, eq(at($declared.groups, 0), $name)):
+        let result = $name

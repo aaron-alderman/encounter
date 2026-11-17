@@ -1,0 +1,173 @@
+process-module "temple/surface-process-module/1"
+
+process mcpAuthorization.facts:
+  let input = $eventInput
+  let result = map(filter($input.facts, "fact",
+    and(eq($fact.s, $input.subject), eq($fact.p, $input.predicate))), "fact", $fact.o)
+
+process mcpAuthorization.one:
+  call mcpAuthorization.facts
+  assert eq(count($result), 1)
+    otherwise "Expected exactly one MCP authorization fact."
+  let result = at($result, 0)
+
+process mcpAuthorization.schema:
+  let input = $eventInput
+  let interfaces = filter($input.schema, "fact", and(eq($fact.p, "type"), eq($fact.o, $input.type)))
+  assert eq(count($interfaces), 1)
+    otherwise "Expected one MCP authorization interface."
+  let interface = at(at($interfaces, 0), "s")
+  port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $interface; predicate = "mode" } } → mode
+  port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $interface; predicate = "isa" } } → kind
+  assert and(eq($kind, "Interface"), eq($mode, "closed"))
+    otherwise "MCP authorization interfaces must be closed."
+  port kernel.invoke { query = "mcpAuthorization.facts"; input = { facts = $input.schema; subject = $interface; predicate = "slot" } } → slots
+  fold $slots as slot; fields starts {}:
+    port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $slot; predicate = "isa" } } → kind
+    port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $slot; predicate = "predicate" } } → predicate
+    port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $slot; predicate = "valueType" } } → type
+    port kernel.invoke { query = "mcpAuthorization.one"; input = { facts = $input.schema; subject = $slot; predicate = "cardinality" } } → cardinality
+    port kernel.invoke { query = "mcpAuthorization.facts"; input = { facts = $input.schema; subject = $slot; predicate = "allowed" } } → allowed
+    port kernel.invoke { query = "mcpAuthorization.facts"; input = { facts = $input.schema; subject = $slot; predicate = "expects" } } → expects
+    assert and(eq($kind, "Slot"), not(at($fields, $predicate)), includes(list("string", "integer", "ref"), $type),
+      includes(list("one", "min1", "many"), $cardinality),
+      eq(count($expects), if(eq($type, "ref"), 1, 0)))
+      otherwise "Unsupported MCP authorization schema slot."
+    port record.put { record = $fields; key = $predicate; value = { type = $type; cardinality = $cardinality;
+      allowed = $allowed; expects = at($expects, 0) } } → next
+    yield $next → result
+
+process mcpAuthorization.record:
+  let input = $eventInput
+  let rows = filter($input.facts, "fact", eq($fact.s, $input.subject))
+  let types = filter($rows, "fact", eq($fact.p, "isa"))
+  assert and(eq(count($types), 1), eq(at(at($types, 0), "o"), $input.type))
+    otherwise "MCP authorization subject has an unexpected type."
+  each $rows as row:
+    assert or(eq($row.p, "isa"), at($input.fields, $row.p))
+      otherwise "Unknown fact on a closed MCP authorization subject."
+  port record.entries { value = $input.fields } → fields
+  fold $fields as field; record starts {}:
+    let predicate = at($field, 0)
+    let slot = at($field, 1)
+    let values = map(filter($rows, "fact", eq($fact.p, $predicate)), "fact", $fact.o)
+    assert and(or(not(eq($slot.cardinality, "one")), eq(count($values), 1)),
+      or(not(eq($slot.cardinality, "min1")), count($values)))
+      otherwise "MCP authorization fact cardinality is invalid."
+    each $values as value:
+      assert or(not(count($slot.allowed)), includes($slot.allowed, $value))
+        otherwise "MCP authorization fact has an unsupported value."
+      when eq($slot.type, "integer"):
+        port text.matches { value = $value; pattern = "\\A[0-9]{1,16}\\z" } → integer
+        assert $integer
+          otherwise "Expected an unsigned MCP authorization integer."
+      when eq($slot.type, "ref"):
+        let target = filter($input.facts, "fact", and(eq($fact.s, $value), eq($fact.p, "isa"), eq($fact.o, $slot.expects)))
+        assert eq(count($target), 1)
+          otherwise "MCP authorization reference has an unexpected type."
+    let value = if(eq($slot.cardinality, "one"), at($values, 0), $values)
+    port record.put { record = $record; key = $predicate; value = $value } → next
+    yield $next → result
+
+process mcpAuthorization.integer:
+  let input = $eventInput
+  port number.parse { value = $input.value } → number
+  port number.calculate { operation = "lessEqual"; values = list($input.minimum, $number) } → above
+  port number.calculate { operation = "lessEqual"; values = list($number, $input.maximum) } → below
+  assert and($above, $below)
+    otherwise "MCP authorization integer is outside its admitted range."
+  let result = $number
+
+process mcpAuthorization.visit:
+  let input = $eventInput
+  assert not(includes($input.path, $input.subject))
+    otherwise "MCP authorization scope implication cycle."
+  let current = at($input.graph, $input.subject)
+  assert $current
+    otherwise "MCP authorization implication names an undeclared scope."
+  each $current.impliedSubjects as subject:
+    port kernel.invoke { query = "mcpAuthorization.visit"; input = {
+      subject = $subject; path = append($input.path, list($input.subject)); graph = $input.graph } } → visited
+  let result = true
+
+process mcpAuthorization.compile:
+  let input = $eventInput
+  let facts = filter($input.policy, "fact", eq($fact.pol, "is"))
+  let schema = filter($input.schema, "fact", eq($fact.pol, "is"))
+  let policyType = "HostedMcpAuthorizationPolicy"
+  let scopeType = "HostedMcpAuthorizationScope"
+  let policies = filter($facts, "fact", and(eq($fact.p, "isa"), eq($fact.o, $policyType)))
+  assert eq(count($policies), 1)
+    otherwise "Expected one authored MCP authorization policy."
+  let policySubject = at(at($policies, 0), "s")
+  port kernel.invoke { query = "mcpAuthorization.schema"; input = { schema = $schema; type = $policyType } } → policyFields
+  port kernel.invoke { query = "mcpAuthorization.schema"; input = { schema = $schema; type = $scopeType } } → scopeFields
+  port kernel.invoke { query = "mcpAuthorization.record"; input = {
+    facts = $facts; subject = $policySubject; type = $policyType; fields = $policyFields } } → policy
+  assert and(count($policy.scope), includes($policy.scope, $policy.discoveryScope))
+    otherwise "MCP discovery scope must belong to the policy."
+  fold $policy.scope as subject; state starts { graph = {}; names = {}; tools = {} }:
+    port kernel.invoke { query = "mcpAuthorization.record"; input = {
+      facts = $facts; subject = $subject; type = $scopeType; fields = $scopeFields } } → scope
+    port text.matches { value = $scope.name; pattern = "\\A[a-z][a-z0-9]*(?:[.:_-][a-z0-9]+)+\\z" } → valid
+    assert and($valid, not(at($state.graph, $subject)), not(at($state.names, $scope.name)))
+      otherwise "Invalid or duplicate MCP authorization scope."
+    fold $scope.tool as tool; tools starts $state.tools:
+      port text.matches { value = $tool; pattern = "\\Asourcery_[a-z0-9_]+\\z" } → valid
+      assert and($valid, not(at($tools, $tool)))
+        otherwise "Invalid or multiply assigned MCP authorization tool."
+      port record.put { record = $tools; key = $tool; value = $scope.name } → next
+      yield $next → tools
+    port kernel.invoke { query = "mcpAuthorization.integer"; input = { value = $scope.order; minimum = 0; maximum = 10000 } } → order
+    port value.sort { values = $scope.tool } → sortedTools
+    port record.put { record = $state.graph; key = $subject; value = { name = $scope.name; order = $order;
+      consentClass = $scope.consentClass; impliedSubjects = $scope.implies; tools = $sortedTools } } → graph
+    port record.put { record = $state.names; key = $scope.name; value = $subject } → names
+    yield { graph = $graph; names = $names; tools = $tools } → scopes
+  let graph = $scopes.graph
+  each $policy.scope as subject:
+    port kernel.invoke { query = "mcpAuthorization.visit"; input = { subject = $subject; path = list(); graph = $graph } } → visited
+  let names = map($policy.scope, "subject", at(at($graph, $subject), "name"))
+  port value.sort { values = $names; mode = "locale" } → names
+  let orders = map($names, "name", at(at($graph, at($scopes.names, $name)), "order"))
+  port value.sort { values = $orders; mode = "numeric" } → orders
+  let orders = distinct($orders)
+  fold $orders as order; sorted starts list():
+    let matches = filter($names, "name", eq(at(at($graph, at($scopes.names, $name)), "order"), $order))
+    yield append($sorted, $matches) → sorted
+  fold $sorted as name; contract starts { scopes = list(); scopeImplications = {} }:
+    let scope = at($graph, at($scopes.names, $name))
+    let implies = map($scope.impliedSubjects, "subject", at(at($graph, $subject), "name"))
+    let entries = append($contract.scopes, list({ name = $name; order = $scope.order;
+      consentClass = $scope.consentClass; implies = $implies; tools = $scope.tools }))
+    port record.put { record = $contract.scopeImplications; key = $name; value = $implies } → implications
+    yield { scopes = $entries; scopeImplications = $implications } → contract
+  port kernel.invoke { query = "mcpAuthorization.integer"; input = {
+    value = $policy.authorizationCodeLifetimeSeconds; minimum = 30; maximum = 600 } } → code
+  port kernel.invoke { query = "mcpAuthorization.integer"; input = {
+    value = $policy.accessTokenLifetimeSeconds; minimum = 60; maximum = 86400 } } → access
+  port kernel.invoke { query = "mcpAuthorization.integer"; input = {
+    value = $policy.refreshTokenLifetimeSeconds; minimum = $access; maximum = 31536000 } } → refresh
+  port value.sort { values = $policy.clientRegistrationMode } → registrationModes
+  let resource = $policy.resource
+  let authorizationServers = $policy.authorizationServer
+  assert not(eq($input.loopbackPort, 0))
+    otherwise "The local MCP resource must have a fixed port."
+  when $input.loopbackPort:
+    let origin = concat("http://127.0.0.1", if(eq($input.loopbackPort, 80), "", concat(":", $input.loopbackPort)))
+    let resource = concat($origin, "/mcp")
+    let authorizationServers = map($authorizationServers, "server", concat($origin, "/"))
+  when not($input.loopbackPort):
+    each append($authorizationServers, list($resource)) as url:
+      port text.matches { value = $url; pattern = "\\Ahttps://(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\.)+[a-z][a-z0-9-]*[a-z0-9]/(?:[A-Za-z0-9_~-]+(?:\\.[A-Za-z0-9_~-]+)*(?:/|\\z))*\\z" } → canonical
+      assert $canonical
+        otherwise "Expected a canonical hosted MCP HTTPS URL."
+  let result = { protocol = "sourcery-hosted-mcp-authorization/1"; policySubject = $policySubject;
+    resource = $resource; authorizationServers = $authorizationServers; discoveryScope = at(at($graph, $policy.discoveryScope), "name");
+    scopesSupported = $sorted; scopes = $contract.scopes; toolScopes = $scopes.tools; scopeImplications = $contract.scopeImplications;
+    clientRegistrationModes = $registrationModes;
+    lifetimes = { authorizationCodeSeconds = $code; accessTokenSeconds = $access; refreshTokenSeconds = $refresh };
+    modes = { authorizationFlow = $policy.authorizationFlowMode; authorizationCode = $policy.authorizationCodeMode;
+      accessToken = $policy.accessTokenMode; refreshToken = $policy.refreshTokenMode; consent = $policy.consentMode;
+      clientMetadataResolution = $policy.clientMetadataResolutionMode; workspaceSelection = $policy.workspaceSelectionMode;
+      consentInteraction = $policy.consentInteractionMode; unmappedTool = $policy.unmappedToolMode } }

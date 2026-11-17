@@ -1,0 +1,6 @@
+process-module "temple/surface-process-module/1"
+
+process hostedTls.deploy:
+  let result = "validate-nginx"
+  when eq($eventInput, "validated"):
+    let result = "reload-nginx"

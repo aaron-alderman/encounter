@@ -1,0 +1,30 @@
+process-module "temple/surface-process-module/1"
+
+# Installed releases hand the workspace host a complete document. Resolve the
+# marked slots from its published shell, preserving the surrounding markup.
+process environment.markup:
+  let document = $eventInput
+  let html = $document.html
+  port html.select { html = $html; select = { tag = "span"; attrs = { "data-workspace-platform" = true } } } → switchers
+  let input = if($document.steward, { tag = "a"; attrs = { href = "/workspace/platform" }; children = list("Platform") }, null)
+  call html.serialize
+  let link = $result
+  let edits = map($switchers, "slot", { start = $slot.start; end = $slot.end; value = $link })
+  when not($document.mobile):
+    port html.select { html = $html; select = { tag = "template"; attrs = { "data-workspace-platform-card" = true }; includeContent = $document.steward } } → cards
+    let edits = append($edits, map($cards, "card", { start = $card.start; end = $card.end; value = if($document.steward, $card.content, "") }))
+    when $document.steward:
+      port html.select { html = $html; select = { tag = "span"; attrs = { "data-workspace-platform-start" = true } } } → start
+      let input = { tag = "a"; attrs = { class = "app-link"; id = "notes-platform-launch"; href = "/workspace/platform" }; children = list(
+        { tag = "svg"; attrs = { class = "icon"; viewBox = "0 0 32 32"; "aria-hidden" = "true" }; children = list(
+          { tag = "use"; attrs = { href = "#icon-tools" } }) },
+        { tag = "span"; attrs = { class = "app-label" }; children = list(
+          { tag = "strong"; children = list("Platform") },
+          { tag = "small"; children = list("Platform apps") }) }) }
+      call html.serialize
+      let shortcut = $result
+      let edits = append($edits, map($start, "slot", { start = $slot.start; end = $slot.end; value = $shortcut }))
+    when $document.picker:
+      port html.select { html = $html; select = { tag = "span"; attrs = { "data-workspace-preference" = true } } } → preferences
+      let edits = append($edits, map($preferences, "slot", { start = $slot.start; end = $slot.end; value = $document.picker }))
+  port html.edit { html = $html; edits = $edits } → result

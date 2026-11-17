@@ -1,0 +1,314 @@
+process-module "temple/surface-process-module/1"
+
+process hostedLaunch.environmentWorkerConfig:
+  let input = $eventInput
+  let launch = eq($input.fromEnvironment, true)
+  let rules = list(
+    list("intervalMs", "SOURCERY_HOSTED_ENVIRONMENT_WORKER_INTERVAL_MS", 30000, 1000, 3600000, "Environment worker interval must be between 1000 and 3600000."),
+    list("sweepLimit", "SOURCERY_HOSTED_ENVIRONMENT_WORKER_SWEEP_LIMIT", 50, 1, 100, "Environment worker sweep limit must be between 1 and 100."))
+  fold $rules as rule; settings starts {}:
+    let field = at($rule, 0)
+    let name = at($rule, 1)
+    let minimum = at($rule, 3)
+    let maximum = at($rule, 4)
+    let value = at($input, $field)
+    when $launch:
+      port kernel.invoke { query = "hostedLaunch.integer"; input = { name = $name; value = at($input.environment, $name);
+        default = concat(at($rule, 2)); minimum = $minimum; maximum = $maximum } } → value
+    when not($launch):
+      let value = if(includes($input.provided, $field), $value, at($rule, 2))
+      port number.isNatural { value = $value } → integer
+      port number.calculate { operation = "greaterEqual"; values = list($value, $minimum) } → above
+      port number.calculate { operation = "lessEqual"; values = list($value, $maximum) } → below
+      when not(and($integer, $above, $below)):
+        let refused = raise(at($rule, 5))
+    port record.put { record = $settings; key = $field; value = $value } → next
+    yield $next → result
+
+process hostedLaunch.environmentSweep:
+  let input = $eventInput
+  let failure = $input.failure
+  let count = 0
+  when not($failure):
+    port number.isNatural { value = $input.count } → integer
+    port number.calculate { operation = "lessEqual"; values = list($input.count, $input.limit) } → bounded
+    when and($integer, $bounded):
+      let count = $input.count
+    when not(and($integer, $bounded)):
+      let failure = { code = "application-environment-worker-failed";
+        message = "Environment worker returned an invalid bounded sweep result." }
+  when $failure:
+    port text.slice { value = $failure.code; start = 0; end = 128 } → code
+    port text.slice { value = $failure.message; start = 0; end = 512 } → message
+    let failure = { code = $code; message = $message }
+  let state = $input.state
+  port number.calculate { operation = "add"; values = list($state.totalSweepCount, $count) } → total
+  port number.calculate { operation = "add"; values = list($state.successfulRuns, if($failure, 0, 1)) } → successful
+  port number.calculate { operation = "add"; values = list($state.failedRuns, if($failure, 1, 0)) } → failed
+  let result = { lastSweepCount = $count; totalSweepCount = $total; successfulRuns = $successful;
+    failedRuns = $failed; lastError = $failure }
+
+process hostedLaunch.localMcpPort:
+  let result = null
+  when not(eq($eventInput.port, null)):
+    port text.matches { value = $eventInput.port; pattern = "\\A[1-9][0-9]{0,4}\\z" } → explicit
+    assert $explicit
+      otherwise "SOURCERY_LOCAL_MCP_PORT must be an explicit TCP port."
+    port number.parse { value = $eventInput.port; radix = 10 } → result
+    port number.calculate { operation = "lessEqual"; values = list($result, 65535) } → bounded
+    assert $bounded
+      otherwise "SOURCERY_LOCAL_MCP_PORT must be an explicit TCP port."
+
+process hostedLaunch.localSshMcp:
+  let config = $eventInput.config
+  let fields = list("protocol", "issuer", "audience", "maximumLifetimeSeconds", "allowedScopes", "publicKeys")
+  port value.describe { value = $config } → shape
+  port record.entries { value = if($shape.plain, $config, {}) } → entries
+  let known = filter($entries, "entry", includes($fields, at($entry, 0)))
+  port value.describe { value = at($config, "publicKeys") } → keys
+  let audience = concat("http://127.0.0.1:", $eventInput.port, "/mcp")
+  assert and($shape.plain, $keys.plain, eq(count($entries), count($fields)), eq(count($known), count($fields)),
+    eq(at($config, "protocol"), "sourcery.hosted/ssh-mcp-verifier-config.v1"), eq(at($config, "audience"), $audience))
+    otherwise "SOURCERY_SSH_MCP_VERIFIER_CONFIG is not an exact SSH MCP verifier configuration."
+  let result = $config
+
+process hostedLaunch.flag:
+  let input = $eventInput
+  let value = or($input.value, "false")
+  when not(includes(list("true", "false"), $value)):
+    let refused = raise(concat($input.name, " must be true or false."))
+  let result = eq($value, "true")
+
+process hostedLaunch.integer:
+  let input = $eventInput
+  let value = or($input.value, $input.default)
+  port text.matches { value = $value; pattern = "\\A[0-9]+\\z" } → integer
+  when not($integer):
+    let refused = raise(or($input.integerError, concat($input.name, " must be an integer.")))
+  port number.parse { value = $value; radix = 10 } → result
+  port number.isNatural { value = $result } → natural
+  port number.calculate { operation = "greaterEqual"; values = list($result, $input.minimum) } → above
+  port number.calculate { operation = "lessEqual"; values = list($result, $input.maximum) } → below
+  when not(and($natural, $above, $below)):
+    let refused = raise(or($input.rangeError, concat($input.name, " is outside its supported range.")))
+
+process hostedLaunch.config:
+  let input = $eventInput
+  let env = $input.environment
+  port text.trim { value = if($env.SOURCERY_HOSTED_STATE_ROOT, $env.SOURCERY_HOSTED_STATE_ROOT, "") } → state
+  assert $state
+    otherwise "SOURCERY_HOSTED_STATE_ROOT is required."
+  port path.resolvePosix { base = $input.cwd; path = $state } → stateRoot
+  port path.resolvePosix { base = $stateRoot; path = "control-plane.json" } → stateFile
+  port path.resolvePosix { base = $stateRoot; path = "workspaces" } → workspaceRoot
+  port text.trim { value = or($env.SOURCERY_HOSTED_BIND_HOST, "127.0.0.1") } → bindHost
+  port kernel.invoke { query = "hostedLaunch.flag"; input = { name = "SOURCERY_HOSTED_TRUST_PROXY";
+    value = $env.SOURCERY_HOSTED_TRUST_PROXY } } → trustProxy
+  port kernel.invoke { query = "hostedLaunch.flag"; input = { name = "SOURCERY_HOSTED_ALLOW_INSECURE_HTTP";
+    value = $env.SOURCERY_HOSTED_ALLOW_INSECURE_HTTP } } → insecure
+  port text.trim { value = or($env.SOURCERY_HOSTED_DEPLOYMENT_PROFILE, "development") } → profile
+  assert includes(list("development", "production"), $profile)
+    otherwise "SOURCERY_HOSTED_DEPLOYMENT_PROFILE must be development or production."
+  let production = eq($profile, "production")
+  port text.trim { value = or($env.SOURCERY_HOSTED_AUTHORING_REQUEST_JOURNAL_STORAGE, "document") } → journal
+  assert includes(list("document", "event-row"), $journal)
+    otherwise "SOURCERY_HOSTED_AUTHORING_REQUEST_JOURNAL_STORAGE must be document or event-row."
+  assert or($production, eq($journal, "document"))
+    otherwise "Event-row authoring request storage is accepted only by the production deployment profile."
+  assert or($trustProxy, $insecure)
+    otherwise "The HTTP host requires SOURCERY_HOSTED_TRUST_PROXY=true behind TLS or explicit development-only insecure HTTP."
+  assert includes(list("127.0.0.1", "::1", "localhost"), $bindHost)
+    otherwise "Trusted proxy or insecure development HTTP requires a loopback bind host."
+  when $production:
+    assert and($trustProxy, not($insecure))
+      otherwise "The production deployment profile requires a loopback trusted TLS proxy and forbids insecure HTTP."
+
+  port text.trim { value = if($env.SOURCERY_HOSTED_PRODUCTION_MODULE, $env.SOURCERY_HOSTED_PRODUCTION_MODULE, "") } → configuredModule
+  let productionModule = null
+  when $production:
+    assert $configuredModule
+      otherwise "SOURCERY_HOSTED_PRODUCTION_MODULE is required for the production deployment profile."
+    port path.resolvePosix { base = $input.cwd; path = or($env.SOURCERY_HOSTED_SOURCE_ROOT, ".") } → sourceRoot
+    port path.resolvePosix { base = $sourceRoot; path = "plugins" } → plugins
+    port path.resolvePosix { base = $sourceRoot; path = "encounter" } → runtime
+    let statePrefix = if(eq($stateRoot, "/"), "/", concat($stateRoot, "/"))
+    port text.startsWith { value = $plugins; search = $statePrefix } → containsPlugins
+    port text.startsWith { value = $runtime; search = $statePrefix } → containsRuntime
+    port text.startsWith { value = $stateRoot; search = concat($plugins, "/") } → insidePlugins
+    assert not(or(eq($stateRoot, $plugins), eq($stateRoot, $runtime), $containsPlugins, $containsRuntime, $insidePlugins))
+      otherwise "SOURCERY_HOSTED_STATE_ROOT must remain outside production code and its containing directories."
+    port path.resolvePosix { base = $input.cwd; path = $configuredModule } → declared
+    port path.resolvePosix { base = $sourceRoot; path = "plugins/hosted-control-plane/self-hosted-production-infrastructure.mjs" } → fixed
+    assert eq($declared, $fixed)
+      otherwise "SOURCERY_HOSTED_PRODUCTION_MODULE must name the release's fixed self-hosted infrastructure module."
+    let productionModule = $fixed
+  when not($production):
+    assert not($configuredModule)
+      otherwise "SOURCERY_HOSTED_PRODUCTION_MODULE is accepted only by the production deployment profile."
+
+  let minimumPort = if(and($production, eq($input.supervisedGeneration, true)), 0, 1)
+  let limits = list(
+    list("port", "SOURCERY_HOSTED_PORT", "8130", $minimumPort, 65535),
+    list("requestTimeoutMs", "SOURCERY_HOSTED_REQUEST_TIMEOUT_MS", "15000", 1000, 120000),
+    list("authoringWorkerTimeoutMs", "SOURCERY_HOSTED_AUTHORING_WORKER_TIMEOUT_MS", "30000", 1000, 120000),
+    list("authoringWorkerMaximumResponseBytes", "SOURCERY_HOSTED_AUTHORING_WORKER_MAXIMUM_RESPONSE_BYTES", "8388608", 1024, 16777216))
+  port kernel.invoke { query = "hostedLaunch.environmentWorkerConfig"; input = { fromEnvironment = true; environment = $env } } → worker
+  let basic = { deploymentProfile = $profile; authoringRequestJournalStorage = $journal; productionModule = $productionModule;
+    bindHost = $bindHost; stateRoot = $stateRoot; stateFile = $stateFile; workspaceRoot = $workspaceRoot;
+    trustProxy = $trustProxy; allowInsecureHttp = $insecure;
+    environmentWorkerIntervalMs = $worker.intervalMs; environmentWorkerSweepLimit = $worker.sweepLimit }
+  fold $limits as rule; result starts $basic:
+    let name = at($rule, 1)
+    port kernel.invoke { query = "hostedLaunch.integer"; input = { name = $name; value = at($env, $name);
+      default = at($rule, 2); minimum = at($rule, 3); maximum = at($rule, 4) } } → value
+    port record.put { record = $result; key = at($rule, 0); value = $value } → next
+    yield $next → result
+
+
+process hostedLaunch.operationsShadow:
+  let env = $eventInput
+  let enabled = or($env.SOURCERY_OPERATIONS_SHADOW_ENABLED, "0")
+  assert includes(list("0", "1"), $enabled)
+    otherwise "SOURCERY_OPERATIONS_SHADOW_ENABLED must be 0 or 1."
+  let result = null
+  when eq($enabled, "1"):
+    let revision = if($env.SOURCERY_TIMESHEET_REVISION_SHA256, $env.SOURCERY_TIMESHEET_REVISION_SHA256, "")
+    port text.matches { value = $revision; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+    assert $hash
+      otherwise "SOURCERY_TIMESHEET_REVISION_SHA256 is required when operations shadow is enabled."
+    port kernel.invoke { query = "hostedLaunch.integer"; input = { name = "SOURCERY_OPERATIONS_SHADOW_INTERVAL_MS";
+      value = $env.SOURCERY_OPERATIONS_SHADOW_INTERVAL_MS; default = "60000"; minimum = 5000; maximum = 3600000 } } → interval
+    let result = { timesheetRevisionHash = $revision; intervalMs = $interval }
+
+process hostedLaunch.operationsMcp:
+  let enabled = or($eventInput.SOURCERY_OPERATIONS_MCP_ENABLED, "0")
+  assert includes(list("0", "1"), $enabled)
+    otherwise "SOURCERY_OPERATIONS_MCP_ENABLED must be 0 or 1."
+  let result = eq($enabled, "1")
+
+process hostedLaunch.requiredText:
+  port text.trim { value = $eventInput.value } → result
+  when not($result):
+    let refused = raise(concat($eventInput.name, " is required."))
+
+process hostedLaunch.authorityConfig:
+  let env = $eventInput
+  port kernel.invoke { query = "hostedLaunch.requiredText"; input = {
+    name = "SOURCERY_HOSTED_OIDC_PROVIDERS"; value = $env.SOURCERY_HOSTED_OIDC_PROVIDERS } } → encodedProviders
+  try:
+    port json.parse { text = $encodedProviders } → providers
+  catch invalid:
+    assert false
+      otherwise "SOURCERY_HOSTED_OIDC_PROVIDERS must be valid JSON."
+  try:
+    port kernel.invoke { query = "hostedOidc.providers"; input = $providers } → providers
+  catch invalid:
+    let refused = raise(concat("SOURCERY_HOSTED_OIDC_PROVIDERS: ", $invalid))
+  let issuers = map($providers, "provider", $provider.issuer)
+  port text.trim { value = or($env.SOURCERY_HOSTED_MANAGED_DOMAIN_ADMISSIONS, "[]") } → encodedAdmissions
+  try:
+    port json.parse { text = $encodedAdmissions } → admissions
+  catch invalid:
+    assert false
+      otherwise "SOURCERY_HOSTED_MANAGED_DOMAIN_ADMISSIONS must be valid JSON."
+  assert isArray($admissions)
+    otherwise "SOURCERY_HOSTED_MANAGED_DOMAIN_ADMISSIONS must contain configured issuer, hostedDomain, and tenantSlug objects."
+  fold $admissions as admission; domains starts list():
+    let issuer = at($admission, "issuer")
+    let domain = at($admission, "hostedDomain")
+    let tenant = at($admission, "tenantSlug")
+    port value.type { value = $issuer } → issuerType
+    port value.type { value = $domain } → domainType
+    port value.type { value = $tenant } → tenantType
+    assert and(eq($issuerType, "string"), eq($domainType, "string"), eq($tenantType, "string"))
+      otherwise "SOURCERY_HOSTED_MANAGED_DOMAIN_ADMISSIONS must contain configured issuer, hostedDomain, and tenantSlug objects."
+    port text.trim { value = $issuer } → issuer
+    port text.trim { value = $domain } → domain
+    port text.trim { value = $tenant } → tenant
+    assert and(includes($issuers, $issuer), $domain, $tenant)
+      otherwise "SOURCERY_HOSTED_MANAGED_DOMAIN_ADMISSIONS must contain configured issuer, hostedDomain, and tenantSlug objects."
+    port text.lowerCase { value = $domain } → domain
+    port text.lowerCase { value = $tenant } → tenant
+    yield append($domains, list({ issuer = $issuer; hostedDomain = $domain; tenantSlug = $tenant })) → domains
+  port kernel.invoke { query = "hostedLaunch.requiredText"; input = {
+    name = "SOURCERY_HOSTED_MASTER_KEY_BASE64"; value = $env.SOURCERY_HOSTED_MASTER_KEY_BASE64 } } → key
+  port text.matches { value = $key; pattern = "\\A[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=\\z" } → canonical
+  assert $canonical
+    otherwise "SOURCERY_HOSTED_MASTER_KEY_BASE64 must encode exactly 32 bytes using canonical base64."
+  port kernel.invoke { query = "hostedLaunch.requiredText"; input = {
+    name = "SOURCERY_HOSTED_BASE_DOMAIN"; value = $env.SOURCERY_HOSTED_BASE_DOMAIN } } → base
+  port text.lowerCase { value = $base } → baseDomain
+  port kernel.invoke { query = "hostedLaunch.requiredText"; input = {
+    name = "SOURCERY_HOSTED_OIDC_AUDIENCE"; value = $env.SOURCERY_HOSTED_OIDC_AUDIENCE } } → audience
+  port text.trim { value = $env.SOURCERY_HOSTED_BROWSER_LOGIN_PATH } → login
+  let browserLoginPath = null
+  when $login:
+    port text.matches { value = $login; pattern = "\\A/(?!/)[^?#\\\\\\r\\n]{1,255}\\z" } → sameOrigin
+    assert $sameOrigin
+      otherwise "SOURCERY_HOSTED_BROWSER_LOGIN_PATH must be a same-origin absolute path without query or fragment."
+    let browserLoginPath = $login
+  let result = { baseDomain = $baseDomain; audience = $audience; providers = $providers; oidcIssuers = $issuers;
+    managedDomainAdmissions = $domains; browserLoginPath = $browserLoginPath }
+
+process hostedLaunch.timesheetUrl:
+  let input = $eventInput
+  let result = null
+  when $input.configured:
+    let url = $input.url
+    assert $url
+      otherwise "SOURCERY_HOSTED_TIMESHEET_URL must be an HTTPS URL."
+    assert and(eq($url.protocol, "https:"), eq($url.credentials, false), eq($url.fragment, false))
+      otherwise "SOURCERY_HOSTED_TIMESHEET_URL must be an HTTPS URL without credentials or fragment."
+    let result = $url.href
+
+process hostedLaunch.operations:
+  let env = $eventInput
+  port kernel.invoke { query = "hostedLaunch.operationsShadow"; input = $env } → shadow
+  port kernel.invoke { query = "hostedLaunch.operationsMcp"; input = $env } → mcp
+  assert or(not($mcp), $shadow)
+    otherwise "Production operations MCP requires the no-effect shadow runtime."
+  let result = { shadow = $shadow; mcp = $mcp }
+
+process hostedLaunch.claimipediaHandoff:
+  let input = $eventInput
+  port text.trim { value = $input.endpoint } → endpoint
+  port text.replace { value = $input.publicOrigin; pattern = "/\\z"; replacement = "" } → publicOrigin
+  port text.trim { value = $input.secretFile } → secretFile
+  let result = null
+  when or($endpoint, $publicOrigin, $secretFile):
+    port text.matches { value = $endpoint; pattern = "\\Ahttp://(?:127\\.0\\.0\\.1|\\[::1\\]):[0-9]+/internal/handoff\\z" } → loopback
+    port text.matches { value = $publicOrigin; pattern = "\\Ahttps://[^\\s/]+\\z" } → https
+    port text.startsWith { value = $secretFile; search = "/" } → absolute
+    assert and($loopback, $https, $absolute)
+      otherwise "Claimipedia portal handoff requires a loopback endpoint, HTTPS public origin, and absolute secret file."
+    let result = { endpoint = $endpoint; publicOrigin = $publicOrigin; secretFile = $secretFile }
+
+process hostedLaunch.claimipediaSecret:
+  port text.trim { value = $eventInput.secret } → secret
+  port number.calculate { operation = "greaterEqual"; values = list(count($secret), 32) } → sufficient
+  assert $sufficient
+    otherwise "Claimipedia portal handoff secret must contain at least 32 characters."
+  let result = { endpoint = $eventInput.plan.endpoint; publicOrigin = $eventInput.plan.publicOrigin; secret = $secret }
+
+process hostedLaunch.startupReadiness:
+  let input = $eventInput
+  let gates = {
+    workspace = { code = "hosted-durable-workspace-unavailable"; message = "The durable hosted workspace allocator is not ready." };
+    authority = { code = "hosted-control-plane-authority-not-ready"; message = "The hosted control-plane authority configuration is not ready." };
+    authoring = { code = "hosted-authoring-request-service-not-ready"; message = "The hosted authoring request service is not ready." } }
+  let gate = at($gates, $input.gate)
+  assert $gate
+    otherwise "Unsupported hosted startup readiness gate."
+  let ready = if(eq($input.gate, "authority"), eq(at($input.observation, "ready"), true),
+    eq(at($input.observation, "status"), "ready"))
+  let result = if($ready, null, $gate)
+
+process hostedLaunch.productionReadiness:
+  let observations = $eventInput
+  each list("workspace", "authority", "authoring") as gate:
+    let observation = at($observations, $gate)
+    port kernel.invoke { query = "hostedLaunch.startupReadiness";
+      input = { gate = $gate; observation = if($observation, $observation, {}) } } → denial
+    when $denial:
+      let refused = raise($denial.message)
+  let result = true

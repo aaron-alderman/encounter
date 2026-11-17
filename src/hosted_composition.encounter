@@ -1,0 +1,154 @@
+process-module "temple/surface-process-module/1"
+
+process composition.hash:
+  port text.matches { value = $eventInput; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert $valid
+    otherwise "Release composition requires lowercase SHA-256 identities."
+  let result = true
+
+process composition.target:
+  let target = $eventInput
+  port text.matches { value = $target.runtimeVersion; pattern = "\\A[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?\\z" } → version
+  port text.matches { value = $target.abi; pattern = "\\A[0-9]{1,10}\\z" } → abi
+  assert and($version, $abi)
+    otherwise "Expected an exact Node target version and ABI for the hosted release."
+  let result = { os = "linux"; architecture = "x64"; runtime = "node"; runtimeVersion = $target.runtimeVersion; abi = $target.abi }
+
+process composition.closureKey:
+  let target = $eventInput
+  let key = { protocol = "sourcery-core/content-addressed-dependency-closure.v1";
+    dependencyBundleHash = $target.bundle; lockfileHash = $target.lockfile; platform = $target.platform }
+  port json.canonical { value = $key } → encoded
+  port digest.sha256 { text = $encoded } → result
+
+process composition.retain:
+  let input = $eventInput
+  assert $input.entryCount
+    otherwise "Dependency closure payload is empty."
+  let receipt = { protocol = "sourcery-core/content-addressed-dependency-closure.v1"; closureKey = $input.key;
+    dependencyBundleHash = $input.bundle; lockfileHash = $input.lockfile; platform = $input.platform;
+    treeHash = $input.treeHash; entryCount = $input.entryCount; bytes = $input.bytes; repositorySourceAuthority = false }
+  port json.canonical { value = $receipt } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  port record.put { record = $receipt; key = "closureHash"; value = $hash } → result
+
+process composition.payload:
+  assert and(eq($eventInput.packageManifestHash, $eventInput.install.packageManifestHash), eq($eventInput.lockfileHash, $eventInput.install.lockfileHash))
+    otherwise "Dependency closure input files differ from the admitted release."
+  let result = true
+
+process composition.preflight:
+  let input = $eventInput
+  let evidence = $input.evidence
+  assert eq($evidence.protocol, "sourcery/application-release-creation-input.v1")
+    otherwise "Unsupported application release evidence input."
+  assert and(eq($evidence.releaseId, $input.releaseId), eq($evidence.intendedActiveReleaseId, $input.releaseId))
+    otherwise "Release evidence does not identify the exact release directory."
+  assert eq($evidence.currentActiveReleaseId, $evidence.rollbackReleaseId)
+    otherwise "Release creation must retain the current active release as its rollback release."
+  assert eq($evidence.sourceCapsuleManifestHash, $input.sourceCapsuleManifestHash)
+    otherwise "Source capsule manifest evidence differs from its identity."
+  assert eq($evidence.reconstructionProofHash, $input.reconstructionProofHash)
+    otherwise "Reconstruction proof evidence differs from its identity."
+  assert and(isArray($evidence.sourceTreeHashes), count($evidence.sourceTreeHashes))
+    otherwise "Release creation requires source tree identities."
+  fold $evidence.sourceTreeHashes as hash; unique starts list():
+    port kernel.invoke { query = "composition.hash"; input = $hash } → valid
+    yield if(includes($unique, $hash), $unique, append($unique, list($hash))) → unique
+  port value.sort { values = $unique } → sources
+  assert not($input.workspaces)
+    otherwise "Production release package manifest must not retain workspace links."
+  assert not($input.templeDependency)
+    otherwise "Temple must enter production from the verified archive, not an npm file dependency."
+  port kernel.invoke { query = "composition.hash"; input = $input.archive } → archive
+  port kernel.invoke { query = "composition.hash"; input = $input.tree } → tree
+  let result = { releaseId = $input.releaseId; sourceCapsuleManifestHash = $input.sourceCapsuleManifestHash;
+    sourceTreeHashes = $sources; currentActiveReleaseId = $evidence.currentActiveReleaseId;
+    rollbackReleaseId = $evidence.rollbackReleaseId; reconstructionProofHash = $input.reconstructionProofHash;
+    install = { protocol = "sourcery/locked-dependency-install-input.v1"; packageManifestHash = $input.packageHash;
+      lockfileHash = $input.lockfileHash; templeArchiveHash = $input.archive; templeTreeHash = $input.tree; omit = "dev" } }
+
+process composition.seal:
+  let input = $eventInput
+  let release = $input.release
+  let install = $release.install
+  let closure = $input.closure
+  assert eq($input.expectedPreflight, $input.preflightHash)
+    otherwise "Release composition inputs changed during dependency installation."
+  assert and($input.closureMatches, eq($closure.closureKey, $input.directoryKey),
+    eq($input.archiveHash, $install.templeArchiveHash), eq($input.freezeHash, $install.templeTreeHash),
+    eq($input.payloadManifestHash, $install.packageManifestHash), eq($input.payloadLockfileHash, $install.lockfileHash))
+    otherwise "Dependency closure does not match the admitted release inputs."
+  let composition = { protocol = "sourcery/application-dependency-composition.v1"; releaseId = $release.releaseId;
+    packageManifestHash = $install.packageManifestHash; lockfileHash = $install.lockfileHash; dependencyBundleHash = $input.bundle;
+    dependencyClosureHash = $closure.closureHash; dependencyClosureKey = $closure.closureKey; templeArchiveHash = $install.templeArchiveHash;
+    templeTreeHash = $install.templeTreeHash; platform = $closure.platform; repositorySourceAuthority = false }
+  port json.canonical { value = $composition } → encoded
+  port digest.sha256 { text = $encoded } → compositionHash
+  port record.put { record = $composition; key = "compositionHash"; value = $compositionHash } → composition
+  let evidence = { protocol = "sourcery/evidence-complete-application-release.v1"; releaseId = $release.releaseId;
+    sourceCapsuleManifestHash = $release.sourceCapsuleManifestHash; sourceTreeHashes = $release.sourceTreeHashes;
+    lockfileHash = $install.lockfileHash; dependencyClosureHash = $closure.closureHash; compositionHash = $compositionHash;
+    currentActiveReleaseId = $release.currentActiveReleaseId; intendedActiveReleaseId = $release.releaseId;
+    rollbackReleaseId = $release.rollbackReleaseId; reconstructionProofHash = $release.reconstructionProofHash;
+    repositorySourceAuthority = false }
+  port json.canonical { value = $evidence } → encoded
+  port digest.sha256 { text = $encoded } → evidenceHash
+  port record.put { record = $evidence; key = "evidenceHash"; value = $evidenceHash } → evidence
+  let result = { composition = $composition; releaseEvidence = $evidence }
+
+process composition.auditInputs:
+  let input = $eventInput
+  let composition = $input.composition
+  let evidence = $input.evidence
+  assert and(eq($composition.protocol, "sourcery/application-dependency-composition.v1"),
+    eq($evidence.protocol, "sourcery/evidence-complete-application-release.v1"),
+    eq($composition.releaseId, $input.releaseId), eq($evidence.releaseId, $input.releaseId),
+    eq($evidence.intendedActiveReleaseId, $input.releaseId),
+    eq($composition.repositorySourceAuthority, false), eq($evidence.repositorySourceAuthority, false))
+    otherwise "Expected composition and evidence for this exact hosted release."
+  port record.entries { value = $composition } → fields
+  port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "compositionHash"))) } → body
+  port json.canonical { value = $body } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  assert and(eq($hash, $composition.compositionHash), eq($hash, $evidence.compositionHash))
+    otherwise "Hosted composition receipt hash differs from the release evidence."
+  assert or(eq($input.pin, null), eq($hash, $input.pin))
+    otherwise "Hosted composition receipt differs from the configured release pin."
+  assert or(eq($input.templePin, null), eq($composition.templeTreeHash, $input.templePin))
+    otherwise "Hosted composition receipt differs from the configured Temple freeze pin."
+  port record.entries { value = $evidence } → fields
+  port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "evidenceHash"))) } → body
+  port json.canonical { value = $body } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  assert eq($hash, $evidence.evidenceHash)
+    otherwise "Hosted release evidence hash differs from its content."
+  assert and(eq($composition.packageManifestHash, $input.packageHash), eq($composition.lockfileHash, $input.lockfileHash),
+    eq($evidence.lockfileHash, $input.lockfileHash), eq($evidence.dependencyClosureHash, $composition.dependencyClosureHash))
+    otherwise "Hosted release package files differ from the sealed dependency inputs."
+  port kernel.invoke { query = "composition.hash"; input = $composition.templeArchiveHash } → archive
+  port kernel.invoke { query = "composition.hash"; input = $composition.templeTreeHash } → tree
+  let install = { protocol = "sourcery/locked-dependency-install-input.v1"; packageManifestHash = $input.packageHash;
+    lockfileHash = $input.lockfileHash; templeArchiveHash = $composition.templeArchiveHash;
+    templeTreeHash = $composition.templeTreeHash; omit = "dev" }
+  port json.canonical { value = $install } → encoded
+  port digest.sha256 { text = $encoded } → bundle
+  port kernel.invoke { query = "composition.target"; input = $composition.platform } → platform
+  port kernel.invoke { query = "composition.closureKey"; input = { bundle = $bundle;
+    lockfile = $input.lockfileHash; platform = $platform } } → key
+  assert and(eq($bundle, $composition.dependencyBundleHash), eq($key, $composition.dependencyClosureKey))
+    otherwise "Hosted dependency closure key differs from the sealed inputs."
+  let result = { install = $install; platform = $platform; key = $key }
+
+process composition.audit:
+  let input = $eventInput
+  let closure = $input.observed
+  assert and($input.closureMatches, eq($closure.closureHash, $input.composition.dependencyClosureHash),
+    eq($input.payloadManifestHash, $input.composition.packageManifestHash),
+    eq($input.payloadLockfileHash, $input.composition.lockfileHash),
+    eq($input.freezeHash, $input.composition.templeTreeHash))
+    otherwise "Retained dependency payload differs from the sealed hosted release."
+  let result = { protocol = "sourcery/hosted-dependency-audit.v1"; releaseId = $input.composition.releaseId;
+    compositionHash = $input.composition.compositionHash; dependencyClosureHash = $closure.closureHash;
+    treeHash = $closure.treeHash; entryCount = $closure.entryCount; linkCount = $input.links;
+    platform = $closure.platform; valid = true }

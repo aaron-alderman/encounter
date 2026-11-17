@@ -1,0 +1,121 @@
+process-module "temple/surface-process-module/1"
+
+# Pending: 0 keep the controls, 1 clear them, 2 hold the update for the draft.
+process liveEvents.refresh:
+  port number.calculate { operation = "lessEqual"; values = list($wanted, $rendered) } → reached
+  let current = and(not($moved), $validRendered, $reached)
+  let holdDraft = and(not($force), $dirty)
+  let holdEditor = and(not($force), not($moved), $editing)
+  let pending = if($current, if($media, 1, 0), if($holdDraft, 2, 0))
+  let result = { fetch = not(if($current, true, if($holdDraft, true, $holdEditor))); pending = $pending }
+
+# 0 hold the draft, 1 replace live parts, 2 replace the page body, 3 hold an incomplete surface.
+process liveEvents.replace:
+  let hold = and($dirty, not($force))
+  port number.calculate { operation = "less"; values = list(0, $partCount) } → hasParts
+  let completeParts = and($hasParts, eq($partCount, $matchedParts))
+  let sameMarkerScope = eq($markerInside, $incomingMarkerInside)
+  let complete = and($surfacesPresent, $sameMarkerScope, if($media, $completeParts, true))
+  let action = if($hold, 0, if($complete, if($media, 1, 2), 3))
+  let commit = if(eq($action, 1), true, eq($action, 2))
+  let parts = eq($action, 1)
+  let marker = if($parts, true, and(eq($action, 2), not($markerInside)))
+  let result = { action = $action; retainDraft = and($dirty, $commit); changeRoute = and($parts, $moved);
+    focus = and($commit, $force); updateMarker = $marker }
+
+process liveEvents.pendingNotice:
+  let ordinary = "New activity is ready. Your draft is still here."
+  let answer = "New activity is ready. Your answer draft is still here."
+  let playback = "Playback moved to another segment. Show the update to change the feedback target. Your draft will be kept."
+  let message = if($show, if($moved, $playback, if($hasConnection, $ordinary, $answer)), "")
+  let result = { message = $message; hideApply = not($show); disableSubmit = $show }
+
+process liveEvents.mediaClockReady:
+  let result = and($hasCurrentData, not($seeking))
+
+process liveEvents.seekCue:
+  let result = and($hasCue, $hasCurrentData, $primaryButton, not($modified))
+
+process liveEvents.replaceToken:
+  let result = and($hasToken, $sameStream)
+
+process liveEvents.resumeCursor:
+  port number.calculate { operation = "lessEqual"; values = list(0, $saved) } → nonnegative
+  let result = if(and($safeInteger, $nonnegative), $saved, 0)
+
+process liveEvents.socketCoordinates:
+  let result = { protocol = if($secure, "wss:", "ws:"); cursorParameter = "after"; storagePrefix = "encounter-events:" }
+
+process liveEvents.socketDelivery:
+  port number.calculate { operation = "less"; values = list($after, $sequence) } → newer
+  let accept = and(not($opening), $validSequence, $newer)
+  let after = if($accept, $sequence, $after)
+  port number.calculate { operation = "max"; values = list($wanted, $after) } → watermark
+  let wanted = if($opening, $watermark, if($accept, $watermark, $wanted))
+  let result = { accept = $accept; after = $after; wanted = $wanted }
+
+process liveEvents.refreshReply:
+  let result = and($ok, $currentRoute)
+
+process liveEvents.replaceReply:
+  port number.calculate { operation = "less"; values = list($shown, $incoming) } → newer
+  let result = and($currentRoute, $sameStream, $validSequences, if($moved, true, $newer))
+
+process liveEvents.reconnectRequest:
+  let result = { refresh = $hasConnection; cache = "no-store"; redirect = "manual" }
+
+process liveEvents.reconnectAction:
+  let unauthorised = if(eq($status, 401), true, eq($status, 403))
+  let waitForSignIn = if($opaqueRedirect, true, $unauthorised)
+  let read = and(not($waitForSignIn), $ok)
+  let result = { read = $read; retryEvent = if($read, "", if($waitForSignIn, "sign-in", "failed")) }
+
+process liveEvents.socketSchedule:
+  let closed = eq($event, "close")
+  let failed = eq($event, "failed")
+  let backoff = if($failed, true, and($closed, $hasConnection))
+  let doubled = add($delay, $delay)
+  port number.calculate { operation = "min"; values = list($doubled, 5000) } → capped
+  let starting = eq($event, "start")
+  let opened = eq($event, "open")
+  let signIn = eq($event, "sign-in")
+  let next = if(if($starting, true, $opened), 500, if($backoff, $capped, $delay))
+  let wait = if($closed, $delay, if($failed, $next, if($signIn, 5000, if(eq($event, "poll"), 750, 0))))
+  let notice = if($starting, "Connecting live…", if($opened, "Live updates connected",
+    if($closed, "Reconnecting live updates…", if($signIn, "Sign in again to reconnect.", ""))))
+  let result = { delay = $next; wait = $wait; notice = $notice; publish = not($starting) }
+
+process liveEvents.cueCandidate:
+  port number.calculate { operation = "lessEqual"; values = list($start, $now) } → reached
+  port number.calculate { operation = "less"; values = list($previous, $start) } → later
+  let result = and($validTimes, $reached, if($hasCue, $later, true))
+
+process liveEvents.holdSubmit:
+  let result = and($hasDraft, if($seeking, true, $moved))
+
+process liveEvents.draftChanged:
+  let result = not(and(eq($currentLength, $savedLength), eq($current, $saved)))
+
+process liveEvents.sameCoordinate:
+  let result = and(eq($currentLength, $savedLength), eq($current, $saved))
+
+process liveEvents.editorActive:
+  let result = and($editable, not($canvasControl))
+
+# 0 ignore, 1 start a refresh, 2 retain an explicit choice for this route.
+process liveEvents.updatePlan:
+  let result = if($surfacePresent, if($updating, if($force, 2, 0), 1), 0)
+
+process liveEvents.applyQueued:
+  let consume = and($queued, $sameRoute)
+  let result = { force = if($force, true, $consume); consume = $consume }
+
+process liveEvents.queuedApplied:
+  let result = and($replaced, $consume)
+
+process liveEvents.inspectQueuedRoute:
+  let result = and($queued, not($applied))
+
+process liveEvents.finishQueued:
+  call liveEvents.inspectQueuedRoute
+  let result = { clear = $queued; retry = and($result, $sameRoute) }

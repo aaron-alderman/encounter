@@ -1,0 +1,42 @@
+process-module "temple/surface-process-module/1"
+
+process productionCatalogue.revision:
+  let input = $eventInput
+  let applications = $input.applications
+  let tools = $input.tools
+  assert and(isArray($applications), count($applications))
+    otherwise "Production catalogue requires an explicit non-empty application inventory."
+  assert and(isArray($tools), count($tools), eq(count($tools), count(distinct($tools))), includes($tools, "sourcery_knowledge_catalogue"))
+    otherwise "Production catalogue tool inventory must be unique and include itself."
+  assert and(every($applications, "app", and($app.slug, $app.applicationId)), every($tools, "tool", $tool))
+    otherwise "Production catalogue inventories contain an incomplete identity."
+  let slugs = map($applications, "app", $app.slug)
+  port value.sort { values = distinct($slugs); mode = "locale" } → sorted
+  fold $sorted as slug; inventory starts list():
+    yield append($inventory, filter($applications, "app", eq($app.slug, $slug))) → inventory
+  port value.sort { values = $tools } → toolInventory
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = { applicationInventory = $inventory;
+    profileHash = $input.profileHash; sourceEvidence = $input.sourceEvidence; toolInventory = $toolInventory } } → sourceRevision
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $inventory } → applicationHash
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $toolInventory } → toolHash
+  let result = { sourceRevision = $sourceRevision; applicationHash = $applicationHash; toolHash = $toolHash }
+
+process productionCatalogue.identity:
+  let input = $eventInput
+  let body = { protocol = "sourcery/production-knowledge-catalogue-identity.v1";
+    sourceRevision = $input.sourceRevision; retainedAt = $input.retainedAt }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "identityHash"; value = $hash } → result
+
+process productionCatalogue.reopen:
+  let input = $eventInput
+  let retained = $input.retained
+  assert $input.timestamp
+    otherwise "Production catalogue identity does not match this exact source revision; explicit archive or migration is required."
+  port kernel.invoke { query = "productionCatalogue.identity"; input = { sourceRevision = $input.sourceRevision;
+    retainedAt = at($retained, "retainedAt") } } → expected
+  port record.entries { value = $retained } → fields
+  assert and(eq(count($fields), 4), eq($retained.protocol, $expected.protocol),
+    eq($retained.sourceRevision, $expected.sourceRevision), eq($retained.identityHash, $expected.identityHash))
+    otherwise "Production catalogue identity does not match this exact source revision; explicit archive or migration is required."
+  let result = $retained

@@ -1,0 +1,121 @@
+process-module "temple/surface-process-module/1"
+
+process templeReadiness.install:
+  let input = $eventInput
+  each list($input.artifact, $input.configPath, $input.dropInPath) as path:
+    port text.matches { value = $path; pattern = "\\A(?:/[A-Za-z0-9_.-]+)+\\z" } → literal
+    assert $literal
+      otherwise "Server Temple installation requires absolute literal systemd paths."
+  port kernel.invoke { query = "templeApplication.plan"; input = $input.config } → application
+  port text.startsWith { value = $application.image; search = concat($input.artifact, "/") } → matched
+  assert $matched
+    otherwise "Server Temple application image must be in the installed artifact."
+  let readiness = { protocol = "sourcery/server-temple-runtime-readiness.v1"; url = $input.endpoint;
+    method = "GET"; expectedStatus = 405; expectedHeaders = { allow = "POST" };
+    timeoutMs = $input.timeoutMs; intervalMs = $input.intervalMs }
+  let transport = { protocol = "sourcery/temple-transit-http-config.v1"; host = "127.0.0.1"; port = 8141;
+    maximumBytes = 1048576; carrierDescription = "loopback HTTP through an operator-authorized tunnel" }
+  port record.put { record = $input.config; key = "readiness"; value = $readiness } → next
+  port record.put { record = $next; key = "transport"; value = $transport } → config
+  let runtime = concat($input.artifact, "/encounter")
+  let dropIn = concat("[Service]\nExecStart=\nExecStart=", $runtime, " server-temple-host ", $input.configPath,
+    "\nExecStartPost=\nExecStartPost=", $runtime, " server-temple-readiness ", $input.configPath,
+    "\nReadWritePaths=/var/lib/sourcery-dev/temples/server\nReadOnlyPaths=", $input.artifact, " ", $input.configPath, "\n")
+  let result = { config = $config; dropIn = $dropIn; application = $application }
+
+process templeReadiness.configure:
+  let config = $eventInput
+  assert eq($config.protocol, "sourcery/server-temple-process-host-config.v1")
+    otherwise "Invalid Server Temple host configuration protocol."
+  let readiness = $config.readiness
+  port value.type { value = $readiness.method } → methodType
+  assert and(eq($readiness.protocol, "sourcery/server-temple-runtime-readiness.v1"),
+    or(eq($readiness.method, "GET"), eq($readiness.method, null), eq($methodType, "undefined")))
+    otherwise "Expected the Server Temple GET readiness contract."
+  let expectedStatus = $readiness.expectedStatus
+  port value.type { value = $expectedStatus } → statusType
+  when eq($statusType, "string"):
+    port number.parse { value = $expectedStatus } → expectedStatus
+  let value = $expectedStatus
+  let minimum = 100
+  let maximum = 599
+  call templeReadiness.range
+  port value.type { value = $readiness.timeoutMs } → timeoutType
+  port value.type { value = $readiness.intervalMs } → intervalType
+  let timeoutMs = if(or(eq($readiness.timeoutMs, null), eq($timeoutType, "undefined")), 30000, $readiness.timeoutMs)
+  let intervalMs = if(or(eq($readiness.intervalMs, null), eq($intervalType, "undefined")), 250, $readiness.intervalMs)
+  let minimum = 1
+  let maximum = 600000
+  let value = $timeoutMs
+  call templeReadiness.range
+  let value = $intervalMs
+  call templeReadiness.range
+  port value.type { value = $readiness.expectedHeaders } → headersType
+  let headers = if(or(eq($readiness.expectedHeaders, null), eq($headersType, "undefined")), {}, $readiness.expectedHeaders)
+  port value.describe { value = $headers } → headerShape
+  assert $headerShape.plain
+    otherwise "Expected Server Temple readiness response headers."
+  port record.entries { value = $headers } → entries
+  fold $entries as entry; normalized starts {}:
+    let name = at($entry, 0)
+    let expected = at($entry, 1)
+    port text.matches { value = $name; pattern = "\\A[!#$%&'*+.^_`|~0-9A-Za-z-]+\\z" } → nameValid
+    port text.matches { value = $expected; pattern = "\\S" } → valueValid
+    assert and($nameValid, $valueValid)
+      otherwise "Invalid Server Temple readiness header."
+    port text.lowerCase { value = $name } → lower
+    port record.put { record = $normalized; key = $lower; value = $expected } → result
+    yield $result → expectedHeaders
+  let transit = null
+  when $config.transport:
+    let transport = $config.transport
+    assert and(eq($transport.protocol, "sourcery/temple-transit-http-config.v1"),
+      includes(list("127.0.0.1", "::1", "localhost"), $transport.host))
+      otherwise "Invalid Server Temple transit readiness configuration."
+    let value = $transport.port
+    let maximum = 65535
+    call templeReadiness.range
+    let host = if(eq($transport.host, "::1"), "[::1]", $transport.host)
+    let transit = concat("http://", $host, ":", $transport.port, "/health")
+  let result = { capsuleFile = $config.capsuleFile; templeId = $config.templeId; url = $readiness.url;
+    expectedStatus = $expectedStatus; expectedHeaders = $expectedHeaders; timeoutMs = $timeoutMs;
+    intervalMs = $intervalMs; transit = $transit }
+
+process templeReadiness.range:
+  port number.isNatural { value = $value } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($value, $minimum) } → above
+  port number.calculate { operation = "lessEqual"; values = list($value, $maximum) } → below
+  assert and($integer, $above, $below)
+    otherwise "Server Temple readiness requires an integer in the supported range."
+
+process templeReadiness.capsule:
+  let capsule = $eventInput.capsule
+  assert and(eq($capsule.valid, true), eq($capsule.templeId, $eventInput.templeId))
+    otherwise "Server Temple capsule identity is not ready."
+  let result = true
+
+process templeReadiness.endpoint:
+  let input = $eventInput
+  port record.entries { value = $input.plan.expectedHeaders } → entries
+  fold $entries as entry; matched starts true:
+    let name = at($entry, 0)
+    let supplied = at($input.observation.headers, $name)
+    let matches = false
+    when $supplied:
+      port text.lowerCase { value = $supplied } → observed
+      port text.lowerCase { value = at($entry, 1) } → expected
+      let matches = eq($observed, $expected)
+    yield and($matched, $matches) → allHeaders
+  let result = and(eq($input.observation.status, $input.plan.expectedStatus), $allHeaders)
+
+process templeReadiness.transit:
+  let observation = $eventInput.observation
+  let capsule = $eventInput.capsule
+  let result = and(eq($observation.status, 200), eq($observation.templeId, $capsule.templeId),
+    eq($observation.manifestHash, $capsule.manifestHash))
+
+process templeReadiness.receipt:
+  let input = $eventInput
+  let result = { protocol = "sourcery/server-temple-runtime-readiness-receipt.v1"; status = "ready";
+    templeId = $input.capsule.templeId; manifestHash = $input.capsule.manifestHash; endpoint = $input.endpoint;
+    attempts = $input.attempts; readyAt = $input.readyAt; elapsedMs = $input.elapsedMs; observation = $input.observation }

@@ -1,0 +1,88 @@
+process-module "temple/surface-process-module/1"
+
+process capsule.schema:
+  assert eq($eventInput.version, 1)
+    otherwise "Server Temple capsule requires schema version 1."
+  assert eq($eventInput.integrity, list("ok"))
+    otherwise "Server Temple capsule failed SQLite integrity checking."
+  let result = true
+
+process capsule.manifest:
+  let row = $eventInput
+  port json.parse { text = $row.manifest_json } → manifest
+  each list("templeId", "name", "generation", "identityPublicKey") as field:
+    port text.matches { value = at($manifest, $field); pattern = "\\S" } → nonempty
+    assert $nonempty
+      otherwise "Server Temple manifest has an empty required field."
+  assert $row.canonicalTimestamp
+    otherwise "Server Temple manifest creation time is not canonical."
+  let authority = $manifest.authority
+  port value.type { value = $authority } → kind
+  when eq($kind, "undefined"):
+    let authority = {}
+  port value.describe { value = $authority } → authorityShape
+  assert $authorityShape.plain
+    otherwise "Server Temple manifest authority must be a record."
+  let body = { protocol = "sourcery-core/temple-manifest.v1"; templeId = $manifest.templeId;
+    name = $manifest.name; generation = $manifest.generation; createdAt = $manifest.createdAt;
+    authority = $authority; identityPublicKey = $manifest.identityPublicKey }
+  port json.canonical { value = $body } → bytes
+  port digest.sha256 { text = $bytes } → pin
+  assert and(eq($pin, $manifest.manifestHash), eq($pin, $row.manifest_hash))
+    otherwise "Server Temple manifest hash differs from the signed body or stored row."
+  assert eq($manifest.signature.algorithm, "Ed25519")
+    otherwise "Server Temple manifest requires Ed25519."
+  port signature.ed25519.verify { text = $bytes; publicKey = $row.publicKey; signature = $row.signature } → verified
+  assert $verified
+    otherwise "Server Temple manifest signature is invalid."
+  let result = { templeId = $manifest.templeId; manifestHash = $pin; publicKey = $row.publicKey }
+
+process capsule.digest:
+  port json.parse { text = $encoded } → value
+  port value.type { value = $value } → kind
+  let bytes = $value
+  when not(eq($kind, "string")):
+    port json.canonical { value = $value } → bytes
+  port digest.sha256 { text = $bytes } → result
+
+process capsule.event:
+  let row = $eventInput.row
+  let prior = $eventInput.prior
+  assert eq($row.sequence, add($prior.eventCount, 1))
+    otherwise "Server Temple journal sequence has a gap."
+  let encoded = $row.payload_json
+  call capsule.digest
+  assert eq($result, $row.payload_hash)
+    otherwise "Server Temple journal payload differs from its digest."
+  assert eq($row.previous_hash, $prior.headHash)
+    otherwise "Server Temple journal chain is broken."
+  call capsule.eventHash
+  let pin = $result
+  assert eq($pin, $row.event_hash)
+    otherwise "Server Temple journal event differs from its digest."
+  let result = { eventCount = $row.sequence; headHash = $pin }
+
+process capsule.eventHash:
+  let body = { sequence = $row.sequence; eventId = $row.event_id; kind = $row.kind;
+    actor = $row.actor; occurredAt = $row.occurred_at; payloadHash = $row.payload_hash; previousHash = $row.previous_hash }
+  port json.canonical { value = $body } → bytes
+  port digest.sha256 { text = $bytes } → result
+
+process capsule.object:
+  assert and(eq($eventInput.actualBytes, $eventInput.byte_length), eq($eventInput.actualDigest, $eventInput.object_hash))
+    otherwise "Server Temple object differs from its recorded size or digest."
+  let result = true
+
+process capsule.document:
+  let encoded = $eventInput.document
+  call capsule.digest
+  assert eq($result, $eventInput.digest)
+    otherwise "Server Temple projection or bridge message differs from its digest."
+  let result = true
+
+process capsule.inspection:
+  let input = $eventInput
+  let result = { protocol = "sourcery-core/temple-capsule.v1"; schemaVersion = $input.version;
+    templeId = $input.manifest.templeId; manifestHash = $input.manifest.manifestHash; journal = $input.journal;
+    objectCount = $input.objects; projectionCount = $input.projections;
+    bridgeMessageCount = $input.messages; secretReferenceCount = $input.secrets; valid = true }

@@ -1,0 +1,113 @@
+process-module "temple/surface-process-module/1"
+
+process catalogueIntegration.coordinates:
+  let result = { admittedSystemAtlas = "system-atlas-control-plane"; applicationInventory = "admitted-project-portfolio";
+    claimInventory = "epistemic-claim-field"; mcpToolCatalogue = "mcp-authoring-tool-catalogue";
+    observationLedgerStore = "host-durable-observation-store"; pluginSemanticRegistry = "semantic-plugin-registry";
+    projectionInventory = "system-atlas-projection-facets"; workInventory = "authoring-control-plane-work-formation" }
+
+process catalogueIntegration.contract:
+  let input = $eventInput
+  port kernel.invoke { query = "catalogueIntegration.coordinates"; input = null } → coordinates
+  port record.entries { value = $coordinates } → required
+  let hooks = $input.hooks
+  when $input.production:
+    let hooks = $coordinates
+  port value.describe { value = $hooks } → shape
+  assert $shape.plain
+    otherwise "hooks must be explicit."
+  port record.entries { value = $hooks } → fields
+  let names = map($required, "field", at($field, 0))
+  assert and(eq(count($fields), count($names)), every($fields, "field", includes($names, at($field, 0))))
+    otherwise "Knowledge catalogue hooks are not closed."
+  fold $names as name; pairs starts list():
+    let coordinate = at($hooks, $name)
+    port value.type { value = $coordinate } → type
+    assert eq($type, "string")
+      otherwise "Knowledge catalogue hooks are not closed."
+    port text.trim { value = $coordinate } → trimmed
+    assert $trimmed
+      otherwise "Knowledge catalogue hooks are not closed."
+    yield append($pairs, list(list($name, $trimmed))) → pairs
+  port record.fromEntries { entries = $pairs } → normalized
+  port value.type { value = $input.sourceRevision } → type
+  assert eq($type, "string")
+    otherwise "sourceRevision is required."
+  port text.trim { value = $input.sourceRevision } → revision
+  assert $revision
+    otherwise "sourceRevision is required."
+  let body = { protocol = "sourcery-knowledge-catalogue-integration/1"; sourceRevision = $input.sourceRevision;
+    tool = "sourcery_knowledge_catalogue"; hooks = $normalized;
+    invariants = { noHiddenDefaults = true; catalogueDoesNotGrantAuthority = true; sourceEvidenceClassesRemainDistinct = true;
+      failuresMayProposeButNeverExecuteRemediation = true; everyIncludedThingHasStandardAndUnderlyingMechanisms = true;
+      missingInventoryFailsReadiness = true } }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "contractHash"; value = $hash } → result
+
+process catalogueIntegration.readiness:
+  let input = $eventInput
+  let contract = $input.contract
+  assert eq(at($contract, "protocol"), "sourcery-knowledge-catalogue-integration/1")
+    otherwise "Exact knowledge catalogue integration contract is required."
+  port record.entries { value = $contract } → fields
+  port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "contractHash"))) } → body
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  assert eq($contract.contractHash, $hash)
+    otherwise "Knowledge catalogue integration contract hash mismatch."
+  port record.entries { value = $contract.hooks } → hooks
+  port value.sort { values = map($hooks, "field", at($field, 0)) } → names
+  port kernel.invoke { query = "catalogueIntegration.coordinates"; input = null } → coordinates
+  port record.entries { value = $coordinates } → required
+  assert eq($names, map($required, "field", at($field, 0)))
+    otherwise "Knowledge catalogue hooks are not closed."
+  let availability = $input.availability
+  port value.describe { value = $availability } → shape
+  assert $shape.plain
+    otherwise "availability must be explicit."
+  port record.entries { value = $availability } → fields
+  assert every($fields, "field", includes($names, at($field, 0)))
+    otherwise "Unknown integration availability hooks."
+  let checks = map($names, "name", { hook = $name; coordinate = at($contract.hooks, $name);
+    available = eq(at($availability, $name), true) })
+  let missing = map(filter($checks, "check", not($check.available)), "check", $check.hook)
+  let result = { protocol = "sourcery-knowledge-catalogue-integration-readiness/1"; contractHash = $hash;
+    status = if(count($missing), "not-ready", "ready"); checks = $checks; missing = $missing }
+
+process catalogueIntegration.hookEvidence:
+  let input = $eventInput
+  let observed = $input.observation
+  let hash = at($observed, "sourceHash")
+  port value.type { value = $hash } → hashType
+  let valid = false
+  when eq($hashType, "string"):
+    port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  let count = at($observed, "evidenceCount")
+  port value.type { value = $count } → countType
+  let positive = false
+  when eq($countType, "number"):
+    port number.calculate { operation = "floor"; values = list($count) } → whole
+    port number.calculate { operation = "greaterEqual"; values = list($count, 1) } → nonzero
+    let positive = and($nonzero, eq($whole, $count))
+  when not(and(eq(at($observed, "coordinate"), $input.coordinate), eq(at($observed, "available"), true), $valid, $positive)):
+    let rejected = raise(concat("Knowledge catalogue integration hook ", $input.hook, " did not return exact availability evidence."))
+  let result = { coordinate = $input.coordinate; sourceHash = $hash; evidenceCount = $count }
+
+process catalogueIntegration.production:
+  let input = $eventInput
+  port kernel.invoke { query = "catalogueIntegration.contract"; input = { production = true; sourceRevision = $input.identity.sourceRevision } } → contract
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $input.store } → storeHash
+  let sources = $input.sources
+  let raw = {
+    admittedSystemAtlas = list($sources.hookHashes.admittedSystemAtlas, 1);
+    applicationInventory = list($input.identity.applicationHash, $input.applicationCount);
+    claimInventory = list($sources.hookHashes.claimInventory, 1);
+    mcpToolCatalogue = list($input.identity.toolHash, $input.toolCount);
+    observationLedgerStore = list($storeHash, 1);
+    pluginSemanticRegistry = list($sources.hookHashes.pluginSemanticRegistry, 1);
+    projectionInventory = list($sources.profileHash, $input.entryCount);
+    workInventory = list($sources.hookHashes.workInventory, 1) }
+  port record.entries { value = $raw } → fields
+  port record.fromEntries { entries = map($fields, "field", list(at($field, 0), {
+    coordinate = at($contract.hooks, at($field, 0)); available = true;
+    sourceHash = at(at($field, 1), 0); evidenceCount = at(at($field, 1), 1) })) } → observations
+  let result = { contract = $contract; observations = $observations }

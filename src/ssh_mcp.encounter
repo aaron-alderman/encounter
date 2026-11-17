@@ -1,0 +1,147 @@
+process-module "temple/surface-process-module/1"
+
+process sshMcp.scopes:
+  let scopes = $eventInput.scopes
+  assert and(isArray($scopes), count($scopes), eq(count(distinct($scopes)), count($scopes)))
+    otherwise "SSH MCP assertion scopes are invalid."
+  port number.calculate { operation = "lessEqual"; values = list(count($scopes), 32) } → bounded
+  assert $bounded
+    otherwise "SSH MCP assertion scopes are invalid."
+  each $scopes as scope:
+    port text.matches { value = $scope; pattern = "\\A[a-z][a-z0-9.:-]{0,127}\\z" } → valid
+    assert and($valid, not(eq($scope, "operations.execute")), includes($eventInput.allowed, $scope))
+      otherwise "SSH MCP assertion scopes exceed the admitted SSH access policy."
+  assert includes($scopes, "authoring.read")
+    otherwise "SSH MCP assertion scopes require authoring.read."
+  port value.sort { values = $scopes } → result
+
+process sshMcp.configuration:
+  let input = $eventInput
+  port text.matches { value = $input.issuer; pattern = "\\A[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}\\z" } → issuer
+  assert $issuer
+    otherwise "SSH MCP assertion issuer is invalid."
+  port text.matches { value = $input.audience; pattern = "\\Ahttp://(?:127[.]0[.]0[.]1|localhost|\\[::1\\])(?::[1-9][0-9]{0,4})?/mcp\\z" } → audience
+  assert $audience
+    otherwise "SSH MCP assertion audience must be the exact loopback MCP resource."
+  port number.isNatural { value = $input.maximumLifetimeSeconds } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($input.maximumLifetimeSeconds, 30) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($input.maximumLifetimeSeconds, 300) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "SSH MCP assertion lifetime must be between 30 and 300 seconds."
+  port kernel.invoke { query = "sshMcp.scopes"; input = { scopes = $input.allowedScopes; allowed = $input.allowedScopes } } → scopes
+  port record.entries { value = $input.keys } → keys
+  assert count($keys)
+    otherwise "SSH MCP assertion verification requires at least one public key."
+  each $keys as key:
+    port text.matches { value = at($key, 0); pattern = "\\A[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}\\z" } → keyId
+    assert $keyId
+      otherwise "SSH MCP assertion key ID is invalid."
+  let result = true
+
+process sshMcp.identity:
+  let input = $eventInput
+  port text.matches { value = $input.account; pattern = "\\A[a-z_][a-z0-9_-]{0,63}\\z" } → account
+  port text.matches { value = $input.keyFingerprint; pattern = "\\ASHA256:[A-Za-z0-9+/]{43}\\z" } → fingerprint
+  port text.matches { value = $input.sessionId; pattern = "\\A[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}\\z" } → session
+  port text.matches { value = $input.nonce; pattern = "\\A[A-Za-z0-9_-]{16,64}\\z" } → nonce
+  assert and($account, $fingerprint, $session, $nonce)
+    otherwise "SSH MCP assertion identity is invalid."
+  let result = true
+
+process sshMcp.verify:
+  let input = $eventInput
+  let body = $input.body
+  let config = $input.config
+  port value.describe { value = $body } → shape
+  port record.entries { value = if($shape.plain, $body, {}) } → entries
+  let expected = list("account", "audience", "expiresAt", "issuedAt", "issuer", "keyFingerprint", "keyId", "nonce", "protocol", "scopes", "sessionId")
+  let fields = filter($entries, "entry", includes($expected, at($entry, 0)))
+  assert and(eq(count($entries), 11), eq(count($fields), 11))
+    otherwise "SSH MCP assertion has an invalid shape."
+  port text.matches { value = if($body.keyId, $body.keyId, ""); pattern = "\\A[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}\\z" } → keyId
+  assert $keyId
+    otherwise "SSH MCP assertion key ID is invalid."
+  let key = at($config.keys, $body.keyId)
+  port signature.ed25519.verify { text = $input.payload; publicKey = if($key, $key, ""); signature = $input.signature } → matched
+  assert $matched
+    otherwise "SSH MCP assertion signature is invalid."
+  assert and(eq($body.protocol, "sourcery.hosted/ssh-mcp-assertion.v1"), eq($body.issuer, $config.issuer), eq($body.audience, $config.audience))
+    otherwise "SSH MCP assertion is bound to a different issuer or resource."
+  port number.isNatural { value = $body.issuedAt } → issued
+  port number.isNatural { value = $body.expiresAt } → expires
+  port number.calculate { operation = "subtract"; values = list($body.expiresAt, $body.issuedAt) } → lifetime
+  port number.calculate { operation = "greater"; values = list($lifetime, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($lifetime, $config.maximumLifetimeSeconds) } → bounded
+  assert and($issued, $expires, $positive, $bounded)
+    otherwise "SSH MCP assertion lifetime is invalid."
+  port number.calculate { operation = "add"; values = list($input.now, 15) } → latest
+  port number.calculate { operation = "subtract"; values = list($input.now, 15) } → earliest
+  port number.calculate { operation = "lessEqual"; values = list($body.issuedAt, $latest) } → started
+  port number.calculate { operation = "greater"; values = list($body.expiresAt, $earliest) } → current
+  assert and($started, $current)
+    otherwise "SSH MCP assertion is not currently valid."
+  port kernel.invoke { query = "sshMcp.identity"; input = $body } → identity
+  port kernel.invoke { query = "sshMcp.scopes"; input = { scopes = $body.scopes; allowed = $config.allowedScopes } } → scopes
+  let claims = { account = $body.account; keyFingerprint = $body.keyFingerprint; sessionId = $body.sessionId;
+    scopes = $scopes; issuedAt = $body.issuedAt; expiresAt = $body.expiresAt; nonce = $body.nonce }
+  let result = $claims
+  when not(eq($input.routeScopes, null)):
+    port kernel.invoke { query = "sshMcp.routeAccess"; input = { claims = $claims; scopes = $input.routeScopes } } → result
+
+process sshMcp.brokerIssue:
+  let input = $eventInput
+  let config = $input.config
+  port record.entries { value = $config } → configEntries
+  let expected = list("protocol", "keyId", "issuer", "audience", "privateKeyFile", "maximumLifetimeSeconds", "principals")
+  assert and(eq(count($configEntries), count($expected)),
+    every($configEntries, "entry", includes($expected, at($entry, 0))),
+    eq($config.protocol, "sourcery.hosted/ssh-mcp-broker-config.v1"), isArray($config.principals), count($config.principals))
+    otherwise "SSH MCP broker configuration is invalid."
+  port kernel.invoke { query = "sshMcp.identity"; input = $input } → identity
+  each $config.principals as principal:
+    port record.entries { value = $principal } → entries
+    assert and(eq(count($entries), 3), every($entries, "entry", includes(list("account", "keyFingerprints", "scopes"), at($entry, 0))),
+      isArray($principal.keyFingerprints), isArray($principal.scopes))
+      otherwise "SSH MCP principal policy is invalid."
+  let matches = filter($config.principals, "principal", and(eq($principal.account, $input.account),
+    or(includes($principal.keyFingerprints, $input.keyFingerprint), includes($principal.keyFingerprints, "*"))))
+  assert count($matches)
+    otherwise "The authenticated SSH account and key are not admitted to the MCP express lane."
+  let principal = at($matches, 0)
+  port record.fromEntries { entries = list(list($config.keyId, true)) } → keys
+  port kernel.invoke { query = "sshMcp.configuration"; input = { keys = $keys; issuer = $config.issuer; audience = $config.audience;
+    allowedScopes = $principal.scopes; maximumLifetimeSeconds = $config.maximumLifetimeSeconds } } → configured
+  let requested = if(eq($input.scopes, null), $principal.scopes, $input.scopes)
+  assert and(isArray($requested), every($requested, "scope", includes($principal.scopes, $scope)))
+    otherwise "Requested SSH MCP scopes exceed the principal policy."
+  port kernel.invoke { query = "sshMcp.scopes"; input = { scopes = $requested; allowed = $principal.scopes } } → scopes
+  let lifetime = $config.maximumLifetimeSeconds
+  let expires = add($input.now, $lifetime)
+  port number.calculate { operation = "divide"; values = list($lifetime, 3) } → third
+  port number.calculate { operation = "floor"; values = list($third) } → whole
+  port number.calculate { operation = "max"; values = list(15, $whole) } → lead
+  port number.calculate { operation = "subtract"; values = list($expires, $lead) } → refresh
+  port number.calculate { operation = "multiply"; values = list($expires, 1000) } → expiresMs
+  port number.calculate { operation = "multiply"; values = list($refresh, 1000) } → refreshMs
+  port time.formatUtc { milliseconds = $expiresMs; fractional = true } → expiresAt
+  port time.formatUtc { milliseconds = $refreshMs; fractional = true } → refreshAfter
+  port digest.sha256 { text = $input.keyFingerprint } → fingerprintHash
+  port json.canonical { value = { protocol = "sourcery.hosted/ssh-mcp-assertion.v1"; keyId = $config.keyId;
+    issuer = $config.issuer; audience = $config.audience; account = $input.account; keyFingerprint = $input.keyFingerprint;
+    sessionId = $input.sessionId; scopes = $scopes; issuedAt = $input.now; expiresAt = $expires; nonce = $input.nonce } } → payload
+  let result = { payload = $payload; response = { protocol = "sourcery.hosted/ssh-mcp-broker-response.v1";
+    expiresAt = $expiresAt; refreshAfter = $refreshAfter; scopes = $scopes; connection = { account = $input.account;
+      sessionId = $input.sessionId; keyFingerprintHash = concat("sha256:", $fingerprintHash) } } }
+
+process sshMcp.routeAccess:
+  let input = $eventInput
+  let claims = $input.claims
+  let scopes = filter($claims.scopes, "scope", includes($input.scopes, $scope))
+  assert and(eq(count($scopes), count($claims.scopes)), includes($scopes, "authoring.read"))
+    otherwise "SSH MCP assertion scopes exceed the current local service composition."
+  port digest.sha256 { text = $claims.keyFingerprint } → fingerprintHash
+  port json.stringify { value = { account = $claims.account; keyFingerprint = $claims.keyFingerprint;
+    sessionId = $claims.sessionId } } → family
+  port digest.sha256 { text = $family } → familyHash
+  let result = { scopes = $scopes; clientId = concat("ssh://", $claims.account, "/", $fingerprintHash);
+    familyId = concat("ssh-express-", $familyHash) }

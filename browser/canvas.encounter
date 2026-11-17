@@ -1,0 +1,946 @@
+process-module "temple/surface-process-module/1"
+
+process canvas.surfaceProfile:
+  let result = { width = 1280; height = 720; alpha = false }
+
+process canvas.seaLayout:
+  let result = { bands = 36; waves = 6; middleStop = 0.63; glowX = 845; glowY = 300; glowRadius = 470; glowAlpha = 0.21 }
+
+process canvas.settingsAction:
+  let edit = and($matched, eq($event, "input"))
+  let reset = and($matched, eq($event, "click"))
+  let submit = and($matched, eq($event, "submit"))
+  let refreshed = eq($event, "encounter:live-refresh")
+  let changed = if($edit, true, $reset)
+  let result = { read = if($changed, true, $refreshed); reset = $reset; trackSubmission = $submit;
+    clearSubmission = $changed; notify = $reset }
+
+process canvas.settingsText:
+  let result = { assignment = " = "; separator = "\n" }
+
+process canvas.settingsSurface:
+  let result = { form = "canvas-settings"; field = "[data-canvas-setting]"; reset = "[data-canvas-reset]";
+    draft = "[data-encounter-draft]"; outputAttribute = "data-canvas-value" }
+
+process canvas.playback:
+  port number.calculate { operation = "subtract"; values = list($audioTime, $start) } → audioPosition
+  port number.calculate { operation = "subtract"; values = list($now, $anchor) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 1000) } → elapsedSeconds
+  let position = if($useAudio, $audioPosition, $elapsedSeconds)
+  port number.calculate { operation = "min"; values = list($duration, $position) } → bounded
+  port number.calculate { operation = "max"; values = list(0, $bounded) } → position
+  port number.calculate { operation = "lessEqual"; values = list($duration, $position) } → ended
+  let result = { position = $position; ended = $ended; stopLabel = "Replay shot" }
+
+process canvas.frameTime:
+  port number.calculate { operation = "subtract"; values = list($duration, 0.001) } → last
+  port number.calculate { operation = "min"; values = list($position, $last) } → shot
+  let result = add($start, $shot)
+
+process canvas.timelineAdmission:
+  let notice = if($validNumbers, "", "The canvas timeline is unavailable.")
+  let result = { admitted = $validNumbers; notice = $notice }
+
+# The browser offers cues in declared order and draws the first selected cue.
+process canvas.cueSelection:
+  port number.calculate { operation = "lessEqual"; values = list($from, $absolute) } → started
+  port number.calculate { operation = "less"; values = list($absolute, $to) } → ongoing
+  let selected = and($validBounds, $started, $ongoing)
+  port number.calculate { operation = "subtract"; values = list(if($selected, $absolute, 0), if($selected, $from, 0)) } → offset
+  let result = { selected = $selected; offset = $offset }
+
+process canvas.confirmLeave:
+  let submitted = and($sameForm, not($prevented))
+  let result = and(not($submitted), $dirty)
+
+process canvas.scrub:
+  port number.calculate { operation = "min"; values = list($duration, $requested) } → upper
+  port number.calculate { operation = "max"; values = list(0, $upper) } → position
+  let result = { position = $position; seekAudio = $audioPlaying }
+
+# Starting after the end rewinds the shot.
+process canvas.playToggle:
+  port number.calculate { operation = "lessEqual"; values = list($duration, $position) } → ended
+  let position = if(and(not($playing), $ended), 0, $position)
+  let label = if($playing, if($ended, "Replay shot", "Play shot"), "Pause shot")
+  let result = { stop = $playing; position = $position; startSound = and(not($playing), $enabled); label = $label }
+
+process canvas.soundChange:
+  let result = { startSound = and($playing, $enabled); useAnimationClock = and($playing, not($enabled)) }
+
+process canvas.narrationResult:
+  let current = eq($token, $activeToken)
+  let adopt = and($current, not($failed))
+  let obsolete = not(and($playing, $enabled))
+  let pause = and(not($failed), not($current), $obsolete)
+  let resetClock = and($failed, $current, $playing)
+  let notice = if($resetClock, "Narration could not start. The animation is playing silently.", "")
+  let result = { useAudio = if($adopt, true, $usingAudio); pause = $pause; resetClock = $resetClock; notice = $notice }
+
+process canvas.narrationFault:
+  let notice = if($playing, "Narration is unavailable. The animation is playing silently.", "")
+  let result = { useAudio = and(not($playing), $usingAudio); resetClock = $playing; notice = $notice }
+
+process canvas.settingChanged:
+  let result = not(and(eq($currentLength, $savedLength), eq($current, $saved)))
+
+process canvas.clockAnchor:
+  port number.calculate { operation = "multiply"; values = list($position, 1000) } → elapsed
+  port number.calculate { operation = "subtract"; values = list($now, $elapsed) } → anchor
+  let result = $anchor
+
+process canvas.audioPosition:
+  let result = add($start, $position)
+
+process canvas.ease:
+  port number.calculate { operation = "min"; values = list(1, $position) } → capped
+  port number.calculate { operation = "max"; values = list(0, $capped) } → bounded
+  port number.calculate { operation = "multiply"; values = list($bounded, $bounded) } → squared
+  port number.calculate { operation = "multiply"; values = list(2, $bounded) } → doubled
+  port number.calculate { operation = "subtract"; values = list(3, $doubled) } → coefficient
+  port number.calculate { operation = "multiply"; values = list($squared, $coefficient) } → eased
+  let result = $eased
+
+process canvas.camera:
+  port number.calculate { operation = "multiply"; values = list($pan, $width) } → offset
+  port number.calculate { operation = "divide"; values = list($offset, 100) } → shift
+  port number.calculate { operation = "divide"; values = list($width, 2) } → centreX
+  port number.calculate { operation = "divide"; values = list($height, 2) } → centreY
+  port number.calculate { operation = "multiply"; values = list($zoom, $zoomPercent) } → magnification
+  port number.calculate { operation = "divide"; values = list($magnification, 100) } → scale
+  port number.calculate { operation = "subtract"; values = list(0, $centreX) } → originX
+  port number.calculate { operation = "subtract"; values = list(0, $centreY) } → originY
+  let result = { scale = $scale; x = add(add($centreX, $dx), $shift); y = add($centreY, $dy);
+    originX = $originX; originY = $originY }
+
+process canvas.routePoint:
+  port number.calculate { operation = "less"; values = list(0, $remaining) } → draw
+  let fraction = 1
+  when and($draw, not(eq($length, 0))):
+    port number.calculate { operation = "divide"; values = list($remaining, $length) } → quotient
+    port number.calculate { operation = "min"; values = list(1, $quotient) } → fraction
+  port number.calculate { operation = "subtract"; values = list($toX, $fromX) } → dx
+  port number.calculate { operation = "subtract"; values = list($toY, $fromY) } → dy
+  port number.calculate { operation = "multiply"; values = list($dx, $fraction) } → xOffset
+  port number.calculate { operation = "multiply"; values = list($dy, $fraction) } → yOffset
+  port number.calculate { operation = "subtract"; values = list($remaining, $length) } → next
+  let result = { draw = $draw; x = if($draw, add($fromX, $xOffset), $fromX);
+    y = if($draw, add($fromY, $yOffset), $fromY); remaining = if($draw, $next, $remaining) }
+
+process canvas.palette:
+  let result = { teal = "#65c1b0"; foam = "#bef7dc"; paper = "#f5e1b4"; coral = "#ef8269"; amber = "#ffc779"; slate = "#507e83" }
+
+process canvas.waterStyle:
+  let surface = if($warm, "#152735", "#071a26")
+  let middle = if($warm, "#244b4b", "#113d48")
+  let glow = if($warm, "#bb8754", "#4badac")
+  let result = { surface = $surface; middle = $middle; depth = "#081c28"; glow = $glow }
+
+process canvas.warmth:
+  port number.calculate { operation = "abs"; values = list($setting) } → magnitude
+  port number.calculate { operation = "divide"; values = list($magnitude, 100) } → amount
+  port number.calculate { operation = "multiply"; values = list($amount, 0.36) } → alpha
+  port number.calculate { operation = "less"; values = list(0, $setting) } → warm
+  let color = if(eq($setting, 0), "", if($warm, "#ff983d", "#3973ff"))
+  let result = { alpha = $alpha; color = $color }
+
+# Base drawing routines are numbered in the painter. Variants reuse their geometry.
+process canvas.sceneFrame:
+  let code = 0
+  let shifted = $time
+  let offset = 0
+  let alternate = false
+  when eq($scene, "flight"):
+    let code = 1
+  when eq($scene, "launch"):
+    let code = 2
+  when eq($scene, "arrival"):
+    let code = 3
+  when eq($scene, "still"):
+    let code = 3
+    port number.calculate { operation = "multiply"; values = list($time, 0.12) } → slowed
+    let shifted = add(5.4, $slowed)
+    let alternate = true
+  when eq($scene, "collision"):
+    let code = 4
+  when eq($scene, "intent"):
+    let code = 5
+  when eq($scene, "intent-shift"):
+    let code = 5
+    let shifted = add($time, 2)
+    let offset = 1.3
+  when eq($scene, "intent-close"):
+    let code = 5
+    let shifted = add($time, 2.1)
+    let offset = 0.9
+  when eq($scene, "strata"):
+    let code = 6
+  when eq($scene, "strata-close"):
+    let code = 6
+    let shifted = add($time, 5)
+  when eq($scene, "branches"):
+    let code = 7
+  when eq($scene, "gate"):
+    let code = 8
+  when eq($scene, "rebuild"):
+    let code = 9
+  when eq($scene, "refactor"):
+    let code = 9
+    let alternate = true
+  when eq($scene, "network"):
+    let code = 10
+  when eq($scene, "signals"):
+    let code = 11
+  when eq($scene, "harbours"):
+    let code = 12
+  when eq($scene, "home"):
+    let code = 13
+  when eq($scene, "closing"):
+    let code = 13
+    let alternate = true
+  let result = { code = $code; time = $shifted; offset = $offset; alternate = $alternate }
+
+process canvas.cueTime:
+  port number.calculate { operation = "multiply"; values = list($offset, $motion) } → scaled
+  port number.calculate { operation = "divide"; values = list($scaled, 100) } → time
+  let result = $time
+
+process canvas.branchPhase:
+  port number.calculate { operation = "divide"; values = list($time, 3.1) } → position
+  call canvas.ease
+  let firstRoute = $result
+  let elapsed = add($time, -2.7)
+  port number.calculate { operation = "divide"; values = list($elapsed, 4.8) } → position
+  call canvas.ease
+  let secondRoute = $result
+  port number.calculate { operation = "less"; values = list($time, 3.8) } → firstBranch
+  let branchTime = if($firstBranch, $time, add($time, -3.8))
+  let branchLength = if($firstBranch, 3.2, 4.7)
+  port number.calculate { operation = "divide"; values = list($branchTime, $branchLength) } → position
+  call canvas.ease
+  let result = { firstRoute = $firstRoute; secondRoute = $secondRoute; firstBranch = $firstBranch; boatRoute = $result }
+
+process canvas.gatePhase:
+  let openingTime = add($time, -8.2)
+  port number.calculate { operation = "divide"; values = list($openingTime, 1.9) } → position
+  call canvas.ease
+  let open = $result
+  port number.calculate { operation = "less"; values = list(0.64, $open) } → lamp
+  port number.calculate { operation = "less"; values = list(0.5, $open) } → beacons
+  port number.calculate { operation = "divide"; values = list($time, 4.2) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list(0.49, $result) } → approach
+  let passingTime = add($time, -8.7)
+  port number.calculate { operation = "divide"; values = list($passingTime, 5.1) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list(0.51, $result) } → crossing
+  let result = { open = $open; lamp = $lamp; beacons = $beacons; route = add($approach, $crossing) }
+
+process canvas.closingFade:
+  let elapsed = add($time, -6.8)
+  port number.calculate { operation = "divide"; values = list($elapsed, 2.2) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list(0.68, $result) } → background
+  let result = { title = $result; background = $background; caption = "Sourcery + Temple";
+    ink = "#fff0cf"; font = "bold 75px Georgia,serif" }
+
+# Camera and water treatment for the base drawing routines in sceneFrame order.
+process canvas.sceneCamera:
+  let base = 1
+  let change = 0
+  let duration = 1
+  let x = 0
+  let y = 0
+  let frequency = 0
+  let warm = false
+  when eq($code, 2):
+    let base = 1.15
+    let change = 0.09
+    let duration = 6
+    let x = -26
+    let y = -7
+    let warm = true
+  when eq($code, 3):
+    let base = 1.05
+    let change = 0.1
+    let duration = 7
+    let x = -12
+    let y = -2
+  when eq($code, 4):
+    let base = 1.02
+    let change = 0.21
+    let duration = 11
+    let x = -18
+    let y = -2
+    let frequency = 0.37
+    let warm = true
+  when eq($code, 5):
+    let base = 1.06
+    let change = 0.09
+    let duration = 6
+    let x = 23
+    let y = -5
+    let frequency = 0.28
+  when eq($code, 6):
+    let base = 1.1
+    let change = 0.1
+    let duration = 6
+    let x = -8
+    let y = 1
+  when eq($code, 7):
+    let base = 1.04
+    let change = 0.09
+    let duration = 9
+    let x = -21
+    let y = -3
+  when eq($code, 8):
+    let base = 1.05
+    let change = 0.13
+    let duration = 6
+    let x = -17
+    let y = 4
+  when eq($code, 9):
+    let base = 1.07
+    let change = 0.15
+    let duration = 8
+    let x = 16
+    let y = -7
+    let frequency = 0.26
+    let warm = true
+  when eq($code, 10):
+    let base = 1.02
+    let change = 0.13
+    let duration = 14
+    let x = -9
+    let y = -2
+  when eq($code, 11):
+    let base = 1.11
+    let change = 0.09
+    let duration = 8
+    let x = -5
+    let y = -8
+    let warm = true
+  when eq($code, 12):
+    let base = 1.08
+    let change = 0.12
+    let duration = 12
+    let x = 18
+    let y = -9
+    let frequency = 0.21
+  when eq($code, 13):
+    let base = 1.07
+    let change = 0.14
+    let duration = 12
+    let x = -11
+    let y = -5
+    let warm = $alternate
+  port number.calculate { operation = "divide"; values = list($time, $duration) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($change, $result) } → advance
+  let zoom = add($base, $advance)
+  when eq($code, 8):
+    port number.calculate { operation = "subtract"; values = list($time, 9) } → elapsed
+    port number.calculate { operation = "divide"; values = list($elapsed, 5) } → position
+    call canvas.ease
+    port number.calculate { operation = "multiply"; values = list(0.07, $result) } → retreat
+    port number.calculate { operation = "subtract"; values = list($zoom, $retreat) } → zoom
+  port number.calculate { operation = "multiply"; values = list($time, $frequency) } → phase
+  when not(eq($frequency, 0)):
+    port number.calculate { operation = "sin"; values = list(add($phase, $offset)) } → wave
+    port number.calculate { operation = "multiply"; values = list($x, $wave) } → x
+  let result = { warm = $warm; zoom = $zoom; x = $x; y = $y }
+
+process canvas.seaWave:
+  port number.calculate { operation = "multiply"; values = list($column, 237) } → columnX
+  port number.calculate { operation = "multiply"; values = list($row, 83) } → rowX
+  port number.calculate { operation = "multiply"; values = list($row, 0.7) } → rowSpeed
+  port number.calculate { operation = "multiply"; values = list($time, add(18, $rowSpeed)) } → motion
+  port number.calculate { operation = "remainder"; values = list(add(add($columnX, $rowX), $motion), 1536) } → wrap
+  let x = add($wrap, -125)
+  port number.calculate { operation = "multiply"; values = list($row, 13) } → rowY
+  let y = add(245, $rowY)
+  port number.calculate { operation = "multiply"; values = list($row, 17) } → rowLength
+  port number.calculate { operation = "multiply"; values = list($column, 43) } → columnLength
+  port number.calculate { operation = "remainder"; values = list(add($rowLength, $columnLength), 95) } → extra
+  let length = add(13, $extra)
+  port number.calculate { operation = "multiply"; values = list($length, 0.46) } → crest
+  port number.calculate { operation = "remainder"; values = list(add($row, $column), 7) } → tint
+  port number.calculate { operation = "less"; values = list(22, $row) } → near
+  let ink = if(eq($tint, 0), "#77c5b536", "#5ba6a12a")
+  let result = { x = $x; y = $y; crestX = add($x, $crest); crestY = add($y, -2); endX = add($x, $length); ink = $ink; width = if($near, 2, 1) }
+
+process canvas.beaconLayout:
+  port number.calculate { operation = "multiply"; values = list(66, $scale) } → plateOffset
+  port number.calculate { operation = "multiply"; values = list(97, $scale) } → plateWidth
+  port number.calculate { operation = "multiply"; values = list(34, $scale) } → plateHeight
+  port number.calculate { operation = "multiply"; values = list(23, $scale) } → plateDepth
+  let result = { plateY = add($y, $plateOffset); plateWidth = $plateWidth; plateHeight = $plateHeight; plateDepth = $plateDepth }
+
+process canvas.placeVertex:
+  port number.calculate { operation = "multiply"; values = list($dx, $scale) } → offsetX
+  port number.calculate { operation = "multiply"; values = list($dy, $scale) } → offsetY
+  let result = { x = add($x, $offsetX); y = add($y, $offsetY) }
+
+process canvas.beaconStripes:
+  port number.calculate { operation = "multiply"; values = list(15, $scale) } → stripeHalfWidth
+  port number.calculate { operation = "multiply"; values = list(16, $scale) } → stripeOffset
+  port number.calculate { operation = "multiply"; values = list(7, $scale) } → stripeWidth
+  port number.calculate { operation = "subtract"; values = list($x, $stripeHalfWidth) } → left
+  port number.calculate { operation = "subtract"; values = list($y, $stripeOffset) } → top
+  let result = { left = $left; right = add($x, $stripeHalfWidth); top = $top;
+    bottom = add($y, $stripeOffset); width = $stripeWidth }
+
+process canvas.beaconGlow:
+  port number.calculate { operation = "multiply"; values = list($time, 2) } → phase
+  port number.calculate { operation = "sin"; values = list($phase) } → wave
+  port number.calculate { operation = "multiply"; values = list(0.07, $wave) } → shimmer
+  port number.calculate { operation = "multiply"; values = list(-54, $scale) } → glowOffset
+  port number.calculate { operation = "multiply"; values = list(-55, $scale) } → lampOffset
+  port number.calculate { operation = "multiply"; values = list(63, $scale) } → glowRadius
+  port number.calculate { operation = "multiply"; values = list(5, $scale) } → lampRadius
+  let result = { glowY = add($y, $glowOffset); glowRadius = $glowRadius; alpha = add(0.42, $shimmer);
+    lampY = add($y, $lampOffset); lampRadius = $lampRadius }
+
+process canvas.beaconReflection:
+  port number.calculate { operation = "multiply"; values = list($row, 7) } → rowOffset
+  port number.calculate { operation = "multiply"; values = list(add(88, $rowOffset), $scale) } → depth
+  port number.calculate { operation = "multiply"; values = list($time, 1.3) } → motion
+  port number.calculate { operation = "multiply"; values = list($row, 2) } → rowPhase
+  port number.calculate { operation = "sin"; values = list(add($motion, $rowPhase)) } → wave
+  port number.calculate { operation = "abs"; values = list($wave) } → magnitude
+  port number.calculate { operation = "multiply"; values = list(26, $magnitude) } → width
+  port number.calculate { operation = "multiply"; values = list(add(9, $width), $scale) } → radius
+  port number.calculate { operation = "remainder"; values = list($row, 2) } → tint
+  port number.calculate { operation = "subtract"; values = list($baseX, $radius) } → left
+  port number.calculate { operation = "multiply"; values = list(2, $scale) } → strokeWidth
+  let ink = if(eq($tint, 0), "#ffc77925", "#ffc7793a")
+  let result = { y = add($baseY, $depth); left = $left; right = add($baseX, $radius); strokeWidth = $strokeWidth; ink = $ink }
+
+process canvas.boatBob:
+  port number.calculate { operation = "multiply"; values = list($time, 2.3) } → phase
+  port number.calculate { operation = "sin"; values = list($phase) } → wave
+  port number.calculate { operation = "multiply"; values = list($wave, 3) } → offset
+  let result = add($y, $offset)
+
+process canvas.boatWake:
+  port number.calculate { operation = "multiply"; values = list($time, 0.8) } → motion
+  port number.calculate { operation = "multiply"; values = list($ring, 0.32) } → delay
+  port number.calculate { operation = "remainder"; values = list(add($motion, $delay), 1) } → phase
+  port number.calculate { operation = "subtract"; values = list(1, $phase) } → fade
+  port number.calculate { operation = "multiply"; values = list(0.29, $fade) } → alpha
+  port number.calculate { operation = "multiply"; values = list($phase, 67) } → x
+  port number.calculate { operation = "multiply"; values = list($phase, 16) } → y
+  let result = { alpha = $alpha; radiusX = add(11, $x); radiusY = add(3, $y) }
+
+process canvas.pulseRing:
+  port number.calculate { operation = "multiply"; values = list($time, 0.45) } → motion
+  port number.calculate { operation = "divide"; values = list($ring, 3) } → delay
+  port number.calculate { operation = "remainder"; values = list(add($motion, $delay), 1) } → phase
+  port number.calculate { operation = "subtract"; values = list(1, $phase) } → fade
+  port number.calculate { operation = "multiply"; values = list($fade, 0.42) } → alpha
+  port number.calculate { operation = "multiply"; values = list($phase, 63) } → x
+  port number.calculate { operation = "multiply"; values = list($phase, 24) } → y
+  let result = { alpha = $alpha; radiusX = add(8, $x); radiusY = add(4, $y) }
+
+process canvas.routeDistance:
+  port number.calculate { operation = "min"; values = list(1, $progress) } → capped
+  port number.calculate { operation = "max"; values = list(0, $capped) } → bounded
+  port number.calculate { operation = "multiply"; values = list($length, $bounded) } → distance
+  let result = $distance
+
+# Routes and outlines list their vertices in drawing order.
+process canvas.drawingVertex:
+  let exists = false
+  let x = 0
+  let y = 0
+  port number.calculate { operation = "floor"; values = list($index) } → vertex
+  port number.calculate { operation = "lessEqual"; values = list(0, $index) } → nonnegative
+  let validIndex = and($nonnegative, eq($vertex, $index))
+  when and($validIndex, eq($drawing, "launch")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(230, 420, 612, 825), $vertex)
+      let y = at(list(537, 462, 425, 432), $vertex)
+  when and($validIndex, eq($drawing, "arrival")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(101, 320, 490, 693, 904), $vertex)
+      let y = at(list(598, 510, 530, 453, 427), $vertex)
+  when and($validIndex, eq($drawing, "collision-west")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(367, 473, 626), $vertex)
+      let y = at(list(328, 419, 443), $vertex)
+  when and($validIndex, eq($drawing, "collision-east")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(922, 801, 626), $vertex)
+      let y = at(list(324, 417, 443), $vertex)
+  when and($validIndex, eq($drawing, "branch-first")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(187, 463, 632, 982), $vertex)
+      let y = at(list(512, 476, 256, 239), $vertex)
+  when and($validIndex, eq($drawing, "branch-second")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(187, 463, 694, 1067), $vertex)
+      let y = at(list(512, 476, 526, 449), $vertex)
+  when and($validIndex, eq($drawing, "gate")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(83, 320, 624, 978, 1190), $vertex)
+      let y = at(list(562, 474, 410, 302, 226), $vertex)
+  when and($validIndex, eq($drawing, "rebuild")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(185, 398, 638, 847, 1100), $vertex)
+      let y = at(list(496, 413, 426, 413, 496), $vertex)
+  when and($validIndex, eq($drawing, "network")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(144, 384, 625, 841, 1104), $vertex)
+      let y = at(list(437, 286, 410, 248, 354), $vertex)
+  when and($validIndex, eq($drawing, "signal-west")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(202, 416, 640), $vertex)
+      let y = at(list(305, 305, 455), $vertex)
+  when and($validIndex, eq($drawing, "signal-east")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(1080, 859, 640), $vertex)
+      let y = at(list(307, 308, 455), $vertex)
+  when and($validIndex, eq($drawing, "signal-south")):
+    port number.calculate { operation = "less"; values = list($vertex, 2) } → exists
+    when $exists:
+      let x = at(list(640, 640), $vertex)
+      let y = at(list(455, 566), $vertex)
+  when and($validIndex, eq($drawing, "home")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(52, 246, 494, 714, 930), $vertex)
+      let y = at(list(595, 525, 546, 455, 422), $vertex)
+  when and($validIndex, eq($drawing, "beacon-tower")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(-23, -13, 13, 23), $vertex)
+      let y = at(list(64, -47, -47, 64), $vertex)
+  when and($validIndex, eq($drawing, "beacon-shadow")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(0, 13, 23, 0), $vertex)
+      let y = at(list(-47, -47, 64, 64), $vertex)
+  when and($validIndex, eq($drawing, "beacon-window")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(-21, 21, 17, -17), $vertex)
+      let y = at(list(-43, -43, -71, -71), $vertex)
+  when and($validIndex, eq($drawing, "beacon-roof")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(-27, 0, 27), $vertex)
+      let y = at(list(-70, -99, -70), $vertex)
+  when and($validIndex, eq($drawing, "slip-paper")):
+    port number.calculate { operation = "less"; values = list($vertex, 5) } → exists
+    when $exists:
+      let x = at(list(-57, 41, 55, 55, -57), $vertex)
+      let y = at(list(-34, -34, -19, 34, 34), $vertex)
+  when and($validIndex, eq($drawing, "slip-fold")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(41, 55, 41), $vertex)
+      let y = at(list(-34, -19, -19), $vertex)
+  when and($validIndex, eq($drawing, "slip-line-top")):
+    port number.calculate { operation = "less"; values = list($vertex, 2) } → exists
+    when $exists:
+      let x = at(list(-38, 35), $vertex)
+      let y = at(list(-13, -13), $vertex)
+  when and($validIndex, eq($drawing, "slip-line-middle")):
+    port number.calculate { operation = "less"; values = list($vertex, 2) } → exists
+    when $exists:
+      let x = at(list(-38, 23), $vertex)
+      let y = at(list(-1, -1), $vertex)
+  when and($validIndex, eq($drawing, "slip-line-bottom")):
+    port number.calculate { operation = "less"; values = list($vertex, 2) } → exists
+    when $exists:
+      let x = at(list(-38, 11), $vertex)
+      let y = at(list(11, 11), $vertex)
+  when and($validIndex, eq($drawing, "boat-hull")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(-43, 47, 24, -27), $vertex)
+      let y = at(list(7, 7, 25, 25), $vertex)
+  when and($validIndex, eq($drawing, "boat-mast")):
+    port number.calculate { operation = "less"; values = list($vertex, 2) } → exists
+    when $exists:
+      let x = at(list(0, 0), $vertex)
+      let y = at(list(7, -49), $vertex)
+  when and($validIndex, eq($drawing, "boat-main-sail")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(3, 32, 3), $vertex)
+      let y = at(list(-48, 2, 2), $vertex)
+  when and($validIndex, eq($drawing, "boat-small-sail")):
+    port number.calculate { operation = "less"; values = list($vertex, 3) } → exists
+    when $exists:
+      let x = at(list(-4, -24, -4), $vertex)
+      let y = at(list(-30, 2, 2), $vertex)
+  when and($validIndex, eq($drawing, "flight-craft")):
+    port number.calculate { operation = "less"; values = list($vertex, 4) } → exists
+    when $exists:
+      let x = at(list(-19, 38, -19, -8), $vertex)
+      let y = at(list(-18, 0, 18, 0), $vertex)
+  let result = { exists = $exists; x = $x; y = $y }
+
+process canvas.flightStar:
+  port number.calculate { operation = "remainder"; values = list($index, 4) } → quadrant
+  port number.calculate { operation = "multiply"; values = list($quadrant, 30) } → drift
+  port number.calculate { operation = "multiply"; values = list($time, add(44, $drift)) } → travel
+  port number.calculate { operation = "multiply"; values = list($index, 223) } → origin
+  port number.calculate { operation = "subtract"; values = list($origin, $travel) } → localX
+  port number.calculate { operation = "remainder"; values = list(add($localX, 2500), 1280) } → x
+  port number.calculate { operation = "multiply"; values = list($index, 131) } → track
+  port number.calculate { operation = "remainder"; values = list($track, 644) } → y
+  port number.calculate { operation = "remainder"; values = list($index, 3) } → size
+  port number.calculate { operation = "multiply"; values = list($size, 0.5) } → radius
+  let result = { x = $x; y = $y; radius = add(1, $radius) }
+
+process canvas.flightPosition:
+  port number.calculate { operation = "multiply"; values = list($time, 70) } → travel
+  port number.calculate { operation = "multiply"; values = list($time, 1.65) } → phase
+  port number.calculate { operation = "sin"; values = list($phase) } → wave
+  port number.calculate { operation = "multiply"; values = list(92, $wave) } → height
+  let result = { x = add(320, $travel); y = add(324, $height) }
+
+process canvas.flightTrail:
+  port number.calculate { operation = "multiply"; values = list($index, 16) } → delay
+  port number.calculate { operation = "subtract"; values = list($x, $delay) } → trailX
+  port number.calculate { operation = "multiply"; values = list($time, 12) } → phase
+  port number.calculate { operation = "sin"; values = list(add($phase, $index)) } → wave
+  port number.calculate { operation = "multiply"; values = list($wave, 8) } → height
+  port number.calculate { operation = "subtract"; values = list(7, $index) } → radius
+  let result = { x = $trailX; y = add($y, $height); radius = $radius }
+
+process canvas.flightPlate:
+  port number.calculate { operation = "multiply"; values = list($index, 247) } → drift
+  port number.calculate { operation = "multiply"; values = list($time, 215) } → travel
+  port number.calculate { operation = "subtract"; values = list(add(1000, $drift), $travel) } → localX
+  port number.calculate { operation = "remainder"; values = list(add($localX, 2560), 1450) } → wrap
+  port number.calculate { operation = "multiply"; values = list($index, 76) } → height
+  port number.calculate { operation = "remainder"; values = list($index, 2) } → shade
+  let result = { x = add($wrap, -90); y = add(163, $height); slate = not(eq($shade, 0));
+    width = 33; height = 19; depth = 13 }
+
+process canvas.flightBeacon:
+  port number.calculate { operation = "less"; values = list(3.8, $time) } → visible
+  port number.calculate { operation = "subtract"; values = list($time, 3.8) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($result, 0.54) } → alpha
+  let result = { visible = $visible; alpha = $alpha; x = 1026; y = 149; glowRadius = 100; lampRadius = 11 }
+
+process canvas.collisionSlip:
+  port number.calculate { operation = "multiply"; values = list($index, 0.22) } → delay
+  port number.calculate { operation = "subtract"; values = list($time, $delay) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2) } → position
+  call canvas.ease
+  let q = $result
+  port number.calculate { operation = "less"; values = list(0, $q) } → visible
+  port number.calculate { operation = "multiply"; values = list($index, 2.399) } → track
+  port number.calculate { operation = "multiply"; values = list($time, 0.05) } → drift
+  let angle = add($track, $drift)
+  port number.calculate { operation = "multiply"; values = list(102, $q) } → contraction
+  port number.calculate { operation = "subtract"; values = list(352, $contraction) } → radius
+  port number.calculate { operation = "cos"; values = list($angle) } → horizontal
+  port number.calculate { operation = "sin"; values = list($angle) } → vertical
+  port number.calculate { operation = "multiply"; values = list($radius, $horizontal) } → x
+  port number.calculate { operation = "multiply"; values = list($radius, 0.64) } → flatRadius
+  port number.calculate { operation = "multiply"; values = list($flatRadius, $vertical) } → y
+  port number.calculate { operation = "multiply"; values = list($q, 0.29) } → grow
+  port number.calculate { operation = "sin"; values = list(add($time, $index)) } → wave
+  port number.calculate { operation = "multiply"; values = list(0.2, $wave) } → rotation
+  port number.calculate { operation = "remainder"; values = list($index, 3) } → shade
+  let result = { visible = $visible; x = add(640, $x); y = add(367, $y); scale = add(0.35, $grow); rotation = $rotation; teal = not(eq($shade, 0)) }
+
+process canvas.collisionRoute:
+  port number.calculate { operation = "less"; values = list(5, $time) } → visible
+  port number.calculate { operation = "subtract"; values = list($time, 5) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2) } → position
+  call canvas.ease
+  let result = { visible = $visible; progress = $result }
+
+process canvas.intentSlip:
+  port number.calculate { operation = "floor"; values = list($index) } → indexFloor
+  port number.calculate { operation = "lessEqual"; values = list(0, $index) } → nonnegative
+  port number.calculate { operation = "less"; values = list($index, 4) } → bounded
+  let valid = and($nonnegative, $bounded, eq($index, $indexFloor))
+  let targetX = 640
+  let targetY = 376
+  when $valid:
+    let targetX = at(list(278, 990, 309, 971), $index)
+    let targetY = at(list(300, 288, 528, 510), $index)
+  port number.calculate { operation = "multiply"; values = list($index, 0.57) } → delay
+  port number.calculate { operation = "subtract"; values = list($time, 1) } → elapsed
+  port number.calculate { operation = "subtract"; values = list($elapsed, $delay) } → localTime
+  port number.calculate { operation = "divide"; values = list($localTime, 2) } → position
+  call canvas.ease
+  let q = $result
+  port number.calculate { operation = "less"; values = list(0, $q) } → visible
+  port number.calculate { operation = "subtract"; values = list($targetX, 640) } → dx
+  port number.calculate { operation = "subtract"; values = list($targetY, 376) } → dy
+  port number.calculate { operation = "multiply"; values = list($dx, $q) } → travelX
+  port number.calculate { operation = "multiply"; values = list($dy, $q) } → travelY
+  let x = add(640, $travelX)
+  port number.calculate { operation = "subtract"; values = list($x, 640) } → routeWidth
+  port number.calculate { operation = "multiply"; values = list($routeWidth, 0.56) } → elbow
+  port number.calculate { operation = "multiply"; values = list(0.68, $q) } → scale
+  port number.calculate { operation = "sin"; values = list(add($time, $index)) } → wave
+  port number.calculate { operation = "multiply"; values = list(0.12, $wave) } → rotation
+  let result = { visible = and($valid, $visible); x = $x; y = add(376, $travelY); elbow = add(640, $elbow); progress = $q; scale = $scale; rotation = $rotation }
+
+process canvas.strataPlate:
+  port number.calculate { operation = "divide"; values = list($time, 3.5) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($time, 0.7) } → drift
+  port number.calculate { operation = "multiply"; values = list($index, 0.5) } → phase
+  port number.calculate { operation = "sin"; values = list(add($drift, $phase)) } → wave
+  port number.calculate { operation = "multiply"; values = list($wave, 9) } → sway
+  port number.calculate { operation = "multiply"; values = list($index, 46) } → tier
+  port number.calculate { operation = "multiply"; values = list($result, $index) } → lift
+  port number.calculate { operation = "multiply"; values = list($lift, 37) } → spread
+  port number.calculate { operation = "subtract"; values = list(510, $tier) } → level
+  port number.calculate { operation = "subtract"; values = list($level, $spread) } → y
+  port number.calculate { operation = "multiply"; values = list($index, 19) } → width
+  port number.calculate { operation = "multiply"; values = list($index, 6) } → height
+  port number.calculate { operation = "subtract"; values = list(260, $width) } → rx
+  port number.calculate { operation = "subtract"; values = list(88, $height) } → ry
+  let x = add(640, $sway)
+  let ink = if(eq($index, 0), "#507e83", if(eq($index, 1), "#65c1b0", if(eq($index, 2), "#f5e1b4", "#bef7dc")))
+  let result = { x = $x; y = $y; rx = $rx; ry = $ry; depth = 25; ink = $ink }
+
+process canvas.strataRoute:
+  port number.calculate { operation = "multiply"; values = list($index, 19) } → width
+  port number.calculate { operation = "subtract"; values = list(add($x, 260), $width) } → edge
+  port number.calculate { operation = "subtract"; values = list($y, 58) } → endY
+  port number.calculate { operation = "multiply"; values = list($index, 7) } → channel
+  port number.calculate { operation = "subtract"; values = list(965, $channel) } → routeX
+  port number.calculate { operation = "less"; values = list(3, $time) } → showRoute
+  port number.calculate { operation = "multiply"; values = list($index, 0.46) } → delay
+  port number.calculate { operation = "subtract"; values = list($time, 3) } → elapsed
+  port number.calculate { operation = "subtract"; values = list($elapsed, $delay) } → localTime
+  port number.calculate { operation = "divide"; values = list($localTime, 1.8) } → position
+  call canvas.ease
+  let result = { edge = $edge; routeX = $routeX; endY = $endY; showRoute = $showRoute; progress = $result; width = 2.3 }
+
+process canvas.strataStar:
+  port number.calculate { operation = "multiply"; values = list($index, 2.399) } → phase
+  port number.calculate { operation = "multiply"; values = list($time, 0.13) } → drift
+  port number.calculate { operation = "cos"; values = list(add($phase, $drift)) } → horizontal
+  port number.calculate { operation = "sin"; values = list(add($phase, $drift)) } → vertical
+  port number.calculate { operation = "multiply"; values = list(446, $horizontal) } → x
+  port number.calculate { operation = "multiply"; values = list(192, $vertical) } → y
+  let result = { x = add(640, $x); y = add(408, $y) }
+
+process canvas.networkNode:
+  port number.calculate { operation = "multiply"; values = list($index, 2.399) } → angle
+  port number.calculate { operation = "cos"; values = list($angle) } → horizontal
+  port number.calculate { operation = "sin"; values = list($angle) } → vertical
+  port number.calculate { operation = "multiply"; values = list(457, $horizontal) } → dx
+  port number.calculate { operation = "multiply"; values = list(229, $vertical) } → dy
+  port number.calculate { operation = "remainder"; values = list($index, 5) } → xBand
+  port number.calculate { operation = "remainder"; values = list($index, 7) } → yBand
+  port number.calculate { operation = "divide"; values = list($xBand, 7) } → xStretch
+  port number.calculate { operation = "divide"; values = list($yBand, 10) } → yStretch
+  port number.calculate { operation = "multiply"; values = list($dx, add(0.32, $xStretch)) } → x
+  port number.calculate { operation = "multiply"; values = list($dy, add(0.34, $yStretch)) } → y
+  port number.calculate { operation = "multiply"; values = list($index, 7) } → link
+  port number.calculate { operation = "remainder"; values = list(add($link, 11), 49) } → peer
+  let result = { x = add(640, $x); y = add(345, $y); peer = $peer }
+
+process canvas.networkMark:
+  port number.calculate { operation = "multiply"; values = list($index, 0.22) } → threshold
+  port number.calculate { operation = "lessEqual"; values = list($threshold, $progress) } → visible
+  port number.calculate { operation = "remainder"; values = list($index, 2) } → parity
+  port number.calculate { operation = "multiply"; values = list(0.06, $index) } → swing
+  let result = { visible = $visible; pulseTime = add($time, $index); card = if(eq($index, 4), true, not(eq($parity, 0))); angle = add(-0.18, $swing) }
+
+process canvas.launchPhase:
+  port number.calculate { operation = "divide"; values = list($time, 2.8) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($result, 0.88) } → book
+  port number.calculate { operation = "subtract"; values = list($time, 0.4) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2.7) } → position
+  call canvas.ease
+  let result = { opening = add(0.12, $book); route = $result }
+
+process canvas.launchSlip:
+  port number.calculate { operation = "multiply"; values = list($index, 0.38) } → delay
+  port number.calculate { operation = "subtract"; values = list($time, 0.5) } → elapsed
+  port number.calculate { operation = "subtract"; values = list($elapsed, $delay) } → staged
+  port number.calculate { operation = "divide"; values = list($staged, 1.6) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($result, 110) } → forward
+  port number.calculate { operation = "multiply"; values = list($index, 55) } → column
+  port number.calculate { operation = "multiply"; values = list($index, 33) } → row
+  port number.calculate { operation = "multiply"; values = list($result, add(70, $row)) } → rise
+  port number.calculate { operation = "subtract"; values = list(523, $rise) } → y
+  port number.calculate { operation = "multiply"; values = list(0.09, $index) } → rotation
+  let result = { x = add(add(250, $forward), $column); y = $y; rotation = add(-0.2, $rotation); coral = eq($index, 3) }
+
+process canvas.arrivalPhase:
+  port number.calculate { operation = "divide"; values = list($time, 5.5) } → position
+  call canvas.ease
+  port number.calculate { operation = "multiply"; values = list($time, 0.15) } → slowed
+  let result = { route = $result; boatTime = if($still, $slowed, $time) }
+
+process canvas.intentBook:
+  port number.calculate { operation = "divide"; values = list($time, 2.2) } → elapsed
+  let position = add($elapsed, 0.12)
+  call canvas.ease
+  let result = $result
+
+process canvas.gateArms:
+  port number.calculate { operation = "multiply"; values = list(136, $open) } → rise
+  port number.calculate { operation = "subtract"; values = list(399, $rise) } → y
+  port number.calculate { operation = "multiply"; values = list(30, $open) } → shift
+  port number.calculate { operation = "subtract"; values = list(631, $shift) } → left
+  let result = { left = $left; right = add(642, $shift); y = $y;
+    leftBase = 452; rightBase = 834; baseY = 399; width = 7 }
+
+process canvas.rebuildPhase:
+  port number.calculate { operation = "subtract"; values = list($time, 0.5) } → staged
+  let elapsed = if($refactor, $staged, $time)
+  let duration = if($refactor, 8, 6)
+  port number.calculate { operation = "divide"; values = list($elapsed, $duration) } → position
+  call canvas.ease
+  let result = { progress = $result; route = if($refactor, 1, $result) }
+
+process canvas.rebuildPlate:
+  port number.calculate { operation = "multiply"; values = list(3.141592653589793, $progress) } → phase
+  port number.calculate { operation = "sin"; values = list($phase) } → wave
+  port number.calculate { operation = "multiply"; values = list(112, $wave) } → swell
+  port number.calculate { operation = "subtract"; values = list($index, 1) } → side
+  port number.calculate { operation = "multiply"; values = list($side, add(129, $swell)) } → offset
+  port number.calculate { operation = "remainder"; values = list($index, 2) } → parity
+  port number.calculate { operation = "multiply"; values = list($parity, 34) } → stagger
+  port number.calculate { operation = "subtract"; values = list($time, $index) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2) } → position
+  call canvas.ease
+  port number.calculate { operation = "subtract"; values = list(1, $result) } → remaining
+  port number.calculate { operation = "multiply"; values = list(55, $remaining) } → rise
+  port number.calculate { operation = "subtract"; values = list($baseY, $rise) } → lifted
+  let result = { x = if($refactor, add(640, $offset), $baseX); y = if($refactor, add(448, $stagger), $lifted) }
+
+process canvas.networkProgress:
+  port number.calculate { operation = "subtract"; values = list($time, 0.6) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 11.2) } → position
+  call canvas.ease
+  let result = $result
+
+process canvas.signalPhase:
+  port number.calculate { operation = "multiply"; values = list($index, 0.8) } → delay
+  port number.calculate { operation = "subtract"; values = list($time, $delay) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2.5) } → position
+  call canvas.ease
+  let route = $result
+  let x = if(eq($index, 0), 202, if(eq($index, 1), 1080, if(eq($index, 2), 640, 0)))
+  let y = if(eq($index, 0), 305, if(eq($index, 1), 307, if(eq($index, 2), 561, 0)))
+  let result = { route = $route; pulseTime = add($time, $index); amber = eq($index, 1); x = $x; y = $y }
+
+process canvas.signalsBook:
+  port number.calculate { operation = "subtract"; values = list($time, 0.9) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 2.9) } → position
+  call canvas.ease
+  let result = $result
+
+process canvas.harboursProgress:
+  port number.calculate { operation = "subtract"; values = list($time, 1.4) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 4) } → position
+  call canvas.ease
+  let result = $result
+
+process canvas.harbourLayout:
+  let west = eq($index, 0)
+  let east = eq($index, 1)
+  let x = if($west, 317, if($east, 963, 0))
+  let scale = if($west, 1.05, if($east, 1.15, 0))
+  let result = { x = $x; scale = $scale; plateY = 484; beaconY = 400; routeX = 640; routeStart = 333; routeElbow = 383; routeEnd = 448 }
+
+process canvas.homePhase:
+  port number.calculate { operation = "multiply"; values = list($time, 0.34) } → phase
+  port number.calculate { operation = "sin"; values = list($phase) } → wave
+  port number.calculate { operation = "multiply"; values = list(44, $wave) } → drift
+  port number.calculate { operation = "divide"; values = list($time, 10.5) } → position
+  call canvas.ease
+  let result = { beam = $drift; route = $result }
+
+process canvas.lightAlpha:
+  port number.calculate { operation = "multiply"; values = list($alpha, $light) } → intensity
+  port number.calculate { operation = "divide"; values = list($intensity, 100) } → fraction
+  port number.calculate { operation = "min"; values = list(1, $fraction) } → capped
+  port number.calculate { operation = "max"; values = list(0, $capped) } → opacity
+  let result = $opacity
+
+process canvas.bookDetails:
+  port number.calculate { operation = "less"; values = list(0.22, $opening) } → visible
+  port number.calculate { operation = "multiply"; values = list(190, $scale) } → openWidth
+  port number.calculate { operation = "multiply"; values = list($openWidth, $opening) } → width
+  port number.calculate { operation = "multiply"; values = list($width, 0.82) } → inset
+  port number.calculate { operation = "subtract"; values = list($x, $inset) } → left
+  port number.calculate { operation = "multiply"; values = list(1.6, $scale) } → lineWidth
+  port number.calculate { operation = "multiply"; values = list(2.6, $scale) } → markWidth
+  port number.calculate { operation = "multiply"; values = list(3.5, $scale) } → markRadius
+  let result = { visible = $visible; left = $left; lineWidth = $lineWidth; markWidth = $markWidth; markRadius = $markRadius }
+
+process canvas.bookDetailGeometry:
+  let first = eq($index, 0)
+  let second = eq($index, 1)
+  let third = eq($index, 2)
+  let markDx = if($first, 41, if($second, 76, if($third, 118, 155)))
+  let markDy = if($first, -18, if($second, 4, if($third, -27, -13)))
+  port number.calculate { operation = "multiply"; values = list($index, 15) } → row
+  port number.calculate { operation = "multiply"; values = list($row, $scale) } → advance
+  port number.calculate { operation = "multiply"; values = list(-25, $scale) } → lineDx
+  port number.calculate { operation = "multiply"; values = list(-20, $scale) } → fromDy
+  port number.calculate { operation = "multiply"; values = list(-52, $scale) } → toDy
+  port number.calculate { operation = "multiply"; values = list($markDx, $scale) } → scaledMarkX
+  port number.calculate { operation = "multiply"; values = list($scaledMarkX, $opening) } → markX
+  port number.calculate { operation = "multiply"; values = list($markDy, $scale) } → markY
+  let result = { lineX = add($x, $lineDx); fromY = add(add($y, $fromDy), $advance);
+    toY = add(add($y, $toDy), $advance); markX = add($x, $markX); markY = add($y, $markY); accent = eq($index, 3) }
+
+process canvas.routeSegment:
+  port number.calculate { operation = "subtract"; values = list($toX, $fromX) } → x
+  port number.calculate { operation = "subtract"; values = list($toY, $fromY) } → y
+  port number.calculate { operation = "hypot"; values = list($x, $y) } → length
+  let result = { length = $length; total = add($total, $length) }
+
+process canvas.plateGeometry:
+  port number.calculate { operation = "subtract"; values = list($x, $rx) } → left
+  port number.calculate { operation = "subtract"; values = list($y, $ry) } → top
+  let bottom = add($y, $ry)
+  let edge = add($y, $depth)
+  let result = { left = $left; right = add($x, $rx); top = $top; bottom = $bottom;
+    edge = $edge; face = add($bottom, $depth) }
+
+process canvas.clockDisplay:
+  port number.calculate { operation = "floor"; values = list($position) } → whole
+  port number.calculate { operation = "divide"; values = list($whole, 60) } → minuteFraction
+  port number.calculate { operation = "floor"; values = list($minuteFraction) } → minutes
+  port number.calculate { operation = "remainder"; values = list($whole, 60) } → seconds
+  port number.calculate { operation = "lessEqual"; values = list(0, $seconds) } → nonnegative
+  port number.calculate { operation = "less"; values = list($seconds, 10) } → singleDigit
+  let padding = if(and($nonnegative, $singleDigit), "0", "")
+  let result = { minutes = $minutes; seconds = $seconds; separator = ":"; padding = $padding }
+
+process canvas.bookGeometry:
+  port number.calculate { operation = "multiply"; values = list(190, $scale) } → openWidth
+  port number.calculate { operation = "multiply"; values = list($openWidth, $opening) } → width
+  port number.calculate { operation = "subtract"; values = list($x, $width) } → left
+  port number.calculate { operation = "multiply"; values = list(60, $scale) } → footOffset
+  port number.calculate { operation = "multiply"; values = list(20, $scale) } → outerBottomOffset
+  port number.calculate { operation = "multiply"; values = list(-89, $scale) } → outerTopOffset
+  port number.calculate { operation = "multiply"; values = list(-42, $scale) } → spineTopOffset
+  port number.calculate { operation = "multiply"; values = list(-41, $scale) } → spineLineOffset
+  port number.calculate { operation = "multiply"; values = list(59, $scale) } → spineBottomOffset
+  let result = { left = $left; right = add($x, $width); foot = add($y, $footOffset); outerBottom = add($y, $outerBottomOffset); outerTop = add($y, $outerTopOffset); spineTop = add($y, $spineTopOffset); spineLineTop = add($y, $spineLineOffset); spineLineBottom = add($y, $spineBottomOffset) }

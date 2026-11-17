@@ -1,0 +1,149 @@
+process-module "temple/surface-process-module/1"
+
+process hostedReadiness.fields:
+  let input = $eventInput
+  port value.describe { value = $input.value } → shape
+  assert $shape.plain
+    otherwise "Readiness observation is invalid or contains unsupported fields."
+  port record.entries { value = $input.value } → fields
+  let keys = map($fields, "field", at($field, 0))
+  let allowed = append($input.required, $input.optional)
+  assert and(every($keys, "key", includes($allowed, $key)), every($input.required, "key", includes($keys, $key)))
+    otherwise "Readiness observation is invalid or contains unsupported fields."
+  let result = $keys
+
+process hostedReadiness.counts:
+  let input = $eventInput
+  each $input.keys as key:
+    let value = at($input.value, $key)
+    port number.isNatural { value = $value } → natural
+    port number.calculate { operation = "lessEqual"; values = list($value, 9007199254740991) } → safe
+    port number.calculate { operation = "greaterEqual"; values = list($value, $input.minimum) } → above
+    assert and($natural, $safe, $above)
+      otherwise "Readiness observation count is invalid."
+  let result = true
+
+process hostedReadiness.semanticSupply:
+  let value = $eventInput
+  port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $value;
+    required = list("protocol", "entries", "inflight", "limits", "counters"); optional = list() } } → fields
+  assert eq($value.protocol, "sourcery-semantic-authoring-supply-cache-observation/1")
+    otherwise "Semantic authoring supply cache observation protocol is unsupported."
+  let limits = list("entries", "dependencyFiles", "dependencyBytes", "hashConcurrency")
+  let counters = list("hits", "misses", "bypasses", "coalesced", "compilations", "invalidations", "evictions", "driftRejections", "resourceLimitRejections")
+  port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $value.limits; required = $limits; optional = list() } } → fields
+  port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $value.counters; required = $counters; optional = list() } } → fields
+  port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $value.limits; keys = $limits; minimum = 1 } } → checked
+  port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $value.counters; keys = $counters; minimum = 0 } } → checked
+  port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $value; keys = list("entries", "inflight"); minimum = 0 } } → checked
+  port number.calculate { operation = "lessEqual"; values = list($value.entries, $value.limits.entries) } → bounded
+  assert $bounded
+    otherwise "Semantic authoring supply cache entries exceed their declared limit."
+  let result = $value
+
+process hostedReadiness.authoringWorker:
+  let value = $eventInput
+  let counts = list("requests", "inflight", "succeeded", "failed", "timeouts")
+  port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $value;
+    required = append(list("protocol", "scope", "configured", "state"), $counts);
+    optional = list("lastErrorCode", "semanticSupply") } } → fields
+  assert and(eq($value.protocol, "sourcery.hosted/authoring-worker-observation.v1"), eq($value.configured, true),
+    eq($value.scope, "executor-and-last-completed-worker"), includes(list("unobserved", "ready", "degraded"), $value.state))
+    otherwise "Hosted authoring worker observation identity is invalid."
+  port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $value; keys = $counts; minimum = 0 } } → checked
+  port number.calculate { operation = "add"; values = list($value.succeeded, $value.failed, $value.inflight) } → total
+  port number.calculate { operation = "lessEqual"; values = list($total, $value.requests) } → accounted
+  port number.calculate { operation = "lessEqual"; values = list($value.timeouts, $value.failed) } → timeouts
+  assert and($accounted, $timeouts)
+    otherwise "Hosted authoring worker observation counts are inconsistent."
+  when includes($fields, "lastErrorCode"):
+    port value.type { value = $value.lastErrorCode } → type
+    assert eq($type, "string")
+      otherwise "Hosted authoring worker observation error code is invalid."
+    port text.matches { value = $value.lastErrorCode; pattern = "\\A[a-z0-9._-]{1,80}\\z" } → code
+    assert $code
+      otherwise "Hosted authoring worker observation error code is invalid."
+  let supply = includes($fields, "semanticSupply")
+  assert and(or(not(eq($value.state, "ready")), $supply), or(not(eq($value.state, "unobserved")), not($supply)))
+    otherwise "Hosted authoring worker observation has inconsistent semantic supply state."
+  when $supply:
+    port kernel.invoke { query = "hostedReadiness.semanticSupply"; input = $value.semanticSupply } → checked
+  let result = $value
+
+process hostedReadiness.capabilityBinding:
+  let value = $eventInput
+  port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $value;
+    required = list("protocol", "status", "bindingRevision", "offerSupply"); optional = list() } } → fields
+  assert and(eq($value.protocol, "sourcery.hosted/capability-binding-readiness.v1"), includes(list("ready", "degraded"), $value.status))
+    otherwise "Hosted capability binding readiness is invalid."
+  port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $value; keys = list("bindingRevision"); minimum = 0 } } → checked
+  let supply = $value.offerSupply
+  let registry = eq(at($supply, "protocol"), "sourcery-capability-offer-catalog-registry-readiness/1")
+  when $registry:
+    let counts = list("revision", "sourceCount", "offerCount", "historyCount", "maximumHistoryEntries", "remainingHistoryEntries")
+    port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $supply;
+      required = append(list("protocol", "status", "persistence", "catalogHash", "registryHash"), $counts); optional = list() } } → fields
+    port kernel.invoke { query = "hostedReadiness.counts"; input = { value = $supply; keys = $counts; minimum = 0 } } → checked
+    each list($supply.catalogHash, $supply.registryHash) as hash:
+      port value.type { value = $hash } → type
+      assert eq($type, "string")
+        otherwise "Hosted capability offer catalogue readiness is invalid."
+      port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+      assert $valid
+        otherwise "Hosted capability offer catalogue readiness is invalid."
+    port number.calculate { operation = "lessEqual"; values = list($supply.sourceCount, 256) } → sources
+    port number.calculate { operation = "lessEqual"; values = list($supply.offerCount, 10000) } → offers
+    port number.calculate { operation = "lessEqual"; values = list($supply.maximumHistoryEntries, 1000000) } → capacity
+    port number.calculate { operation = "add"; values = list($supply.historyCount, $supply.remainingHistoryEntries) } → history
+    assert and(includes(list("ready", "degraded"), $supply.status), eq($supply.persistence, "database"),
+      $sources, $offers, $capacity, $supply.maximumHistoryEntries, eq($supply.revision, $supply.historyCount),
+      eq($history, $supply.maximumHistoryEntries), eq(eq($supply.remainingHistoryEntries, 0), eq($supply.status, "degraded")),
+      eq(eq($supply.status, "degraded"), eq($value.status, "degraded")))
+      otherwise "Hosted capability offer catalogue readiness is invalid."
+  when not($registry):
+    port kernel.invoke { query = "hostedReadiness.fields"; input = { value = $supply;
+      required = list("status", "persistence"); optional = list() } } → fields
+    assert and(eq($supply.status, "configured"), eq($supply.persistence, "provider-owned"))
+      otherwise "Hosted protected offer-provider readiness is invalid."
+  let result = $value
+
+process hostedReadiness.response:
+  let input = $eventInput
+  let capability = { status = "not-configured" }
+  when $input.capabilityConfigured:
+    try:
+      assert not($input.capabilityError)
+        otherwise "Capability binding observation failed."
+      port kernel.invoke { query = "hostedReadiness.capabilityBinding"; input = $input.capability } → capability
+    catch failure:
+      let candidate = or($input.capabilityError, "dependency-unavailable")
+      port text.matches { value = $candidate; pattern = "\\A[a-z0-9._-]{1,80}\\z" } → valid
+      let capability = { status = "degraded"; errorCode = if($valid, $candidate, "dependency-unavailable") }
+  let authoring = { configured = false; state = "unavailable" }
+  when $input.authoringConfigured:
+    try:
+      port kernel.invoke { query = "hostedReadiness.authoringWorker"; input = $input.authoring } → authoring
+    catch failure:
+      let authoring = { configured = true; state = "degraded"; lastErrorCode = "authoring-worker-observation-invalid" }
+  let worker = or($input.worker, { configured = false; state = "unavailable" })
+  let workerFields = list("configured", "state", "intervalMs", "sweepLimit", "lastStartedAt", "lastCompletedAt", "lastSweepCount", "failedRuns")
+  port record.entries { value = $worker } → fields
+  port record.fromEntries { entries = filter($fields, "field", includes($workerFields, at($field, 0))) } → workerReport
+  when at(at($worker, "lastError"), "code"):
+    port record.put { record = $workerReport; key = "lastErrorCode"; value = $worker.lastError.code } → workerReport
+  let readiness = $input.readiness
+  let degraded = or(not(eq($readiness.ready, true)), eq($worker.state, "degraded"),
+    not(includes(list("ready", "not-configured"), $capability.status)), eq($authoring.state, "degraded"))
+  let body = { status = if($degraded, "degraded", "ready");
+    applicationEnvironmentWorker = $workerReport; capabilityBinding = $capability; authoringWorker = $authoring;
+    hostedProduction = or($input.production, { status = "not-inspected" });
+    hostedEdge = or($input.edge, { status = "not-configured" }) }
+  let fields = list("schemaVersion", "authorityDiagnostics", "applicationEnvironmentResolution", "applicationEnvironmentActivation",
+    "applicationEnvironmentExecution", "applicationEnvironmentCleanup")
+  port record.entries { value = $readiness } → observed
+  fold filter($observed, "field", includes($fields, at($field, 0))) as field; body starts $body:
+    port record.put { record = $body; key = at($field, 0); value = at($field, 1) } → next
+    yield $next → body
+  when $input.generation:
+    port record.put { record = $body; key = "hostedGeneration"; value = $input.generation } → body
+  let result = { status = if($degraded, 503, 200); body = $body }

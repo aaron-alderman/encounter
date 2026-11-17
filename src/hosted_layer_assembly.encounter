@@ -1,0 +1,156 @@
+process-module "temple/surface-process-module/1"
+
+process layerAssembly.graph:
+  let manifests = $eventInput.manifests
+  assert and(isArray($manifests), eq(count($manifests), 3))
+    otherwise "Exactly three ordered workspace manifests are required."
+  let expected = list(
+    list("sourcery-platform", "platform", list("sourcery-core")),
+    list("sourcery-capabilities", "capabilities", list("sourcery-core", "sourcery-platform")),
+    list("sourcery-applications", "applications", list("sourcery-core", "sourcery-platform", "sourcery-capabilities")))
+  let source = at($manifests, 0)
+  let reference = $source.source
+  assert and($reference.referenceHash, $reference.admissionHash, $reference.kernelRoot)
+    otherwise "Layer manifests require one Core authority reference."
+  when $eventInput.withCore:
+    let core = at($eventInput.core, "activeAuthority")
+    assert and(eq(at($core, "referenceHash"), $reference.referenceHash),
+      eq(at($core, "admissionHash"), $reference.admissionHash), eq(at($core, "kernelRoot"), $reference.kernelRoot))
+      otherwise "Core authority reference does not match projection layers."
+  fold list(0, 1, 2) as index; inventory starts list():
+    let manifest = at($manifests, $index)
+    let role = at($expected, $index)
+    assert and(eq($manifest.protocol, "sourcery/layer-workspace.v1"), eq($manifest.repository, at($role, 0)),
+      eq($manifest.layer, at($role, 1)), eq($manifest.authority, false), eq($manifest.projection, true))
+      otherwise "Unexpected layer or non-projection authority."
+    assert eq($manifest.dependsOn, at($role, 2))
+      otherwise "Layer has an invalid dependency boundary."
+    assert and(eq($manifest.source.referenceHash, $reference.referenceHash),
+      eq($manifest.source.admissionHash, $reference.admissionHash), eq($manifest.source.kernelRoot, $reference.kernelRoot))
+      otherwise "Layer manifests do not share one Core authority reference."
+    port number.calculate { operation = "lessEqual"; values = list(count($manifest.files), 20000) } → bounded
+    assert and(isArray($manifest.files), $bounded)
+      otherwise "Layer file inventory exceeds its bounds."
+    let files = map($manifest.files, "file", { path = $file.path; contentHash = $file.contentHash; bytes = $file.bytes })
+    port json.stringify { value = $files } → encoded
+    port digest.sha256 { text = $encoded } → digest
+    assert eq($digest, $manifest.layerDigest)
+      otherwise "Layer has an invalid layer digest."
+    each $files as file:
+      port kernel.invoke { query = "layerAssembly.file"; input = { file = $file;
+        reserved = list("node_modules", ".sourcery-runtime.json", ".sourcery-composition.json", ".sourcery-assembly.json") } } → checked
+    yield append($inventory, map($files, "file", $file.path)) → inventory
+  assert eq(count($inventory), count(distinct($inventory)))
+    otherwise "Layer collision in the combined file inventory."
+  let result = { protocol = "sourcery/layer-graph-proof.v2"; valid = true;
+    referenceHash = $reference.referenceHash; fileCount = count($inventory) }
+
+process layerAssembly.proof:
+  let input = $eventInput
+  let body = { protocol = "sourcery/layer-composition-proof.v1"; referenceHash = $input.graph.referenceHash;
+    fileCount = $input.graph.fileCount; layerDigests = map($input.manifests, "layer",
+      { repository = $layer.repository; layerDigest = $layer.layerDigest }); projectionAuthority = false }
+  port json.stringify { value = $body } → encoded
+  port digest.sha256 { text = $encoded } → digest
+  port record.put { record = $body; key = "proofHash"; value = $digest } → result
+
+process layerAssembly.runtime:
+  let result = { protocol = "sourcery/composed-runtime-projection.v1"; authority = false;
+    internalLinks = list({ package = "@temple2/platform-sdk"; target = "sdk" });
+    dependencyManifest = "package.json"; installCommand = "npm install"; closureCommand = "sourcery-core-seal-runtime ." }
+
+  when $eventInput.physical:
+    let result = { protocol = "sourcery/composed-runtime-projection.v1"; authority = false; internalLinks = list();
+      dependencyManifest = "package.json"; physicalSdk = "node_modules/@temple2/platform-sdk" }
+
+process layerAssembly.file:
+  let file = $eventInput.file
+  port text.matches { value = $file.path; pattern = "\\A[^/\\\\\\p{Cc}]+(?:/[^/\\\\\\p{Cc}]+)*\\z" } → syntax
+  port text.split { value = $file.path; pattern = "/" } → parts
+  assert and($syntax, not(some($parts, "part", includes(list(".", ".."), $part))),
+    not(includes($eventInput.reserved, at($parts, 0))))
+    otherwise "Layer contains an unsafe or reserved destination path."
+  port text.matches { value = $file.contentHash; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+  port number.isNatural { value = $file.bytes } → bytes
+  port number.calculate { operation = "lessEqual"; values = list($file.bytes, 268435456) } → small
+  assert and($hash, $bytes, $small)
+    otherwise "Layer contains invalid file evidence."
+  let result = true
+
+process layerAssembly.sdk:
+  let manifest = $eventInput
+  assert eq($manifest.protocol, "sourcery/platform-runtime-payload.v1")
+    otherwise "Unsupported Platform SDK payload protocol."
+  let files = map($manifest.files, "file", { path = $file.path; contentHash = $file.contentHash; bytes = $file.bytes })
+  port json.stringify { value = $files } → encoded
+  port digest.sha256 { text = $encoded } → digest
+  assert eq($digest, $manifest.payloadHash)
+    otherwise "Platform SDK payload manifest digest is invalid."
+  port kernel.invoke { query = "layerAssembly.inventory"; input = { files = $files; reserved = list("SOURCERY-PAYLOAD.json") } } → admitted
+  let result = $files
+
+process layerAssembly.inventory:
+  let input = $eventInput
+  let files = $input.files
+  port number.calculate { operation = "lessEqual"; values = list(count($files), 20000) } → bounded
+  let paths = map($files, "file", $file.path)
+  assert and(isArray($files), count($files), $bounded, eq(count($paths), count(distinct($paths))))
+    otherwise "Runtime file inventory must be nonempty, unique, and bounded."
+  each $files as file:
+    port kernel.invoke { query = "layerAssembly.file"; input = { file = $file; reserved = $input.reserved } } → admitted
+  let result = true
+
+process layerAssembly.dependencies:
+  let manifest = $eventInput
+  port kernel.invoke { query = "dependency.releasePlan"; input = $manifest } → admitted
+  fold $admitted as package; dependencies starts list():
+    let matches = filter($manifest.dependencies, "record", eq($record.name, $package.name))
+    assert eq(count($matches), 1)
+      otherwise "Platform dependency inventory is ambiguous."
+    let files = at(at($matches, 0), "files")
+    port kernel.invoke { query = "layerAssembly.inventory"; input = { files = $files; reserved = list() } } → checked
+    yield append($dependencies, list({ name = $package.name; files = $files })) → dependencies
+  let result = $dependencies
+
+process layerAssembly.orderedInventory:
+  let paths = map($eventInput, "file", $file.path)
+  port value.sort { values = $paths } → ordered
+  assert eq($paths, $ordered)
+    otherwise "Platform runtime file inventory is out of order."
+  let result = true
+
+process layerAssembly.payloadProof:
+  let input = $eventInput
+  let manifest = $input.dependencyManifest
+  assert eq($manifest.protocol, "sourcery/platform-runtime-dependencies.v1")
+    otherwise "Unsupported Platform runtime dependency manifest."
+  let entries = $manifest.dependencies
+  let names = map($entries, "entry", $entry.name)
+  port number.calculate { operation = "lessEqual"; values = list(count($names), 128) } → bounded
+  assert and(isArray($entries), $bounded, eq(count($names), count(distinct($names))))
+    otherwise "Platform dependency declarations must be distinct and bounded."
+  let required = filter($entries, "entry", not(eq($entry.availability, "optional-not-admitted")))
+  let admitted = list()
+  when count($required):
+    port kernel.invoke { query = "layerAssembly.dependencies"; input = $manifest } → admitted
+  port kernel.invoke { query = "layerAssembly.orderedInventory"; input = $input.files } → ordered
+  fold $input.files as file; byteCount starts 0:
+    port number.calculate { operation = "add"; values = list($byteCount, $file.bytes) } → next
+    yield $next → byteCount
+  fold $entries as entry; dependencies starts list():
+    let receipt = { name = $entry.name }
+    when eq($entry.availability, "optional-not-admitted"):
+      let receipt = { name = $entry.name; availability = $entry.availability }
+      when not(eq($entry.loadMode, at({}, "loadMode"))):
+        port record.put { record = $receipt; key = "loadMode"; value = $entry.loadMode } → receipt
+    when not(eq($entry.availability, "optional-not-admitted")):
+      port kernel.invoke { query = "layerAssembly.orderedInventory"; input = $entry.files } → checked
+      port json.stringify { value = $entry.files } → encoded
+      port digest.sha256 { text = $encoded } → hash
+      let receipt = { name = $entry.name; version = $entry.version; fileCount = count($entry.files); payloadHash = $hash }
+    yield append($dependencies, list($receipt)) → dependencies
+  let proof = { protocol = "sourcery/platform-runtime-payload-proof.v1"; payloadHash = $input.payloadHash;
+    fileCount = count($input.files); byteCount = $byteCount; dependencies = $dependencies }
+  let result = { proof = $proof; admitted = $admitted;
+    declarations = map($entries, "entry", { name = $entry.name; availability = or($entry.availability, null);
+      loadMode = or($entry.loadMode, null) }) }

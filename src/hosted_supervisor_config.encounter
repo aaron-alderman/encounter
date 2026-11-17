@@ -1,0 +1,72 @@
+process-module "temple/surface-process-module/1"
+
+process hostedSupervisor.timeout:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedLaunch.integer"; input = { value = $input.value; default = $input.default;
+    minimum = $input.minimum; maximum = $input.maximum;
+    integerError = "Hosted supervisor timeouts must be integer milliseconds.";
+    rangeError = "Hosted supervisor timeout is outside its supported range." } } → result
+
+process hostedSupervisor.dependencyGate:
+  let input = $eventInput
+  port text.trim { value = $input.store } → store
+  port text.startsWith { value = $store; search = "/" } → absolute
+  assert $absolute
+    otherwise "SOURCERY_HOSTED_DEPENDENCY_CLOSURE_ROOT must name an absolute retained dependency store."
+  port text.trim { value = $input.pin } → pin
+  port text.matches { value = $pin; pattern = "\\A[a-f0-9]{64}\\z" } → pinned
+  assert $pinned
+    otherwise "SOURCERY_HOSTED_DEPENDENCY_COMPOSITION_SHA256 must pin the sealed release composition."
+  let result = { store = $store; pin = $pin }
+
+process hostedSupervisor.config:
+  let input = $eventInput
+  assert eq($input.profile, "production")
+    otherwise "The hot-swap supervisor accepts only the production deployment profile."
+  port text.trim { value = $input.tree } → tree
+  port text.matches { value = $tree; pattern = "\\A[a-f0-9]{64}\\z" } → frozen
+  assert $frozen
+    otherwise "SOURCERY_HOSTED_TEMPLE_TREE_SHA256 must be the frozen Temple SHA-256 tree hash."
+  try:
+    port json.parse { text = $input.paths } → paths
+  catch invalid:
+    assert false
+      otherwise "SOURCERY_HOSTED_RELOAD_PATHS must be a JSON array of production source paths."
+  assert and(isArray($paths), count($paths))
+    otherwise "SOURCERY_HOSTED_RELOAD_PATHS must contain one or more production source paths."
+  port path.resolvePosix { base = $input.cwd; path = or($input.source, ".") } → root
+  let prefix = if(eq($root, "/"), "/", concat($root, "/"))
+  let admittedPaths = append($paths, list("encounter", "plugins", "package.json", "package-lock.json"))
+  fold $admittedPaths as path; resolved starts list():
+    port value.type { value = $path } → kind
+    assert eq($kind, "string")
+      otherwise "SOURCERY_HOSTED_RELOAD_PATHS must contain nonempty strings."
+    port text.trim { value = $path } → name
+    assert $name
+      otherwise "SOURCERY_HOSTED_RELOAD_PATHS must contain nonempty strings."
+    port path.resolvePosix { base = $root; path = $path } → absolute
+    port text.startsWith { value = $absolute; search = $prefix } → inside
+    assert or(eq($absolute, $root), $inside)
+      otherwise "SOURCERY_HOSTED_RELOAD_PATHS must stay inside source root."
+    port text.slice { value = $absolute; start = count($prefix) } → relative
+    port text.split { value = $relative; pattern = "/" } → components
+    assert not(some($components, "part", includes(list(".git", ".temple2", "node_modules"), $part)))
+      otherwise "SOURCERY_HOSTED_RELOAD_PATHS must stay outside state, dependencies, and VCS metadata."
+    yield append($resolved, list($absolute)) → resolved
+  port text.trim { value = $input.pointer } → pointerName
+  port path.resolvePosix { base = $root; path = $input.pointer } → pointer
+  port text.startsWith { value = $pointer; search = $prefix } → pointerInside
+  assert and($pointerName, $pointerInside, not(eq($pointer, $root)))
+    otherwise "SOURCERY_HOSTED_RELEASE_POINTER must name the admitted release pointer inside source root."
+  port path.resolvePosix { base = $root; path = "node_modules/@temple2/platform-sdk" } → sdk
+  port path.resolvePosix { base = $input.cwd; path = or($input.temple, $sdk) } → temple
+  assert eq($temple, $sdk)
+    otherwise "SOURCERY_HOSTED_TEMPLE_ROOT must be the exact Temple dependency loaded by the hosted source tree."
+  port kernel.invoke { query = "hostedSupervisor.timeout";
+    input = { value = $input.poll; default = "2000"; minimum = 250; maximum = 60000 } } → poll
+  port kernel.invoke { query = "hostedSupervisor.timeout";
+    input = { value = $input.startup; default = "60000"; minimum = 1000; maximum = 300000 } } → startup
+  port kernel.invoke { query = "hostedSupervisor.timeout";
+    input = { value = $input.drain; default = "30000"; minimum = 1000; maximum = 300000 } } → drain
+  let result = { sourceRoot = $root; sourcePaths = distinct($resolved); releasePointer = $pointer; templeRoot = $temple;
+    expectedTempleTreeHash = $tree; pollIntervalMs = $poll; startupTimeoutMs = $startup; drainTimeoutMs = $drain }

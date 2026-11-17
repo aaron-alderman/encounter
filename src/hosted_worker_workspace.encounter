@@ -1,0 +1,62 @@
+process-module "temple/surface-process-module/1"
+
+process workerWorkspace.admit:
+  let input = $eventInput
+  port kernel.invoke { query = "workerWorkspace.project"; input = $input } → projectFile
+  port json.canonical { value = $input.target } → canonical
+  port digest.sha256 { text = $canonical } → hash
+  port text.slice { value = $hash; start = 0; end = 32 } → identity
+  let result = { projectFile = $projectFile; workerId = concat("worker.self-hosted.", $identity) }
+
+process workerWorkspace.project:
+  let input = $eventInput
+  when not($input.hasReceipt):
+    let result = "project.rel"
+  when $input.hasReceipt:
+    let receipt = $input.receipt
+    assert and(eq(at($receipt, "protocol"), "sourcery.hosted/workspace-source-bootstrap.v1"),
+      eq(at($receipt, "target"), $input.target))
+      otherwise "The hosted workspace source-bootstrap receipt does not bind its assigned workspace."
+    let placement = at($receipt, "placement")
+    let project = at($placement, "projectFile")
+    port value.type { value = $project } → kind
+    assert eq($kind, "string")
+      otherwise "The hosted workspace source-bootstrap receipt has no valid project coordinate."
+    port text.matches { value = $project; pattern = "\\A(?:[^/\\\\\\p{Cc}]+/)*project\\.rel\\z" } → normalized
+    port text.split { value = $project; pattern = "/" } → parts
+    assert and($normalized, not(some($parts, "part", includes(list(".", ".."), $part))),
+      not(includes(list("node_modules", "plugins"), at($parts, 0))))
+      otherwise "The hosted workspace source-bootstrap receipt has no valid project coordinate."
+    let result = $project
+
+process workerWorkspace.application:
+  let input = $eventInput
+  let apps = filter($input.facts, "fact", and(eq($fact.s, "project"), eq($fact.p, "app"), eq($fact.pol, "is")))
+  let ids = distinct(map($apps, "fact", $fact.o))
+  assert eq(count($ids), 1)
+    otherwise "Container worker project must declare one exact authoring application."
+  let id = at($ids, 0)
+  port text.replace { value = $id; pattern = "\\Aapp\\."; replacement = "" } → instance
+  let names = filter($input.facts, "fact", and(eq($fact.s, $id), eq($fact.p, "name"), eq($fact.pol, "is")))
+  let name = or(at(at($names, 0), "o"), $instance)
+  each list($id, $instance, $name) as field:
+    port text.matches { value = $field; pattern = "\\A[^\\x{0}]{1,256}\\z" } → bounded
+    assert $bounded
+      otherwise "Container worker application coordinates must be nonempty and bounded."
+  port text.split { value = $name; pattern = "[-_\\s\\x{00a0}\\x{1680}\\x{2000}-\\x{200a}\\x{2028}\\x{2029}\\x{202f}\\x{205f}\\x{3000}\\x{feff}]+" } → words
+  let nonempty = filter($words, "word", $word)
+  fold $nonempty as word; titleWords starts list():
+    port text.matches { value = $word; pattern = "\\A[\\x{10000}-\\x{10ffff}]" } → supplementary
+    let capitalized = $word
+    when not($supplementary):
+      port text.slice { value = $word; start = 0; end = 1 } → first
+      port text.upperCase { value = $first } → upper
+      port text.slice { value = $word; start = 1 } → remainder
+      let capitalized = concat($upper, $remainder)
+    yield append($titleWords, list($capitalized)) → titleWords
+  port text.join { values = $titleWords; separator = " " } → title
+  assert $title
+    otherwise "Container worker application title must be nonempty."
+  port digest.sha256 { text = $input.source } → projectSha256
+  let application = { id = $id; name = $name; instance = $instance; title = $title; targetDirectory = "." }
+  let result = { projectSha256 = $projectSha256; application = $application }

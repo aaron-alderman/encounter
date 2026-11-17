@@ -1,0 +1,161 @@
+process-module "temple/surface-process-module/1"
+
+process knowledgeCatalogue.digest:
+  port json.canonicalCompact { value = $eventInput } → encoded
+  port digest.sha256 { text = $encoded } → result
+
+process knowledgeCatalogue.bodyDigest:
+  port record.entries { value = $eventInput } → fields
+  port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "catalogueHash"))) } → body
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → result
+
+process knowledgeCatalogue.verify:
+  let catalogue = $eventInput
+  assert and(eq(at($catalogue, "protocol"), "sourcery-knowledge-catalogue/1"), isArray(at($catalogue, "entries")))
+    otherwise "Exact knowledge catalogue is required."
+  port kernel.invoke { query = "knowledgeCatalogue.bodyDigest"; input = $catalogue } → hash
+  assert eq($catalogue.catalogueHash, $hash)
+    otherwise "Catalogue hash does not match its exact content."
+  let result = $hash
+
+process knowledgeCatalogue.kinds:
+  let result = list("application", "capability", "claim", "learning-object", "plugin", "programme", "projection", "tool", "work-item")
+
+process knowledgeCatalogue.stages:
+  let result = list("start", "tutorial", "learning-series", "topics", "how-to-author", "how-to-extend", "how-to-prove")
+
+process knowledgeCatalogue.inspect:
+  let input = $eventInput
+  let catalogue = $input.catalogue
+  let hash = $input.hash
+  let entry = at(filter($catalogue.entries, "candidate", eq($candidate.id, $input.entryId)), 0)
+  let result = null
+  when $entry:
+    let body = {
+      protocol = "sourcery-knowledge-catalogue-projection/1"; catalogueHash = $hash;
+      identity = { id = $entry.id; kind = $entry.kind; title = $entry.title; aliases = $entry.aliases };
+      meaning = { summary = $entry.summary; audiences = $entry.audiences; tags = $entry.tags };
+      context = $entry.relations; projection = $entry.projection;
+      mechanism = { standard = $entry.mechanisms.standard; mechanismUnderTheMechanism = $entry.mechanisms.underlying };
+      authority = $entry.authority; admissibility = $entry.admissibility; provenance = $entry.provenance }
+    port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → projectionHash
+    port record.put { record = $body; key = "projectionHash"; value = $projectionHash } → result
+
+process knowledgeCatalogue.discoveryMatch:
+  let input = $eventInput
+  let entry = $input.entry
+  let kinds = $input.kinds
+  let audiences = $input.audiences
+  let result = false
+  when and(or(not(count($kinds)), includes($kinds, $entry.kind)),
+    or(not(count($audiences)), some($audiences, "audience", includes($entry.audiences, $audience)))):
+    port text.join { values = append(append(list($entry.id, $entry.title, $entry.summary), $entry.aliases), $entry.tags); separator = " " } → words
+    port text.lowerCase { value = $words } → haystack
+    let result = every($input.terms, "term", includes($haystack, $term))
+
+process knowledgeCatalogue.discover:
+  let input = $eventInput
+  let args = $input.args
+  port value.type { value = $args.query } → queryType
+  assert eq($queryType, "string")
+    otherwise "query must be supplied explicitly, including an empty string."
+  assert and(isArray($args.kinds), isArray($args.audiences))
+    otherwise "kinds and audiences must be explicit arrays."
+  port value.type { value = $args.offset } → offsetType
+  port number.calculate { operation = "greaterEqual"; values = list($args.offset, 0) } → nonnegative
+  port number.calculate { operation = "floor"; values = list($args.offset) } → whole
+  port number.isNatural { value = $args.limit } → limit
+  assert and(eq($offsetType, "number"), $nonnegative, eq($args.offset, $whole), $limit, not(eq($args.limit, 0)))
+    otherwise "offset and limit must be explicit and bounded."
+  port number.calculate { operation = "lessEqual"; values = list($args.limit, 200) } → bounded
+  assert $bounded
+    otherwise "offset and limit must be explicit and bounded."
+  port kernel.invoke { query = "knowledgeCatalogue.kinds"; input = null } → kinds
+  each $args.kinds as kind:
+    assert includes($kinds, $kind)
+      otherwise "Unsupported catalogue kind."
+  port text.lowerCase { value = $args.query } → query
+  port text.split { value = $query; pattern = "[^a-z0-9]+" } → tokens
+  let terms = filter($tokens, "token", $token)
+  fold $input.catalogue.entries as entry; page starts { total = 0; entries = list() }:
+    port kernel.invoke { query = "knowledgeCatalogue.discoveryMatch"; input = {
+      entry = $entry; kinds = $args.kinds; audiences = $args.audiences; terms = $terms } } → matched
+    let total = $page.total
+    let entries = $page.entries
+    when $matched:
+      port number.calculate { operation = "greaterEqual"; values = list($total, $args.offset) } → afterOffset
+      port number.calculate { operation = "less"; values = list(count($entries), $args.limit) } → belowLimit
+      when and($afterOffset, $belowLimit):
+        let entries = append($entries, list({ id = $entry.id; kind = $entry.kind; title = $entry.title; projection = $entry.projection }))
+      port number.calculate { operation = "add"; values = list($total, 1) } → total
+    yield { total = $total; entries = $entries } → page
+  let result = { protocol = "sourcery-knowledge-catalogue-discovery/1"; catalogueHash = $input.hash;
+    filters = { query = $args.query; kinds = $args.kinds; audiences = $args.audiences; offset = $args.offset; limit = $args.limit };
+    total = $page.total; entries = $page.entries; ordering = "canonical-entry-id"; recommendationAuthority = "none" }
+
+process knowledgeCatalogue.completeness:
+  let catalogue = $eventInput.catalogue
+  port kernel.invoke { query = "knowledgeCatalogue.kinds"; input = null } → kinds
+  port kernel.invoke { query = "knowledgeCatalogue.stages"; input = null } → stages
+  let presentKinds = map($catalogue.entries, "entry", $entry.kind)
+  let presentStages = map($catalogue.pathways, "pathway", $pathway.stage)
+  let missingKinds = filter($kinds, "kind", not(includes($presentKinds, $kind)))
+  let missingStages = filter($stages, "stage", not(includes($presentStages, $stage)))
+  let findings = append(map($missingKinds, "kind", { code = "missing-first-class-kind"; subject = $kind }),
+    map($missingStages, "stage", { code = "missing-learning-stage"; subject = $stage }))
+  fold $catalogue.entries as entry; findings starts $findings:
+    let next = $findings
+    when not(count($entry.mechanisms.standard)):
+      let next = append($next, list({ code = "missing-standard-mechanism"; subject = $entry.id }))
+    when not(count($entry.mechanisms.underlying)):
+      let next = append($next, list({ code = "missing-underlying-mechanism"; subject = $entry.id }))
+    when and(eq($entry.admissibility.state, "admitted"), not(count($entry.admissibility.evidenceRefs))):
+      let next = append($next, list({ code = "admitted-without-evidence"; subject = $entry.id }))
+    yield $next → findings
+  let keys = distinct(map($findings, "finding", concat($finding.code, ":", $finding.subject)))
+  port value.sort { values = $keys; mode = "locale" } → sorted
+  fold $sorted as key; ordered starts list():
+    yield append($ordered, filter($findings, "finding", eq(concat($finding.code, ":", $finding.subject), $key))) → ordered
+  let body = { protocol = "sourcery-knowledge-catalogue-completeness/1"; catalogueHash = $eventInput.hash;
+    status = if(count($ordered), "incomplete", "complete"); entryCount = count($catalogue.entries);
+    pathwayCount = count($catalogue.pathways); findings = $ordered }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "reportHash"; value = $hash } → result
+
+process knowledgeCatalogue.read:
+  let input = $eventInput
+  let args = $input.args
+  let operation = at($args, "operation")
+  assert includes(list("inspect", "discover", "learning", "completeness"), $operation)
+    otherwise "Unsupported read-only knowledge catalogue operation."
+  port record.entries { value = $args } → fields
+  port value.sort { values = map($fields, "field", at($field, 0)) } → keys
+  let catalogue = $input.catalogue
+  let response = null
+  when eq($operation, "inspect"):
+    assert eq($keys, list("entryId", "operation"))
+      otherwise "inspect requires exactly: entryId, operation."
+    port kernel.invoke { query = "knowledgeCatalogue.verify"; input = $catalogue } → hash
+    port kernel.invoke { query = "knowledgeCatalogue.inspect"; input = { catalogue = $catalogue; entryId = $args.entryId; hash = $hash } } → response
+  when eq($operation, "discover"):
+    assert eq($keys, list("audiences", "kinds", "limit", "offset", "operation", "query"))
+      otherwise "discover requires exactly: audiences, kinds, limit, offset, operation, query."
+    port kernel.invoke { query = "knowledgeCatalogue.verify"; input = $catalogue } → hash
+    port kernel.invoke { query = "knowledgeCatalogue.discover"; input = { catalogue = $catalogue; args = $args; hash = $hash } } → response
+  when eq($operation, "learning"):
+    let all = not(includes($keys, "pathwayId"))
+    let expected = if($all, list("operation"), list("operation", "pathwayId"))
+    assert and(eq($keys, $expected), or($all, not(eq($args.pathwayId, null))))
+      otherwise "learning requires exactly: operation, or operation and pathwayId."
+    port kernel.invoke { query = "knowledgeCatalogue.verify"; input = $catalogue } → hash
+    when $all:
+      let response = $catalogue.pathways
+    when not($all):
+      let response = or(at(filter($catalogue.pathways, "pathway", eq($pathway.id, $args.pathwayId)), 0), null)
+  when eq($operation, "completeness"):
+    assert eq($keys, list("operation"))
+      otherwise "completeness requires exactly: operation."
+    port kernel.invoke { query = "knowledgeCatalogue.verify"; input = $catalogue } → hash
+    port kernel.invoke { query = "knowledgeCatalogue.completeness"; input = { catalogue = $catalogue; hash = $hash } } → response
+  let result = { protocol = "sourcery-knowledge-catalogue-mcp/1"; operation = $operation;
+    catalogueHash = $catalogue.catalogueHash; result = $response; authority = "read-only"; productMutation = "none" }

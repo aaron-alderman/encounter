@@ -1,0 +1,97 @@
+process-module "temple/surface-process-module/1"
+
+process hostedBearer.invalid:
+  port kernel.invoke { query = "controlAccess.refuse"; input = { status = 401; code = "credential-invalid";
+    message = "The developer credential is invalid, expired, or revoked." } } → result
+
+process hostedBearer.plan:
+  let input = $eventInput
+  assert includes(list("enabled", "personal-only", "disabled"), $input.mode)
+    otherwise "Unsupported hosted credential mode."
+  port kernel.invoke { query = "controlAccess.boundedText"; input = { value = $input.token; name = "bearer token"; limit = 2048 } } → token
+  port text.startsWith { value = $token; search = "src_session_" } → session
+  port text.startsWith { value = $token; search = "src_dev_" } → credential
+  when not(or($session, and($credential, not(eq($input.mode, "disabled"))))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 401; code = "bearer-token-invalid";
+      message = "The bearer token type is not recognized." } } → denied
+  port digest.sha256 { text = $token } → digest
+  let result = { kind = "session"; digest = $digest }
+  when $credential:
+    port text.split { value = $token; pattern = "\\." } → parts
+    when eq(count($parts), 1):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 401; code = "credential-invalid";
+        message = "The developer credential is malformed." } } → denied
+    port text.slice { value = at($parts, 0); start = 8 } → credentialId
+    let result = { kind = "credential"; digest = $digest; credentialId = $credentialId }
+
+process hostedBearer.permissions:
+  let input = $eventInput
+  let read = list("project.read", "workspace.read", "authoring.read")
+  let write = append($read, list("workspace.write", "authoring.write"))
+  let allowed = if(eq($input.role, "viewer"), $read, if(includes(list("author", "steward"), $input.role), $write, list()))
+  when $input.portfolio:
+    let allowed = list("authoring.read", "authoring.write", "projects.observe", "projects.request",
+      "projects.decide", "projects.provision")
+  let result = false
+  when isArray($input.permissions):
+    let result = and(count($input.permissions), not(some($input.permissions, "permission", not(includes($allowed, $permission)))))
+
+process hostedBearer.verify:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  let record = at($snapshot, "record")
+  port value.type { value = $input.nowMs } → clock
+  assert eq($clock, "number")
+    otherwise "Hosted bearer verification requires a valid clock."
+  let current = false
+  when and($record, $input.digestMatches, not($record.revokedAt)):
+    try:
+      port time.parseRfc3339 { value = $record.expiresAt } → expiry
+      port number.calculate { operation = "greater"; values = list($expiry, $input.nowMs) } → current
+    catch invalid:
+      let current = false
+  when eq($input.kind, "session"):
+    when not($current):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 401; code = "session-invalid";
+        message = "The session is invalid, expired, or revoked." } } → denied
+    when not(eq($snapshot.identities, 1)):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "not-found";
+        message = "Identity was not found." } } → denied
+    port value.type { value = $record.id } → sessionId
+    port value.type { value = $record.userId } → userId
+    assert and(eq($sessionId, "string"), $record.id, eq($userId, "string"), $record.userId)
+      otherwise "Hosted bearer session has invalid identity fields."
+    let result = { kind = "user"; userId = $record.userId; sessionId = $record.id }
+  when eq($input.kind, "credential"):
+    when not(and($current, $snapshot.lineage, eq($record.id, $input.credentialId),
+      or($record.subjectUserId, eq($input.mode, "enabled")))):
+      port kernel.invoke { query = "hostedBearer.invalid"; input = null } → denied
+    assert and(isArray($record.permissions), count($record.permissions))
+      otherwise "Hosted bearer credential has invalid permission fields."
+    let result = { kind = "developerCredential"; credentialId = $record.id; tenantId = $record.tenantId;
+      projectId = $record.projectId; workspaceId = $record.workspaceId; permissions = $record.permissions }
+    when $record.subjectUserId:
+      let portfolio = and(eq($record.scopeMode, "application-portfolio-v1"), eq($record.projectId, null), eq($record.workspaceId, null))
+      let tenant = if(eq(count($snapshot.tenantRoles), 1), at($snapshot.tenantRoles, 0), null)
+      let project = if(eq(count($snapshot.projectRoles), 1), at($snapshot.projectRoles, 0), null)
+      let role = if(includes(list("owner", "admin"), $tenant), "steward", $project)
+      port kernel.invoke { query = "hostedBearer.permissions"; input = { portfolio = $portfolio; role = $role;
+        permissions = $record.permissions } } → allowed
+      when not(and(eq($snapshot.identities, 1), includes(list("owner", "admin", "developer", "viewer"), $tenant),
+        $allowed, or(not($portfolio), $snapshot.appActive))):
+        port kernel.invoke { query = "hostedBearer.invalid"; input = null } → denied
+      port record.put { record = $result; key = "userId"; value = $record.subjectUserId } → result
+      when $portfolio:
+        let result = { principal = { kind = "user"; userId = $record.subjectUserId }; scopes = $record.permissions;
+          grant = { scope = { tenantId = $record.tenantId; appId = $record.appId } };
+          clientId = "urn:sourcery:personal-mcp-connection"; familyId = $record.id }
+
+process hostedBearer.database:
+  let input = $eventInput
+  let state = $input.snapshot
+  when not(eq($state, null)):
+    port kernel.invoke { query = "controlAccess.databaseSnapshot"; input = $state } → admitted
+    port number.calculate { operation = "lessEqual"; values = list($state.matches, 1) } → unique
+    assert $unique
+      otherwise "Hosted bearer lookup is ambiguous."
+  port kernel.invoke { query = "hostedBearer.verify"; input = $input } → result

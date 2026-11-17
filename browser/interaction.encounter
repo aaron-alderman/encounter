@@ -1,0 +1,637 @@
+process-module "temple/surface-process-module/1"
+
+# Return the number of DOM writes for an active-group change.
+process interaction.activate:
+  let result = if($sameMember, 0, if($hasPrevious, 2, 1))
+
+process interaction.activeGroupAdmission:
+  port number.calculate { operation = "less"; values = list($used, 16) } → room
+  port number.calculate { operation = "lessEqual"; values = list(1, $count) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($count, 64) } → bounded
+  let result = and($text, not($duplicate), $room, $array, $nonempty, $bounded)
+
+process interaction.activeMemberId:
+  port text.matches { value = $id; pattern = "\\A#[a-z][a-z0-9-]{0,100}\\z" } → valid
+  let result = $valid
+
+process interaction.activeMemberAdmission:
+  let result = and($html, $directChild, not($duplicate))
+
+# 0 ignore an inactive child, 1 retain the first active child, 2 clear an extra active child.
+process interaction.activeMemberInitial:
+  let result = if($active, if($hasPrevious, 2, 1), 0)
+
+process interaction.observationHandle:
+  port number.calculate { operation = "lessEqual"; values = list(2048, $count) } → full
+  let result = { allocate = not($known); evict = and(not($known), $full) }
+
+process interaction.descriptionCards:
+  port number.calculate { operation = "lessEqual"; values = list($count, 128) } → bounded
+  let result = $bounded
+
+process interaction.descriptionBinding:
+  let result = and($summary, $button, $panelMatches)
+
+process interaction.timingIntervals:
+  port number.calculate { operation = "subtract"; values = list($enqueued, $started) } → input
+  port number.calculate { operation = "subtract"; values = list($ended, $dispatched) } → dispatch
+  port number.calculate { operation = "subtract"; values = list($ended, $started) } → total
+  port number.calculate { operation = "subtract"; values = list(if($hasDispatch, $dispatched, $ended), $started) } → queue
+  port number.calculate { operation = "subtract"; values = list($revealed, $started) } → reveal
+  let result = { input = $input; dispatch = $dispatch; total = $total; queue = $queue; reveal = $reveal }
+
+process interaction.timingAge:
+  port number.calculate { operation = "subtract"; values = list($now, $recordedAt) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 1000) } → seconds
+  port number.calculate { operation = "floor"; values = list($seconds) } → whole
+  port number.calculate { operation = "max"; values = list(0, $whole) } → age
+  let result = $age
+
+process interaction.timingHost:
+  port number.calculate { operation = "subtract"; values = list($host, $exchange) } → net
+  port number.calculate { operation = "max"; values = list(0, $net) } → native
+  let result = $native
+
+process interaction.timingBlocker:
+  port number.calculate { operation = "max"; values = list($enqueued, $dispatched) } → start
+  port number.calculate { operation = "subtract"; values = list($ended, $start) } → overlap
+  port number.calculate { operation = "subtract"; values = list($start, $started) } → offset
+  port number.calculate { operation = "less"; values = list($count, 12) } → keep
+  let result = { overlap = $overlap; offset = $offset; keep = $keep }
+
+process interaction.timingEffectRequest:
+  let result = if(eq($port, "browser.request"), true, eq($port, "browser.frontGateStatus"))
+
+process interaction.timingEffectSample:
+  port number.calculate { operation = "subtract"; values = list($ended, $effectStarted) } → elapsed
+  port number.calculate { operation = "subtract"; values = list($effectStarted, $started) } → offset
+  port number.calculate { operation = "less"; values = list($count, 48) } → keep
+  let result = { elapsed = $elapsed; offset = $offset; keep = $keep;
+    revealed = and(not($previousReveal), $hasReveal) }
+
+process interaction.timingResponse:
+  port number.calculate { operation = "subtract"; values = list($ended, $requestStarted) } → elapsed
+  port number.calculate { operation = "lessEqual"; values = list(500, $status) } → failed
+  let result = { elapsed = $elapsed; failed = $failed }
+
+process interaction.timingFailure:
+  let result = if($request, "Request failed", "Browser action failed")
+
+process interaction.timingEvict:
+  port number.calculate { operation = "less"; values = list(30, $count) } → evict
+  let result = $evict
+
+process interaction.retryAt:
+  let result = if($enabled, add($now, $delay), 0)
+
+process interaction.backoff:
+  let limit = if($hasPanel, 60000, 5000)
+  let doubled = add($delay, $delay)
+  port number.calculate { operation = "less"; values = list($doubled, $limit) } → belowLimit
+  let result = if($belowLimit, $doubled, $limit)
+
+process interaction.retryPlan:
+  call interaction.retryAt
+  let retryTimestamp = $result
+  call interaction.backoff
+  let scheduled = not(eq($retryTimestamp, 0))
+  let result = { at = $retryTimestamp; schedule = $scheduled; nextDelay = if($scheduled, $result, $delay);
+    state = if($enabled, "reconnecting", "disconnected"); countdownInterval = if($hasPanel, 1000, 0);
+    panelState = "disconnected"; wait = if($scheduled, $delay, 0) }
+
+process interaction.retryAllowed:
+  port number.calculate { operation = "subtract"; values = list($now, $lastAttempt) } → elapsed
+  port number.calculate { operation = "lessEqual"; values = list(10000, $elapsed) } → cooldownElapsed
+  let result = and(not($hasSocket), if($hasAttempt, $cooldownElapsed, true))
+
+# 0 invalid declaration, 1 already consumed, 2 capacity, 3 admit.
+process interaction.startupReceiver:
+  let key = $receiver
+  call interaction.startupKey
+  let validReceiver = $result
+  port number.calculate { operation = "lessEqual"; values = list($paths, 8) } → pathsBounded
+  port number.calculate { operation = "lessEqual"; values = list($hashes, 8) } → hashesBounded
+  port number.calculate { operation = "lessEqual"; values = list($encoded, 8) } → encodedBounded
+  port number.calculate { operation = "less"; values = list($used, 16) } → room
+  let valid = and($validReceiver, $arrays, $pathsBounded, $hashesBounded, $encodedBounded)
+  let result = if($valid, if($seen, 1, if($room, 3, 2)), 0)
+
+process interaction.startupRoute:
+  let hadInput = if($hasSearch, true, $hasHash)
+  let result = { hadInput = $hadInput; launchHash = and($pathAllowed, $hashAllowed) }
+
+# 0 omit, 1 return text, 2 URL-encode the field.
+process interaction.startupField:
+  call interaction.startupKey
+  let result = if($result, if($encoded, 2, 1), 0)
+
+process interaction.startupKey:
+  port text.matches { value = $key; pattern = "\\A[a-z][a-z0-9-]{0,31}\\z" } → valid
+  let result = $valid
+
+process interaction.startupFields:
+  port number.calculate { operation = "lessEqual"; values = list($length, 4096) } → boundedText
+  port number.calculate { operation = "lessEqual"; values = list($count, 16) } → boundedCount
+  let result = and($unique, $boundedText, $boundedCount)
+
+# 0 keep the URL, 1 consume the query, 2 consume the query and admitted hash.
+process interaction.startupCleanup:
+  let result = if(and($consume, $samePath), if($sameLaunchHash, 2, if($hasSearch, 1, 0)), 0)
+
+process interaction.sessionRequestAllowed:
+  let result = and(not($inFlight), not($pending))
+
+process interaction.sessionRetry:
+  port number.calculate { operation = "lessEqual"; values = list(502, $status) } → low
+  port number.calculate { operation = "lessEqual"; values = list($status, 504) } → high
+  let retryable = if($received, and($low, $high), true)
+  let result = and(not($aborted), $retryable)
+
+process interaction.sessionFields:
+  let result = { identityLimit = if($identityText, 1024, 0); usernameLimit = if($usernameText, 1024, 0);
+    xAvailable = $xAvailable }
+
+process interaction.queueHasRoom:
+  port number.calculate { operation = "less"; values = list($queued, 64) } → result
+  let result = $result
+
+process interaction.canDispatch:
+  let result = and(not($busy), $hasQueued, $socketOpen)
+
+# A fetch result belongs to the socket that started the observation.
+process interaction.canDeliverObservation:
+  call interaction.queueHasRoom
+  let result = and(not($aborted), $sameSocket, $socketOpen, $result)
+
+process interaction.observationReply:
+  let result = eq($status, 200)
+
+# 0 ordinary completion, 1 ready, 2 close and retry startup.
+process interaction.bootCompletion:
+  let close = and($booting, $reconnect, $failed)
+  let ready = and($booting, not($close))
+  let result = { close = $close; ready = $ready; status = if($ready, "ready", "") }
+
+process interaction.startupTimedOut:
+  let close = and($sameSocket, $booting)
+  let reason = if($close, "The workspace did not finish connecting within 15 seconds.", "")
+  let result = { close = $close; reason = $reason }
+
+process interaction.asterAttempt:
+  port number.calculate { operation = "less"; values = list($attempt, 3) } → remaining
+  let result = and(not($aborted), $remaining)
+
+process interaction.asterRetryDelay:
+  let next = add($attempt, 1)
+  port number.calculate { operation = "multiply"; values = list(350, $next) } → delay
+  let result = if($aborted, 0, $delay)
+
+process interaction.asterResponse:
+  let result = and($ok, eq($mediaType, "text/event-stream"), $hasBody)
+
+# 0 ignore, 1 event name, 2 payload line. Skip the colon and its optional space.
+process interaction.asterField:
+  let kind = if(and(not($eventPresent), eq($field, "event")), 1, if(eq($field, "data"), 2, 0))
+  let skip = if($hasColon, if($space, 2, 1), 0)
+  let result = { kind = $kind; skip = $skip }
+
+# 0 ignore, 1 update, 2 finish.
+process interaction.asterFrameKind:
+  let result = if(eq($name, "update"), 1, if(eq($name, "done"), 2, 0))
+
+process interaction.asterThreadMatches:
+  let result = and(not(eq($expected, "")), eq($expected, $observed))
+
+# 0 keep the stream, 1 cancel it, 2 start the admitted watch.
+process interaction.asterWatchAction:
+  call interaction.asterThreadMatches
+  let result = if($sameMarker, 0, if(and($hasWatch, $result), 2, 1))
+
+process interaction.delayLimit:
+  let result = 5000
+
+process interaction.fileLimit:
+  let result = 3000000
+
+process interaction.transportLimits:
+  call interaction.delayLimit
+  let delay = $result
+  call interaction.fileLimit
+  let result = { requestDeadline = 5000; asterDeadline = 300000; delayLimit = $delay; fileLimit = $result }
+
+process interaction.delayAllowed:
+  call interaction.delayLimit
+  port number.calculate { operation = "lessEqual"; values = list($milliseconds, $result) } → bounded
+  port number.calculate { operation = "lessEqual"; values = list(0, $milliseconds) } → nonnegative
+  let result = and($integer, $bounded, $nonnegative)
+
+# 0 read, 1 invalid input or declared bound, 2 missing or oversized file.
+process interaction.fileReadAction:
+  call interaction.fileLimit
+  port number.calculate { operation = "lessEqual"; values = list($maxBytes, $result) } → bounded
+  port number.calculate { operation = "lessEqual"; values = list(1, $maxBytes) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($size, $maxBytes) } → fits
+  let result = if(and($fileInput, $integer, $bounded, $positive), if(and($hasFile, $fits), 0, 2), 1)
+
+process interaction.overlayPlacement:
+  port number.calculate { operation = "subtract"; values = list($viewportHeight, 8) } → bottomEdge
+  port number.calculate { operation = "less"; values = list($bottomEdge, add($anchorBottom, $height)) } → wouldOverflow
+  port number.calculate { operation = "subtract"; values = list($anchorTop, $height) } → above
+  let y = if($anchored, if($wouldOverflow, $above, $anchorBottom), $pointY)
+  port number.calculate { operation = "subtract"; values = list($viewportWidth, $width) } → right
+  port number.calculate { operation = "subtract"; values = list($right, 8) } → rightEdge
+  port number.calculate { operation = "subtract"; values = list($viewportHeight, $height) } → lower
+  port number.calculate { operation = "subtract"; values = list($lower, 8) } → lowerEdge
+  port number.calculate { operation = "min"; values = list($pointX, $rightEdge) } → xFit
+  port number.calculate { operation = "min"; values = list($y, $lowerEdge) } → yFit
+  port number.calculate { operation = "max"; values = list(8, $xFit) } → left
+  port number.calculate { operation = "max"; values = list(8, $yFit) } → top
+  let result = { left = $left; top = $top }
+
+process interaction.eventAdmission:
+  let matched = if($delegated, $withinScope, true)
+  let ordinary = and($primary, not($modified), not($alreadyPrevented))
+  let admitted = and(not($excluded), $matched, if($unmodified, $ordinary, true))
+  let suppress = if($preventDefault, true, $preventKey)
+  let result = { prevent = and($admitted, $suppress); dispatch = and($admitted, not($waitingForBoot)) }
+
+process interaction.canPoll:
+  let result = and(not($busy), not($queued), $socketOpen)
+
+process interaction.intervalSelector:
+  let global = if(eq($ref, "window"), true, eq($ref, "document"))
+  let result = and(not($nullRef), not($global))
+
+process interaction.intervalDispatch:
+  let result = if($scoped, $visible, true)
+
+process interaction.intervalAllowed:
+  port number.calculate { operation = "lessEqual"; values = list(500, $milliseconds) } → aboveMinimum
+  port number.calculate { operation = "lessEqual"; values = list($milliseconds, 60000) } → belowMaximum
+  let result = and($whole, $aboveMinimum, $belowMaximum)
+
+# 0 normal event binding, 1 observe access, 2 observe session, 3/4 invalid trigger.
+process interaction.workspaceObservationTrigger:
+  let window = eq($ref, "window")
+  let access = eq($event, "workspace-access")
+  let session = if(eq($event, "focus"), true, eq($event, "pageshow"))
+  let result = if($access, if(and($window, $booting), 1, 3),
+    if($backgroundSession, if(and($window, $session), 2, 4), 0))
+
+process interaction.sessionObservation:
+  let phase = if($initial, $booting, and(not($booting), $socketOpen))
+  let result = and(not($leaving), $phase)
+
+process interaction.batchLength:
+  port number.calculate { operation = "lessEqual"; values = list(1, $count) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($count, 64) } → bounded
+  let result = and($array, $nonempty, $bounded)
+
+process interaction.bootBatchAllowed:
+  call interaction.batchLength
+  let result = and($booting, $result)
+
+process interaction.preflightPlain:
+  let result = and(not($hasSearch), not($hasHash), $sameLocation)
+
+# 0 refuse, 1 skip a stale startup read, 2 startup, 3 location, 4 ordinary observation.
+process interaction.preflightRead:
+  let local = if(eq($port, "dom.exists"), true, if(eq($port, "browser.property"), true,
+    if(eq($port, "storage.read"), true, eq($port, "state.get"))))
+  let result = if(eq($port, "browser.startup"), if($plain, 2, 1),
+    if(eq($port, "browser.location"), if($plain, 3, 1), if($local, 4, 0)))
+
+# 0 refuse, 1 confirm cached startup, 2 run a deferred effect.
+process interaction.deferredBootEffect:
+  let action = 0
+  when eq($port, "browser.startup"):
+    let action = 1
+  when eq($port, "browser.asterStream"):
+    let action = 2
+  when eq($port, "browser.countdown"):
+    let action = 2
+  when eq($port, "browser.on"):
+    let action = 2
+  when eq($port, "browser.onMany"):
+    let action = 2
+  when eq($port, "browser.activeGroup"):
+    let action = 2
+  when eq($port, "browser.appDescriptions"):
+    let action = 2
+  when eq($port, "browser.copyText"):
+    let action = 2
+  when eq($port, "browser.guard"):
+    let action = 2
+  when eq($port, "browser.write"):
+    let action = 2
+  when eq($port, "browser.attribute"):
+    let action = 2
+  when eq($port, "browser.content"):
+    let action = 2
+  when eq($port, "state.set"):
+    let action = 2
+  let result = $action
+
+process interaction.bootStartupMatches:
+  let result = and($sameFirst, $samePath, not($hadInput), not($hasHash), not($hasFields))
+
+# 0 finish the batch, 1 refuse the follow-up, 2 invoke it.
+process interaction.followupBootEffect:
+  let allowed = and($known, not(eq($port, "browser.bootEffects")), not(eq($port, "browser.preflight")))
+  let result = if($present, if($allowed, 2, 1), 0)
+
+process interaction.domWriteProperty:
+  let result = not(and(not(eq($name, "value")), not(eq($name, "checked")), not(eq($name, "disabled")),
+    not(eq($name, "hidden")), not(eq($name, "readOnly")), not(eq($name, "tabIndex")), not(eq($name, "textContent")),
+    not(eq($name, "className")), not(eq($name, "open")), not(eq($name, "max")), not(eq($name, "min")), not(eq($name, "title"))))
+
+# 0 refuse, 1 remove, 2 set the value, 3 stringify the Boolean, 4 set true, 5 check PNG source.
+process interaction.domAttribute:
+  port text.matches { value = $name; pattern = "\\Adata-[a-z][a-z0-9-]{0,63}\\z" } → dataName
+  let current = and(eq($name, "aria-current"), $anchor, if($page, true, $nullValue))
+  let pressed = and(eq($name, "aria-pressed"), $boolean)
+  let data = and($dataName, $boolean)
+  let imageSource = and(eq($name, "src"), $image)
+  let sourceAction = if($nullValue, 1, 5)
+  let result = if($current, if($nullValue, 1, 2), if($pressed, 3, if($data, if($valueTrue, 4, 1),
+    if($imageSource, $sourceAction, 0))))
+
+process interaction.pngPayloadOffset:
+  port text.startsWith { value = $head; search = "data:image/png;base64," } → png
+  let offset = 22
+  port number.calculate { operation = "less"; values = list($offset, $length) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($length, 131072) } → bounded
+  let result = if(and($png, $nonempty, $bounded), $offset, 0)
+
+process interaction.pngPayloadChunk:
+  port text.matches { value = $chunk; pattern = "\\A[A-Za-z0-9+/=]{1,128}\\z" } → valid
+  let result = $valid
+
+process interaction.clipboardControl:
+  call interaction.activeMemberId
+  let result = $result
+
+process interaction.timingLabelAllowed:
+  port number.calculate { operation = "lessEqual"; values = list(1, $length) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($length, 80) } → bounded
+  let result = and($click, $text, $nonempty, $bounded)
+
+process interaction.timingTarget:
+  port text.matches { value = $id; pattern = "\\A#[a-z0-9-]{1,100}\\z" } → valid
+  let result = $valid
+
+process interaction.launchId:
+  port text.matches { value = $id; pattern = "\\A[0-9]{1,16}\\z" } → valid
+  let result = $valid
+
+process interaction.clipboardTrigger:
+  let result = and($trusted, $matches)
+
+process interaction.clipboardSelection:
+  port number.calculate { operation = "less"; values = list(0, $length) } → present
+  port number.calculate { operation = "lessEqual"; values = list($length, 96000) } → bounded
+  let result = and($readOnly, $feedback, $present, $bounded)
+
+process interaction.clipboardNotice:
+  let result = if($copied, "Copied to clipboard.", "Use your device’s Copy command to copy the selected text.")
+
+process interaction.storageInTab:
+  let result = eq($scope, "tab")
+
+process interaction.storageReadAllowed:
+  port number.calculate { operation = "less"; values = list($limit, $length) } → tooLong
+  let result = not(and($present, $tooLong))
+
+process interaction.documentStateKey:
+  port number.calculate { operation = "lessEqual"; values = list($length, 512) } → bounded
+  let result = and($text, $bounded)
+
+process interaction.documentStateAdmission:
+  let size = if($remove, 0, add($keyLength, $valueLength))
+  port number.calculate { operation = "subtract"; values = list($used, $previousSize) } → remaining
+  let total = add($remaining, $size)
+  port number.calculate { operation = "lessEqual"; values = list($total, 4000000) } → bytesAllowed
+  port number.calculate { operation = "less"; values = list($count, 64) } → entryAllowed
+  let needsEntry = and(not(eq($size, 0)), not($existing))
+  let result = { total = $total; allowed = and($bytesAllowed, if($needsEntry, $entryAllowed, true)); size = $size }
+
+# 0 accept, 1 invalid or repeated field, 2 observation too large.
+process interaction.formField:
+  port text.matches { value = $name; pattern = "\\A[A-Za-z0-9_-]{1,80}\\z" } → validName
+  port number.calculate { operation = "less"; values = list($count, 64) } → hasRoom
+  let valid = and($validName, $text, not($repeated), $hasRoom)
+  let next = add(add($used, $nameLength), $valueLength)
+  port number.calculate { operation = "lessEqual"; values = list($next, 16384) } → bounded
+  let result = { action = if($valid, if($bounded, 0, 2), 1); size = $next }
+
+process interaction.fileSizeBatch:
+  port number.calculate { operation = "lessEqual"; values = list($count, 8192) } → bounded
+  let result = and($array, $bounded)
+
+process interaction.fileSize:
+  port number.calculate { operation = "lessEqual"; values = list(0, $bytes) } → nonnegative
+  let valid = and($safeInteger, $nonnegative)
+  let unit = 0
+  let scaled = $bytes
+  port number.calculate { operation = "lessEqual"; values = list(1000, $scaled) } → useKilobytes
+  when and($valid, $useKilobytes):
+    let unit = 1
+    port number.calculate { operation = "divide"; values = list($scaled, 1000) } → scaled
+    port number.calculate { operation = "lessEqual"; values = list(999.95, $scaled) } → useMegabytes
+    when $useMegabytes:
+      let unit = 2
+      port number.calculate { operation = "divide"; values = list($scaled, 1000) } → scaled
+      port number.calculate { operation = "lessEqual"; values = list(999.95, $scaled) } → useGigabytes
+      when $useGigabytes:
+        let unit = 3
+        port number.calculate { operation = "divide"; values = list($scaled, 1000) } → scaled
+        port number.calculate { operation = "lessEqual"; values = list(999.95, $scaled) } → useTerabytes
+        when $useTerabytes:
+          let unit = 4
+          port number.calculate { operation = "divide"; values = list($scaled, 1000) } → scaled
+          port number.calculate { operation = "lessEqual"; values = list(999.95, $scaled) } → usePetabytes
+          when $usePetabytes:
+            let unit = 5
+            port number.calculate { operation = "divide"; values = list($scaled, 1000) } → scaled
+  let result = { valid = $valid; scaled = $scaled; unit = $unit }
+
+process interaction.connectionView:
+  let label = if(eq($state, "ready"), "Connected", if(eq($state, "connecting"), "Connecting…", "Offline"))
+  port number.calculate { operation = "subtract"; values = list($retryAt, $now) } → remaining
+  port number.calculate { operation = "divide"; values = list($remaining, 1000) } → seconds
+  port number.calculate { operation = "ceil"; values = list($seconds) } → rounded
+  port number.calculate { operation = "max"; values = list(0, $rounded) } → countdown
+  let scheduled = not(eq($retryAt, 0))
+  let prefix = if($scheduled, "Retry in ", "")
+  let suffix = if($scheduled, "s", "")
+  let retryTitle = if($manualRetry, "Connect to ", "Wait at least 10 seconds between connection attempts.")
+  let result = { label = $label; prefix = $prefix; countdown = $countdown; suffix = $suffix;
+    showRetry = eq($state, "disconnected"); retryTitle = $retryTitle }
+
+process interaction.disconnectPlan:
+  let lost = and(not($socketReason), eq($code, 1006))
+  let lostMessage = "Connection lost without a close reason (code 1006)."
+  let prefix = if($socketReason, "Connection closed (", if($lost, $lostMessage, "Connection closed (code "))
+  let suffix = if($socketReason, "). ", if($lost, "", ")."))
+  let publish = not($leaving)
+  let showNotice = and(not($hasPanel), $publish)
+  let retryMessage = "Browser session disconnected. Reconnecting…"
+  let reloadMessage = "Browser session disconnected. Reload to reconnect."
+  let notice = if($showNotice, if($reconnect, $retryMessage, $reloadMessage), "")
+  let result = { publish = $publish; preserveReason = $storedReason; includeCode = not($lost);
+    includeSocketReason = $socketReason; prefix = $prefix; suffix = $suffix; notice = $notice;
+    logNotice = and($showNotice, not($reconnect)) }
+
+process interaction.startupFailureNotice:
+  let result = { prefix = "Workspace startup failed. "; report = not($hasPanel) }
+
+process interaction.holdStartupSubmit:
+  let result = and($reconnect, $booting)
+
+process interaction.connectionOpen:
+  let open = and(not($leaving), not($hasSocket))
+  let result = { open = $open; status = if($open, "connecting", "") }
+
+process interaction.historyResume:
+  let resume = and($persisted, $leaving)
+  let result = { resume = $resume; waitForClose = and($resume, $hasSocket) }
+
+process interaction.connectionProfile:
+  let reconnect = if($hasPanel, true, if($homeAster, true, $requestedReconnect))
+  let result = { reconnect = $reconnect; firstDelay = if($hasPanel, 10000, 250);
+    startupTimeout = if($reconnect, 15000, 0) }
+
+process interaction.socketReplyAllowed:
+  let result = and($sameSocket, $socketOpen)
+
+process interaction.agentInvocationAllowed:
+  call interaction.queueHasRoom
+  let result = and($sameSocket, $socketOpen, $result)
+
+# Zero refuses the port. A DOM existence result (1) is the only kind of guard.
+process interaction.batchPort:
+  let result = if(eq($port, "dom.exists"), 1, if(eq($port, "browser.property"), 2,
+    if(eq($port, "browser.write"), 3, if(eq($port, "browser.attribute"), 4,
+      if(eq($port, "browser.focus"), 5, if(eq($port, "browser.activate"), 6, 0))))))
+
+# 0 admit, 1 invalid step, 2 invalid observation.
+process interaction.batchStep:
+  port text.matches { value = $key; pattern = "\\A[a-z][a-zA-Z0-9]{0,39}\\z" } → validKey
+  let knownPort = not(eq($port, 0))
+  let validGuard = if($conditional, eq($guardPort, 1), true)
+  let validStep = and($knownPort, $record, $validGuard)
+  let validSave = if($save, and($validKey, not($duplicate), not($conditional)), true)
+  let result = if($validStep, if($validSave, 0, 2), 1)
+
+process interaction.batchExecute:
+  let result = not(and($conditional, $observed))
+
+process interaction.markReveal:
+  let dialog = and(eq($port, "browser.dialog"), $open)
+  let write = and(eq($port, "browser.write"), $unhide)
+  let result = and($matchingTarget, if($dialog, true, $write))
+
+# 0 keep the watch, 1 clear an invalid watch, 2 admit a new watch.
+process interaction.asterCredential:
+  port text.matches { value = $thread; pattern = "\\A[a-f0-9]{32}\\z" } → threadValid
+  port text.matches { value = $bearer; pattern = "\\A[A-Za-z0-9_-]{43}\\z" } → current
+  port text.matches { value = $bearer; pattern = "\\A[a-f0-9]{64}\\z" } → previous
+  let bearerValid = if($current, true, $previous)
+  let result = if($capture, if(and($threadValid, $bearerValid), 2, 1), 0)
+
+# 0 wait for more data, 1 parse the frame, 2 reject an oversized buffer.
+# A CR normalized at the end of the previous chunk already accounts for a leading LF.
+process interaction.asterChunkBoundary:
+  let result = { skip = if(and($previousCR, $leadingLF), 1, 0); carryCR = $trailingCR }
+
+process interaction.asterBuffer:
+  let complete = not(eq($boundary, -1))
+  let length = if($complete, $boundary, $pending)
+  port number.calculate { operation = "lessEqual"; values = list($length, 131072) } → bounded
+  let result = if($bounded, if($complete, 1, 0), 2)
+
+# 0 reject a mismatched thread, 1 emit an update, 2 emit and finish.
+process interaction.asterDispatchFrame:
+  call interaction.asterThreadMatches
+  let result = if($result, $action, 0)
+
+# 0 report a full queue, 1 replace the pending update, 2 enqueue.
+process interaction.asterQueueAction:
+  let result = if($pending, 1, if($room, 2, 0))
+
+# 0 no action, 1 show, 2 hide, 3 keep the preview open on click.
+process interaction.descriptionTransition:
+  let action = 0
+  let delay = 0
+  let nextPreview = $preview
+  when and(eq($event, "enter"), $mouse, not($open)):
+    let action = 1
+    let delay = 180
+  when and(eq($event, "leave"), $preview):
+    let action = 2
+    let delay = 180
+  when and(eq($event, "show"), not($hidden), not($open)):
+    let action = 1
+    let nextPreview = true
+  when eq($event, "hide"):
+    let action = 2
+  when eq($event, "closed"):
+    let nextPreview = false
+  when and(eq($event, "click"), $preview):
+    let action = 3
+    let nextPreview = false
+  let result = { action = $action; delay = $delay; preview = $nextPreview }
+
+# 0 no measurement, 1 hide the button, 2 show it, 3 close the popover and hide the button.
+process interaction.descriptionLayout:
+  port number.calculate { operation = "less"; values = list(add($height, 1), $scrollHeight) } → overflow
+  let result = if(eq($height, 0), 0, if($overflow, 2, if($open, 3, 1)))
+
+# 0 ordinary request, 1 unsupported method, 2 replace the session observation, 3 scoped stream only.
+process interaction.requestRoute:
+  let supported = if(eq($method, "GET"), true, eq($method, "POST"))
+  let session = if(eq($path, "/workspace/session"), true, eq($path, "/workspace/sign-out"))
+  let stream = eq($path, "/workspace/aster/events")
+  let result = if($supported, if($session, 2, if($stream, 3, 0)), 1)
+
+process interaction.requestForm:
+  let limit = if($mobileOffer, 65536, if(eq($path, "/workspace/formation/records"), 32768, 16384))
+  port number.calculate { operation = "lessEqual"; values = list($length, $limit) } → bounded
+  let result = $bounded
+
+process interaction.requestQuery:
+  port number.calculate { operation = "lessEqual"; values = list($count, 8) } → bounded
+  let result = $bounded
+
+process interaction.queryField:
+  port text.matches { value = $key; pattern = "\\A[A-Za-z0-9_-]{1,64}\\z" } → validKey
+  port number.calculate { operation = "lessEqual"; values = list($length, 1024) } → bounded
+  let result = and($validKey, $text, $bounded)
+
+# 0 text, 1 extract a fragment, 2 strip Aster capabilities, 3 capture the admitted Aster watch.
+process interaction.requestResponse:
+  let chat = eq($path, "/identity-management/aster/")
+  let view = and(eq($path, "/identity-management/"), $asterView)
+  let capture = and($chat, $ok, $subscription)
+  let result = if($capture, 3, if(if($chat, true, $view), 2, if($fragment, 1, 0)))
+
+# 0 omit authorization, 1 send the bearer, 2 refuse.
+process interaction.requestBearer:
+  port text.matches { value = $bearer; pattern = "\\A[A-Za-z0-9_-]{1,128}\\z" } → valid
+  let result = if($present, if($valid, 1, 2), 0)
+
+process interaction.frontGatePort:
+  port number.calculate { operation = "lessEqual"; values = list(1024, $port) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($port, 65535) } → maximum
+  let result = and($integer, $canonical, $minimum, $maximum)
+
+# 0 wait for Home, 1 import immediately, 2 import on an idle callback, 3 import on a timer.
+process interaction.asterStartupPlan:
+  let explicit = if($connected, if(eq($view, "aster"), true, $restored), true)
+  let settled = if($ready, true, $deadline)
+  let action = if($explicit, 1, if($settled, if($idle, 2, 3), 0))
+  let result = { action = $action; delay = if(eq($action, 0), 2500, if(eq($action, 2), 750, 0)) }
+
+process interaction.asterStartupCoordinates:
+  let result = { bridge = "/_aster/browser.mjs?wasm=1"; panel = "[data-home-connection]";
+    view = "view"; openKey = "sourcery.aster.open"; openValue = "1"; stateAttribute = "data-state"; ready = "ready" }

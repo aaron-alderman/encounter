@@ -1,0 +1,90 @@
+process-module "temple/surface-process-module/1"
+
+process workspaceStorage.rootPlan:
+  let input = $eventInput
+  port value.type { value = $input.root } → rootType
+  port value.type { value = $input.allowedRoot } → allowedType
+  assert and(eq($rootType, "string"), eq($allowedType, "string"))
+    otherwise "Self-hosted workspace roots must be absolute paths."
+  port text.matches { value = $input.root; pattern = "\\A/[^\\x00]*\\z" } → rootAbsolute
+  port text.matches { value = $input.allowedRoot; pattern = "\\A/[^\\x00]*\\z" } → allowedAbsolute
+  assert and($rootAbsolute, $allowedAbsolute)
+    otherwise "Self-hosted workspace roots must be absolute paths."
+  port path.resolvePosix { base = "/"; path = $input.root } → root
+  port path.resolvePosix { base = "/"; path = $input.allowedRoot } → allowed
+  let prefix = if(eq($allowed, "/"), "/", concat($allowed, "/"))
+  port text.startsWith { value = $root; search = $prefix } → contained
+  port text.slice { value = $root; start = count($prefix) } → name
+  port text.matches { value = $name; pattern = "\\A[^/]+\\z" } → direct
+  assert and($contained, $direct)
+    otherwise "Self-hosted workspace root must be an immediate child of its private state root."
+  let result = { root = $root; allowedRoot = $allowed; child = $name }
+
+process workspaceStorage.fileSystem:
+  let input = $eventInput
+  port value.type { value = $input } → kind
+  port number.calculate { operation = "greaterEqual"; values = list($input, -9007199254740991) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($input, 9007199254740991) } → maximum
+  assert and(eq($kind, "number"), $minimum, $maximum, not(includes(list(16914836, 2240043254), $input)))
+    otherwise "Self-hosted workspaces require a non-memory filesystem."
+  let result = true
+
+process workspaceStorage.durability:
+  let input = $eventInput
+  assert eq($input.reopened, true)
+    otherwise "Self-hosted workspace durability probe did not survive reopen."
+  let protocol = "sourcery.hosted/self-hosted-workspace.v1"
+  port value.string { value = $input.fileSystemType } → fileSystem
+  let basis = concat($protocol, "\u0000", $input.root, "\u0000", $input.device, "\u0000", $fileSystem)
+  port digest.sha256 { text = $basis } → identity
+  let result = { protocol = $protocol; status = "ready"; storageIdentity = concat("self-hosted-volume.", $identity);
+    sharedAcrossReplicas = true; restartSafe = true; root = $input.root; fileSystemType = $input.fileSystemType;
+    durabilityProbe = "file-and-directory-fsync-reopen-delete-fsync"; directoryMetadataSynchronized = true }
+
+process workspaceStorage.namespacePath:
+  let input = $eventInput
+  let result = concat("tenants/", $input.tenantId, "/workspaces/", $input.workspaceId)
+
+process workspaceStorage.namespace:
+  let input = $eventInput
+  port kernel.invoke { query = "workspaceStorage.namespacePath"; input = $input } → result
+  assert eq($input.storageNamespace, $result)
+    otherwise "Workspace storage namespace does not match its immutable tenant/workspace lineage."
+
+process workspaceStorage.invalidNamespace:
+  fold $eventInput as workspace; invalid starts null:
+    let next = $invalid
+    when eq($invalid, null):
+      port kernel.invoke { query = "workspaceStorage.namespacePath"; input = $workspace } → expected
+      when not(eq($workspace.storageNamespace, $expected)):
+        let next = { workspaceId = $workspace.workspaceId }
+    yield $next → result
+
+process workspaceStorage.allocation:
+  let input = $eventInput
+  let workspaceId = if(and(eq($input.operation, "provision"), $input.id), $input.id, $input.workspaceId)
+  each list($input.tenantId, $input.appId, $input.projectId, $workspaceId) as id:
+    port value.type { value = $id } → kind
+    assert eq($kind, "string")
+      otherwise "Workspace requires canonical hosted resource identities."
+    port text.matches { value = $id; pattern = "\\A[a-z]+_[a-z0-9_-]+\\z" } → valid
+    assert $valid
+      otherwise "Workspace requires canonical hosted resource identities."
+  port kernel.invoke { query = "workspaceStorage.namespace"; input = { tenantId = $input.tenantId; workspaceId = $workspaceId;
+    storageNamespace = $input.storageNamespace } } → namespace
+  let identity = { tenantId = $input.tenantId; appId = $input.appId; projectId = $input.projectId;
+    workspaceId = $workspaceId; storageNamespace = $namespace }
+  let marker = { schemaVersion = 1; tenantId = $input.tenantId; appId = $input.appId; projectId = $input.projectId;
+    workspaceId = $workspaceId; storageNamespace = $namespace }
+  port json.stringify { value = $marker } → serialized
+  let result = { identity = $identity; marker = concat($serialized, "\n") }
+
+process workspaceStorage.retained:
+  let input = $eventInput
+  when eq($input.operation, "provision"):
+    assert eq($input.expected, $input.observed)
+      otherwise "Existing workspace allocation marker has different lineage."
+  when eq($input.operation, "resolve"):
+    assert eq($input.expected, $input.observed)
+      otherwise "Workspace allocation marker does not match the checked routing target."
+  let result = true

@@ -1,0 +1,55 @@
+process-module "temple/surface-process-module/1"
+
+process hostedRevocation.target:
+  let input = $eventInput
+  assert includes(list("session", "personal-credential", "tenant-credential"), $input.operation)
+    otherwise "Unsupported hosted revocation operation."
+  let principal = $input.principal
+  port value.type { value = at($principal, "userId") } → user
+  when not(and(eq(at($principal, "kind"), "user"), eq($user, "string"))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "user-required";
+      message = "This operation requires an authenticated hosted user." } } → denied
+  let session = eq($input.operation, "session")
+  let id = if(and($session, not($input.explicitId)), $principal.sessionId, $input.id)
+  let result = { id = $id; session = $session; collection = if($session, "sessions", "developerCredentials") }
+
+process hostedRevocation.plan:
+  let input = $eventInput
+  let principal = $input.principal
+  let record = $input.record
+  let session = $input.target.session
+  let personal = eq($input.operation, "personal-credential")
+  when eq($input.operation, "tenant-credential"):
+    port kernel.invoke { query = "controlAccess.authorize"; input = { tenantId = $input.tenantId; principal = $principal;
+      membership = $input.membership; permission = "credential.manage"; scope = {} } } → tenantAccess
+  when not(and($record, eq($record.id, $input.target.id),
+    or($session, and(eq($record.tenantId, $input.tenantId), or(not($personal), eq($record.subjectUserId, $principal.userId)))))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "not-found";
+      message = if($session, "Session was not found.", "Developer credential was not found.") } } → denied
+  when and($session, not(eq($record.userId, $principal.userId))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+      message = "A user may revoke only their own session." } } → denied
+  let revokedAt = if($record.revokedAt, $record.revokedAt, $input.occurredAt)
+  let action = if($session, "identity.session.revoked",
+    if($personal, "developerCredential.personal.revoked", "developerCredential.revoked"))
+  let audit = { id = $input.auditId; occurredAt = $input.occurredAt; actorKind = "user";
+    actorId = or($principal.userId, "system"); tenantId = if($session, null, $input.tenantId);
+    action = $action; resourceType = if($session, "session", "developerCredential"); resourceId = $record.id; metadata = {} }
+  let response = { id = $record.id; revokedAt = $revokedAt }
+  when not($session):
+    port record.entries { value = $record } → entries
+    let public = filter($entries, "entry", not(or(eq(at($entry, 0), "tokenDigest"),
+      and($personal, eq(at($entry, 0), "subjectUserId")))))
+    port record.fromEntries { entries = $public } → response
+    port record.put { record = $response; key = "revokedAt"; value = $revokedAt } → response
+  let result = { revokedAt = $revokedAt; audit = $audit; response = $response }
+
+process hostedRevocation.snapshot:
+  let state = $eventInput
+  port kernel.invoke { query = "controlAccess.databaseSnapshot"; input = $state } → revision
+  port number.calculate { operation = "lessEqual"; values = list($state.matches, 1) } → unique
+  port number.calculate { operation = "lessEqual"; values = list(count($state.memberships), 1) } → member
+  port number.calculate { operation = "less"; values = list($state.rowRevision, 9007199254740991) } → advance
+  assert and($unique, $member, $advance)
+    otherwise "Hosted revocation snapshot is ambiguous or cannot advance."
+  let result = $state.rowRevision

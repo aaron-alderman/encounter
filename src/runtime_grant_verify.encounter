@@ -1,0 +1,118 @@
+process-module "temple/surface-process-module/1"
+
+process runtimeGrant.verify:
+  let input = $eventInput
+  port signature.ed25519.verify { text = $input.wire; publicKey = $input.publicKey; signature = $input.signature } → valid
+  assert $valid
+    otherwise "The runtime resource grant signature is invalid."
+  let claims = $input.claims
+  port value.describe { value = $claims } → shape
+  assert $shape.plain
+    otherwise "The runtime resource grant claims are not canonical."
+  port record.entries { value = $claims } → entries
+  let names = list("protocol", "keyId", "issuer", "audience", "grantId", "consumerId", "identityEvidenceHash",
+    "bindingKey", "resourceRef", "provider", "receiptHash", "scopeHash", "issuedAt", "expiresAt")
+  let keys = map($entries, "entry", at($entry, 0))
+  port json.canonical { value = $claims } → canonical
+  assert and(eq($claims.protocol, "sourcery.hosted/runtime-resource-grant.v1"), eq($claims.keyId, $input.keyId),
+    not(some($keys, "key", not(includes($names, $key)))), eq($canonical, $input.wire))
+    otherwise "The runtime resource grant claims are not canonical."
+  let result = $claims
+
+process runtimeGrant.admitProof:
+  let input = $eventInput
+  let proof = $input.proof
+  port value.describe { value = $proof.keyId } → key
+  port value.describe { value = $proof.payload } → payload
+  port value.describe { value = $proof.signature } → signature
+  assert and(eq($proof.protocol, "sourcery.hosted/runtime-resource-grant.v1"), eq($key.type, "string"),
+    eq($payload.type, "string"), eq($signature.type, "string"), $input.withinBounds)
+    otherwise "runtime-resource-grant-invalid"
+  port record.entries { value = $input.keyring } → entries
+  let matching = filter($entries, "entry", eq(at($entry, 0), $proof.keyId))
+  assert eq(count($matching), 1)
+    otherwise "runtime-resource-grant-key-unknown"
+  let result = at(at($matching, 0), 1)
+
+process runtimeGrant.currentBinding:
+  let input = $eventInput
+  let query = $input.query
+  let matches = filter($input.candidates, "binding", and(eq($binding.status, "active"),
+    eq($binding.scopeHash, $query.expectedScopeHash),
+    or(eq($query.bindingKey, null), eq($binding.bindingKey, $query.bindingKey)),
+    or(eq($query.resourceRef, null), eq($binding.resourceRef, $query.resourceRef))))
+  assert eq(count($matches), 1)
+    otherwise "runtime-resource-grant-not-current"
+  let binding = at($matches, 0)
+  when $input.proof:
+    assert and(eq($binding.receiptHash, $input.proof.receiptHash), eq($binding.offer.provider, $input.proof.provider))
+      otherwise "runtime-resource-grant-revoked"
+  let result = $binding
+
+process runtimeGrant.resolve:
+  let input = $eventInput
+  port kernel.invoke { query = "runtimeGrant.verify"; input = $input } → claims
+  let boundary = $input.boundary
+  port kernel.invoke { query = "runtimeGrant.scopeDigest"; input = $boundary.scope } → scopeHash
+  assert and(eq($claims.issuer, $boundary.issuer), eq($claims.audience, $boundary.audience),
+    eq($claims.consumerId, $boundary.consumerId), eq($claims.identityEvidenceHash, $boundary.identityEvidenceHash),
+    eq($claims.scopeHash, $scopeHash))
+    otherwise "runtime-resource-grant-boundary"
+  assert and($input.timestamps, $boundary.clockValid)
+    otherwise "runtime-resource-grant-expired"
+  port number.calculate { operation = "lessEqual"; values = list($input.issuedAtMs, add($boundary.nowMs, 5000)) } → started
+  port number.calculate { operation = "less"; values = list($boundary.nowMs, $input.expiresAtMs) } → fresh
+  port number.calculate { operation = "subtract"; values = list($input.expiresAtMs, $input.issuedAtMs) } → lifetime
+  call runtimeGrant.productionLifetime
+  let maximum = if($input.production, $result.maximumMs, $boundary.maximumLifetimeMs)
+  port number.calculate { operation = "lessEqual"; values = list($lifetime, $maximum) } → bounded
+  assert and($started, $fresh, $bounded)
+    otherwise "runtime-resource-grant-expired"
+  let result = $claims
+
+process runtimeGrant.productionLifetime:
+  let result = { issuedMs = 30000; maximumMs = 120000 }
+
+process runtimeGrant.scopeDigest:
+  let scope = $eventInput
+  port value.describe { value = $scope } → shape
+  port record.entries { value = if($shape.plain, $scope, {}) } → scopeFields
+  assert and($shape.plain, count($scopeFields))
+    otherwise "runtime-resource-grant-scope"
+  port json.canonical { value = $scope } → canonical
+  port digest.sha256 { text = $canonical } → result
+
+process runtimeGrant.issueCoordinates:
+  let input = $eventInput
+  assert or(not(eq($input.bindingKey, null)), not(eq($input.resourceRef, null)))
+    otherwise "runtime-resource-grant-invalid"
+  each list($input.bindingKey, $input.resourceRef) as coordinate:
+    when not(eq($coordinate, null)):
+      port value.type { value = $coordinate } → type
+      assert eq($type, "string")
+        otherwise "runtime-resource-grant-invalid"
+      port text.matches { value = $coordinate; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,511}\\z" } → valid
+      assert $valid
+        otherwise "runtime-resource-grant-invalid"
+  let result = { bindingKey = $input.bindingKey; resourceRef = $input.resourceRef }
+
+process runtimeGrant.issueClaims:
+  let input = $eventInput
+  let binding = $input.binding
+  each list($input.keyId, $input.issuer, $input.audience, $input.consumerId, $binding.offer.provider) as field:
+    port text.matches { value = $field; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → valid
+    assert $valid
+      otherwise "runtime-resource-grant-invalid"
+  port text.matches { value = $binding.receiptHash; pattern = "\\A[a-f0-9]{64}\\z" } → receipt
+  assert $receipt
+    otherwise "runtime-resource-grant-invalid"
+  call runtimeGrant.productionLifetime
+  let lifetime = $result.issuedMs
+  port time.formatUtc { milliseconds = $input.nowMs; fractional = true } → issuedAt
+  port time.formatUtc { milliseconds = add($input.nowMs, $lifetime); fractional = true } → expiresAt
+  let claims = { protocol = "sourcery.hosted/runtime-resource-grant.v1"; keyId = $input.keyId; issuer = $input.issuer;
+    audience = $input.audience; grantId = $input.grantId; consumerId = $input.consumerId;
+    identityEvidenceHash = $input.identityEvidenceHash; bindingKey = $binding.bindingKey; resourceRef = $binding.resourceRef;
+    provider = $binding.offer.provider; receiptHash = $binding.receiptHash; scopeHash = $binding.scopeHash;
+    issuedAt = $issuedAt; expiresAt = $expiresAt }
+  port json.canonical { value = $claims } → result

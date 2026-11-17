@@ -1,0 +1,74 @@
+process-module "temple/surface-process-module/1"
+
+process operatorLogin.pageStyles:
+  let cssRuleSeparator = ""
+  let cssRules = list(
+    { selector = "body"; declarations = list(
+      { property = "font"; value = "16px system-ui" },
+      { property = "background"; value = "#111827" },
+      { property = "color"; value = "#f9fafb" },
+      { property = "display"; value = "grid" },
+      { property = "place-items"; value = "center" },
+      { property = "min-height"; value = "100vh" },
+      { property = "margin"; value = "0" }
+    ) },
+    { selector = "main"; declarations = list(
+      { property = "width"; value = "min(28rem,calc(100% - 3rem))" },
+      { property = "padding"; value = "2rem" },
+      { property = "border"; value = "1px solid #374151" },
+      { property = "border-radius"; value = ".75rem" },
+      { property = "background"; value = "#1f2937" }
+    ) },
+    { selector = "label,input,button"; declarations = list(
+      { property = "display"; value = "block" },
+      { property = "width"; value = "100%" },
+      { property = "box-sizing"; value = "border-box" }
+    ) },
+    { selector = "input,button"; declarations = list(
+      { property = "font"; value = "inherit" },
+      { property = "padding"; value = ".75rem" },
+      { property = "margin-top"; value = ".5rem" },
+      { property = "border-radius"; value = ".4rem" }
+    ) },
+    { selector = "button"; declarations = list(
+      { property = "margin-top"; value = "1rem" },
+      { property = "background"; value = "#d1fae5" },
+      { property = "color"; value = "#064e3b" },
+      { property = "border"; value = "0" },
+      { property = "font-weight"; value = "700" }
+    ) },
+    { selector = ".error"; declarations = list(
+      { property = "color"; value = "#fecaca" }
+    ) }
+  )
+  call css.renderCompactRules
+
+process operatorLogin.page:
+  let login = $eventInput
+  call operatorLogin.pageStyles
+  let stylesheet = $result
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width" } },
+      { tag = "title"; children = list("Sign in to Sourcery") },
+      { tag = "style"; children = list($stylesheet) }
+    ) },
+    { tag = "body"; children = list(
+      { tag = "main"; children = list(
+        { tag = "h1"; children = list("Sourcery operator sign-in") },
+        if($login.failed, { tag = "p"; attrs = { class = "error" }; children = list("Sign-in was not accepted.") }, null),
+        { tag = "form"; attrs = { method = "post"; action = "/identity/login" }; children = list(
+          { tag = "input"; attrs = { type = "hidden"; name = "csrf"; value = $login.csrf } },
+          { tag = "input"; attrs = { type = "hidden"; name = "return"; value = $login.returnPath } },
+          { tag = "label"; children = list(
+            "Operator secret",
+            { tag = "input"; attrs = { name = "secret"; type = "password"; autocomplete = "current-password"; maxlength = "1024"; required = true; autofocus = true } }
+          ) },
+          { tag = "button"; attrs = { type = "submit" }; children = list("Sign in") }
+        ) }
+      ) }
+    ) }
+  ) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)

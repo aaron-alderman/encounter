@@ -1,0 +1,70 @@
+process-module "temple/surface-process-module/1"
+
+process custody.assignment:
+  let pattern = concat("\\A[ \\t]*", $eventInput.key, "[ \\t]*=(.*)\\z")
+  port text.split { value = $eventInput.source; pattern = "\\r?\\n" } → lines
+  fold $lines as line; values starts list():
+    port text.match { value = $line; pattern = $pattern } → match
+    let next = $values
+    when $match:
+      port text.trim { value = at($match.groups, 0) } → value
+      let next = append($values, list($value))
+    yield $next → values
+  assert and(eq(count($values), 1), at($values, 0))
+    otherwise "Google identity custody must declare exactly one assignment for each custody path."
+  let result = at($values, 0)
+
+process custody.verify:
+  let observed = $eventInput
+  let directory = $observed.directory
+  let environment = $observed.environment
+  let secret = $observed.secret
+  assert and($directory.directory, $environment.file, $secret.file, $observed.unit.file)
+    otherwise "Google identity custody must use one real directory and regular files."
+  assert and(eq($directory.uid, $observed.ownerUid), eq($environment.uid, $observed.ownerUid),
+    eq($secret.uid, $observed.ownerUid), eq($observed.unit.uid, $observed.ownerUid))
+    otherwise "Google identity custody must retain the expected root owner."
+  assert and(eq($directory.gid, $environment.gid), eq($directory.gid, $secret.gid))
+    otherwise "Google identity custody directory and files must share one service group."
+  assert and(eq($directory.mode, 488), eq($environment.mode, 416), eq($secret.mode, 416),
+    $observed.unit.protected)
+    otherwise "Google identity custody requires directory mode 0750, file modes 0640, and a protected unit."
+  port number.calculate { operation = "greaterEqual"; values = list($secret.bytes, 1) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($secret.bytes, 4096) } → bounded
+  assert and($nonempty, $bounded)
+    otherwise "Google client secret size is invalid."
+  port kernel.invoke { query = "custody.assignment"; input = { key = "EnvironmentFile"; source = $observed.unit.source } } → envPath
+  port kernel.invoke { query = "custody.assignment"; input = { key = "SOURCERY_GOOGLE_CLIENT_SECRET_FILE"; source = $environment.source } } → secretPath
+  assert and(or(eq($envPath, $environment.path), eq($envPath, concat("-", $environment.path))),
+    eq($secretPath, $secret.path))
+    otherwise "Google identity configuration drifted from the canonical custody path."
+  let result = { protocol = "sourcery.hosted/google-identity-custody.v1"; status = "passed";
+    unitFile = $observed.unit.path; envFile = $environment.path; secretFile = $secret.path;
+    ownerUid = $observed.ownerUid; groupGid = $directory.gid; secretBytes = $secret.bytes;
+    modes = { directory = "0750"; environment = "0640"; secret = "0640" } }
+
+process custody.inactive:
+  assert includes(list("inactive", "failed"), $eventInput)
+    otherwise "Google identity service must be inactive during custody migration."
+  let result = true
+
+process custody.migration:
+  let input = $eventInput
+  assert eq($input.unitDigest, "c1dbe0050de90d4fea2b87231ee0bd45cdc02a3dc5dd9bc746a4151c316149b8")
+    otherwise "Google identity custody migration requires the matching native service unit."
+  assert or(not($input.canonicalPresent), $input.canonicalMatches)
+    otherwise "Canonical Google client secret conflicts with retained legacy custody."
+  port number.calculate { operation = "greaterEqual"; values = list($input.secretBytes, 1) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($input.secretBytes, 4096) } → bounded
+  assert and($nonempty, $bounded)
+    otherwise "Google client secret size is invalid."
+  port kernel.invoke { query = "custody.assignment"; input = { key = "SOURCERY_GOOGLE_CLIENT_SECRET_FILE";
+    source = $input.environment } } → sourcePath
+  assert eq($sourcePath, $input.legacySecret)
+    otherwise "Legacy Google identity configuration drifted from its retained custody path."
+  port text.replace { value = $input.environment; pattern = "(?m)^[ \\t]*SOURCERY_GOOGLE_CLIENT_SECRET_FILE[ \\t]*=[^\\r\\n]*";
+    replacement = concat("SOURCERY_GOOGLE_CLIENT_SECRET_FILE=", $input.canonicalSecret) } → environment
+  let credentials = if($input.canonicalDirectory, list("publish-environment", "publish-secret"), list("publish-directory"))
+  let backup = if($input.hasBackup, list(), list("publish-backup"))
+  let result = { environment = $environment;
+    operations = append(append($credentials, $backup), list("publish-unit", "verify-custody", "reload-unit")) }

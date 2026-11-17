@@ -1,0 +1,211 @@
+process-module "temple/surface-process-module/1"
+
+process mcpProjectHttp.versions:
+  let result = list("2026-07-28", "2025-11-25", "2025-06-18", "2025-03-26")
+
+process mcpProjectHttp.unbound:
+  let message = $eventInput
+  let params = at($message, "params")
+  let coordinate = at(at($params, "_meta"), "com.sourcery/projectConnection")
+  port value.describe { value = $coordinate } → connection
+  let context = at(at($params, "arguments"), "projectContext")
+  port value.describe { value = $context } → project
+  let result = and(eq($connection.type, "undefined"), or(eq(at($message, "method"), "tools/call"), eq($project.type, "undefined")))
+
+process mcpProjectHttp.operation:
+  let message = $eventInput
+  call mcpProjectHttp.unbound
+  let unbound = $result
+  let result = null
+  when and($unbound, includes(list("initialize", "notifications/initialized", "server/discover", "tools/list", "ping"), $message.method)):
+    let result = $message.method
+  when and($unbound, eq($message.method, "tools/call"),
+    eq(at(at($message, "params"), "name"), "sourcery_project")):
+    let result = "project"
+
+process mcpProjectHttp.wire:
+  let input = $eventInput
+  let message = $input.message
+  call mcpProjectHttp.versions
+  let version = at($result, 0)
+  let metadata = at(at($message, "params"), "_meta")
+  port value.describe { value = $metadata } → meta
+  port value.describe { value = at($metadata, "io.modelcontextprotocol/clientCapabilities") } → capabilities
+  let detail = ""
+  when and(eq($message.method, "tools/call"), not(eq($input.name, "sourcery_project"))):
+    let detail = if(not($input.namePresent), "Mcp-Name header is required.",
+      if(eq($input.name, null), "Mcp-Name header is malformed.", "Mcp-Name header does not match the request body."))
+  when not(eq($input.method, $message.method)):
+    let detail = if(not($input.methodPresent), "Mcp-Method header is required.",
+      if(eq($input.method, null), "Mcp-Method header is malformed.", "Mcp-Method header does not match the request body."))
+  when not(and($meta.plain, eq(at($metadata, "io.modelcontextprotocol/protocolVersion"), $version),
+    or($capabilities.plain, eq($capabilities.type, "array")))):
+    let detail = "MCP protocol metadata is missing or does not match its header."
+  let result = if($detail, { reason = "wire"; detail = $detail }, null)
+  port value.describe { value = $message.id } → id
+  when or($id.null, eq($id.type, "undefined")):
+    let result = { reason = "id"; detail = "Modern MCP body must contain one JSON-RPC request." }
+
+process mcpProjectHttp.transport:
+  let input = $eventInput
+  let message = $input.message
+  let method = $message.method
+  call mcpProjectHttp.versions
+  let versions = $result
+  let modern = at($versions, 0)
+  let initialize = eq($method, "initialize")
+  let notification = eq($method, "notifications/initialized")
+  let version = if($initialize, $message.params.protocolVersion, $input.version)
+  let handshake = and(includes($versions, $version), not(eq($version, $modern)))
+  let result = { handshake = $handshake; version = $version }
+  port value.describe { value = $message.id } → id
+  let absent = or($id.null, eq($id.type, "undefined"))
+  when and($handshake, not($initialize), if($notification, not($absent), $absent)):
+    let result = { reason = "id"; detail = if($notification, "MCP initialized must be a JSON-RPC notification.",
+      "MCP body must contain one JSON-RPC request.") }
+  when and($handshake, eq($method, "server/discover"), not($absent)):
+    let result = { reason = "method" }
+  when and($initialize, $handshake):
+    port value.describe { value = $message.params.capabilities } → capabilities
+    port value.describe { value = $message.params.clientInfo } → client
+    when not(and($capabilities.plain, $client.plain)):
+      let result = { reason = "initialize" }
+    when and($input.version, not(eq($version, $input.version))):
+      let result = { reason = "wire"; detail = "MCP protocol header does not match the initialize request." }
+  when and(not($handshake), or($initialize, not(eq($version, $modern)))):
+    let result = { reason = "version"; requested = $version }
+  when and($initialize, $absent):
+    let result = { reason = "id"; detail = "MCP initialize must be a JSON-RPC request." }
+  when and(not($initialize), eq($version, $modern)):
+    call mcpProjectHttp.wire
+    let result = if($result, $result, if($notification, { reason = "method" }, { handshake = false }))
+
+process mcpProjectHttp.publicInstructions:
+  let result = "Public read-only MCP lane. No authoring, imports, uploads, publication, capture, observation retention or admission. Only explicitly listed read operations are available. Private operator authoring requires its separate authenticated lane."
+
+process mcpProjectHttp.handshakeContract:
+  call mcpProjectPortfolio.definition
+  let tool = $result
+  port json.canonical { value = list({ name = $tool.name; inputSchema = $tool.inputSchema }) } → canonical
+  port digest.sha256 { text = $canonical } → result
+
+process mcpProjectHttp.handshakeClient:
+  let input = $eventInput
+  let subject = $input.subject
+  port json.canonical { value = list($subject.userId, $subject.credentialKind, $subject.tenantId, $subject.appId,
+    $input.session, if($input.session, "", $input.userAgent)) } → coordinate
+  port digest.sha256 { text = $coordinate } → result
+
+process mcpProjectHttp.handshakeReply:
+  let input = $eventInput
+  let message = $input.message
+  let method = $message.method
+  let result = { status = 200; body = $input.body; challenge = null; remember = false }
+  when eq($method, "initialize"):
+    call mcpProjectHttp.publicInstructions
+    let instructions = $result
+    let result = { status = 200; session = $input.session; body = { jsonrpc = "2.0"; id = $message.id; result = {
+      protocolVersion = $input.version; capabilities = { tools = { listChanged = true } };
+      serverInfo = { name = "sourcery-authoring"; version = "1" }; instructions = $instructions } } }
+  when eq($method, "notifications/initialized"):
+    let result = { status = 202 }
+  let metadata = { "sourcery/toolContractHash" = $input.contract }
+  when eq($method, "tools/list"):
+    port record.put { record = $input.body.result; key = "_meta"; value = $metadata } → payload
+    port record.put { record = $input.body; key = "result"; value = $payload } → body
+    let result = { status = 200; body = $body; remember = true }
+  when and(includes(list("ping", "tools/call"), $method), not($input.seen)):
+    let result = { status = 200; events = list(
+      { jsonrpc = "2.0"; method = "notifications/tools/list_changed"; params = { _meta = $metadata } },
+      $input.body) }
+
+process mcpProjectHttp.discovery:
+  let input = $eventInput
+  let message = $input.message
+  let payload = {}
+  when eq($message.method, "server/discover"):
+    call mcpProjectHttp.versions
+    let payload = { supportedVersions = $result;
+      capabilities = { tools = { listChanged = false } };
+      instructions = "Use the returned nextCall arguments, including contextual continuation handles, through admit-and-prove. Identity and workspace scope are supplied by the hosted connection; never add actor or filesystem authority to tool arguments.";
+      ttlMs = 60000; cacheScope = "private" }
+  when eq($message.method, "tools/list"):
+    call mcpProjectPortfolio.definition
+    let tools = if($input.projectRead, list($result), list())
+    let payload = if($input.handshake, { tools = $tools }, { tools = $tools; ttlMs = 60000; cacheScope = "private" })
+  let result = { jsonrpc = "2.0"; id = $message.id; result = $payload }
+
+process mcpProjectHttp.reply:
+  let message = $eventInput
+  let body = $message
+  port record.put { record = $body.result; key = "resultType"; value = "complete" } → enriched
+  port record.put { record = $enriched; key = "_meta"; value = {
+    "io.modelcontextprotocol/serverInfo" = { name = "sourcery-authoring"; version = "1" } } } → enriched
+  port record.put { record = $body; key = "result"; value = $enriched } → body
+  let result = { status = 200; body = $body; challenge = null }
+
+process mcpProjectHttp.error:
+  let input = $eventInput
+  let status = 503
+  let code = -32603
+  let message = "Hosted project authority is unavailable."
+  let id = $input.id
+  let challenge = null
+  let data = { requestId = $input.requestId }
+  when eq($input.reason, "invalidToken"):
+    let status = 401
+    let code = -32001
+    let message = "Bearer credential is invalid, expired, revoked, or outside this authoring resource."
+    let id = null
+    let challenge = "invalid_token"
+    let data = null
+  when eq($input.reason, "scope"):
+    let status = 403
+    let code = -32003
+    let message = "The authoring connection requires authoring.read for this tool."
+    let challenge = "insufficient_scope"
+    let data = null
+  when eq($input.reason, "wire"):
+    let status = 400
+    let code = -32020
+    let message = $input.detail
+    let data = { sourceryCode = "header-mismatch"; requestId = $input.requestId }
+  when eq($input.reason, "id"):
+    let status = 400
+    let code = -32600
+    let message = $input.detail
+    let data = { sourceryCode = "invalid-request"; requestId = $input.requestId }
+  when eq($input.reason, "initialize"):
+    let status = 400
+    let code = -32602
+    let message = "MCP initialize requires client capabilities and client information."
+    let data = { sourceryCode = "invalid-request"; requestId = $input.requestId }
+  when eq($input.reason, "version"):
+    call mcpProjectHttp.versions
+    let supported = $result
+    let status = 400
+    let code = -32022
+    let message = "Unsupported MCP protocol version."
+    let data = { sourceryCode = "unsupported-protocol-version"; supported = $supported; requestId = $input.requestId }
+    when $input.detail:
+      port record.put { record = $data; key = "requested"; value = $input.detail } → data
+  when eq($input.reason, "method"):
+    let status = 404
+    let code = -32601
+    let message = concat("Method not available on the Sourcery authoring surface: ", $input.detail, ".")
+    let data = null
+  when eq($input.reason, "request"):
+    let status = 400
+    let code = -32602
+    let message = "Invalid sourcery_project arguments."
+    let data = { sourceryCode = "invalid-request"; requestId = $input.requestId }
+  when includes(list("ambiguous", "unavailable"), $input.reason):
+    let status = 403
+    let code = -32031
+    let message = if(eq($input.reason, "ambiguous"), "Project selection is ambiguous; include workspaceId.",
+      "Project is not available to this MCP connection.")
+    let data = { sourceryCode = "sourcery-project-unavailable"; requestId = $input.requestId }
+  let error = { code = $code; message = $message }
+  when $data:
+    port record.put { record = $error; key = "data"; value = $data } → error
+  let result = { status = $status; challenge = $challenge; body = { jsonrpc = "2.0"; id = $id; error = $error } }

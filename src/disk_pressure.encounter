@@ -1,0 +1,340 @@
+process-module "temple/surface-process-module/1"
+
+process diskPressure.hash:
+  port value.describe { value = $eventInput } → shape
+  let result = false
+  when eq($shape.type, "string"):
+    port text.matches { value = $eventInput; pattern = "\\A[a-f0-9]{64}\\z" } → result
+
+process diskPressure.natural:
+  port number.isNatural { value = $eventInput } → natural
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 9007199254740991) } → bounded
+  let result = and($natural, $bounded)
+
+process diskPressure.under:
+  let path = $eventInput.path
+  let root = concat($eventInput.root, "/")
+  port text.matches { value = $path; pattern = "\\A(?!.*(?:^|/)[.]{1,2}(?:/|$))/[^\\x00\\r\\n]+\\z" } → safe
+  port text.slice { value = $path; start = 0; end = count($root) } → prefix
+  let result = and($safe, eq($prefix, $root))
+
+process diskPressure.seal:
+  port json.canonical { value = $eventInput } → wire
+  port digest.sha256 { text = $wire } → result
+
+process diskPressure.sealed:
+  let observation = $eventInput.observation
+  let key = $eventInput.key
+  let result = false
+  when $observation:
+    let value = $observation.value
+    let expected = at($value, $key)
+    port kernel.invoke { query = "diskPressure.hash"; input = $expected } → valid
+    port kernel.invoke { query = "diskPressure.hash"; input = $observation.sha256 } → fileHash
+    when and($valid, $fileHash):
+      port record.entries { value = $value } → entries
+      let entries = filter($entries, "entry", not(eq(at($entry, 0), $key)))
+      port record.fromEntries { entries = $entries } → body
+      port kernel.invoke { query = "diskPressure.seal"; input = $body } → actual
+      let result = eq($expected, $actual)
+
+process diskPressure.releaseEvidence:
+  let observation = $eventInput.evidence
+  let runtime = $eventInput.runtime
+  let id = $eventInput.id
+  let result = null
+  port kernel.invoke { query = "diskPressure.sealed"; input = { observation = $observation; key = "evidenceHash" } } → sealed
+  when and($sealed, eq($observation.path, $eventInput.path)):
+    let value = $observation.value
+    let valid = false
+    let hashes = list()
+    when $runtime:
+      let valid = and(eq($value.protocol, "sourcery-core/evidence-complete-release.v1"),
+        eq($value.releaseReferenceHash, $id), eq($value.intendedActiveReferenceHash, $id),
+        eq($value.currentActiveReferenceHash, $value.rollbackReferenceHash))
+      let hashes = list($value.source.coreBundleHash, $value.source.admissionHash, $value.sourceHash,
+        $value.lockfileHash, $value.dependencyClosureHash, $value.compositionHash, $value.releaseReferenceHash,
+        $value.currentActiveReferenceHash, $value.intendedActiveReferenceHash, $value.rollbackReferenceHash,
+        $value.candidateReconstructionProofHash, $value.rollbackReconstructionProofHash, $value.rollbackProofHash)
+    when not($runtime):
+      let policy = $eventInput.policy
+      let proofRoot = if($policy.applicationReconstructionEvidenceRoot, $policy.applicationReconstructionEvidenceRoot,
+        concat($policy.outputRoot, "/reconstruction/releases"))
+      let valid = and(eq($value.protocol, "sourcery/evidence-complete-application-release.v1"),
+        eq($value.releaseId, $id), eq($value.intendedActiveReleaseId, $id), eq($value.currentActiveReleaseId, $value.rollbackReleaseId),
+        isArray($value.sourceTreeHashes), count($value.sourceTreeHashes),
+        eq($observation.capsuleSha256, $value.sourceCapsuleManifestHash), eq($observation.proofSha256, $value.reconstructionProofHash),
+        eq($observation.sourceCapsuleManifestPath, concat($policy.sourceCapsuleManifestRoot, "/", $value.sourceCapsuleManifestHash, ".json")),
+        eq($observation.reconstructionProofPath, concat($proofRoot, "/", $value.reconstructionProofHash, ".json")))
+      when $valid:
+        let hashes = append(list($value.sourceCapsuleManifestHash, $value.lockfileHash, $value.dependencyClosureHash,
+          $value.compositionHash, $value.reconstructionProofHash), $value.sourceTreeHashes)
+    fold $hashes as hash; verified starts $valid:
+      port kernel.invoke { query = "diskPressure.hash"; input = $hash } → validHash
+      yield and($verified, $validHash) → verified
+    when $verified:
+      port record.put { record = $value; key = "path"; value = $observation.path } → value
+      port record.put { record = $value; key = "sha256"; value = $observation.sha256 } → result
+      when not($runtime):
+        port record.put { record = $result; key = "sourceCapsuleManifestPath"; value = $observation.sourceCapsuleManifestPath } → value
+        port record.put { record = $value; key = "reconstructionProofPath"; value = $observation.reconstructionProofPath } → result
+
+process diskPressure.reconstruction:
+  let evidence = $eventInput.evidence
+  let policy = $eventInput.policy
+  let result = null
+  when and($evidence, eq($evidence.evidencePath, concat($policy.runtimeReconstructionEvidenceRoot, "/", $eventInput.id, ".json")),
+    isArray($evidence.artifacts), eq(count($evidence.artifacts), 3)):
+    fold list($evidence.admissionHash, $evidence.coreBundleHash, $evidence.dependencyBundleHash, $evidence.evidenceSha256) as hash; valid starts true:
+      port kernel.invoke { query = "diskPressure.hash"; input = $hash } → matches
+      yield and($valid, $matches) → valid
+    let kinds = map($evidence.artifacts, "artifact", $artifact.kind)
+    let valid = and($valid, includes($kinds, "admission"), includes($kinds, "core-bundle"), includes($kinds, "dependency-bundle"))
+    fold $evidence.artifacts as artifact; admitted starts $valid:
+      let expected = at({ "core-bundle" = $evidence.coreBundleHash;
+        "dependency-bundle" = $evidence.dependencyBundleHash }, $artifact.kind)
+      port kernel.invoke { query = "diskPressure.hash"; input = $artifact.sha256 } → hash
+      port kernel.invoke { query = "diskPressure.under"; input = { path = $artifact.path; root = $policy.authorityStore } } → authority
+      port kernel.invoke { query = "diskPressure.under"; input = { path = $artifact.path; root = concat($policy.filesystemRoot, "/shared-assets") } } → shared
+      yield and($admitted, $hash, or(eq($artifact.kind, "admission"), eq($expected, $artifact.sha256)),
+        eq($artifact.observedSha256, $artifact.sha256), or($authority, $shared)) → admitted
+    when $admitted:
+      let result = { admissionHash = $evidence.admissionHash; coreBundleHash = $evidence.coreBundleHash;
+        dependencyBundleHash = $evidence.dependencyBundleHash;
+        recoverySemantic = "reconstructible-in-kind-from-retained-authority-and-bundles" }
+
+process diskPressure.runtime:
+  let input = $eventInput
+  let row = $input.row
+  let id = $row.referenceHash
+  port kernel.invoke { query = "diskPressure.hash"; input = $id } → valid
+  port kernel.invoke { query = "diskPressure.natural"; input = $row.bytes } → bytes
+  assert and($valid, $bytes, eq($row.directory, concat($input.policy.runtimeRoot, "/", $id)), isArray($row.liveReferences))
+    otherwise "Invalid disk-pressure runtime observation."
+  let active = eq($id, $input.current)
+  let referenced = count($row.liveReferences)
+  let rollback = includes(if(isArray($input.policy.rollbackRuntimeReferenceHashes), $input.policy.rollbackRuntimeReferenceHashes, list()), $id)
+  port kernel.invoke { query = "diskPressure.reconstruction"; input = { evidence = $row.reconstruction; policy = $input.policy; id = $id } } → reconstruction
+  port kernel.invoke { query = "diskPressure.releaseEvidence"; input = { evidence = $row.releaseEvidence; id = $id; runtime = true;
+    path = concat($row.directory, "/release-evidence.json") } } → evidence
+  let status = if(or($active, $referenced, $rollback), "retained", if($reconstruction, "candidate", "isolated"))
+  let reason = if($active, "current-authority-reference", if($referenced, "live-reference", if($rollback,
+    "policy-retained-rollback", if($reconstruction, "unreferenced-and-reconstructible", "reconstruction-evidence-incomplete"))))
+  let result = { referenceHash = $id; directory = $row.directory; bytes = $row.bytes; status = $status; reason = $reason;
+    liveReferences = $row.liveReferences; reconstruction = $reconstruction;
+    evidenceCompleteness = if($evidence, "evidence-complete-release", "legacy-or-incomplete"); releaseEvidence = $evidence }
+
+process diskPressure.release:
+  let input = $eventInput
+  let row = $input.row
+  let id = $row.id
+  port text.matches { value = $id; pattern = "\\A[A-Za-z0-9][A-Za-z0-9._-]{0,255}\\z" } → valid
+  port kernel.invoke { query = "diskPressure.natural"; input = $row.bytes } → bytes
+  assert and($valid, $bytes, eq($row.path, concat($input.policy.releaseRoot, "/", $id)), isArray($row.liveReferences),
+    includes(list("directory", "symlink", "other"), $row.type))
+    otherwise "Invalid disk-pressure release observation."
+  let active = eq($id, $input.active)
+  let rollback = includes($input.policy.rollbackReleaseIds, $id)
+  let referenced = count($row.liveReferences)
+  let capsule = $row.capsuleEvidence
+  let recordPath = concat($input.policy.releaseRecordRoot, "/", $id, "/.sourcery-release.json")
+  port kernel.invoke { query = "diskPressure.hash"; input = $row.releaseRecordSha256 } → recordPresent
+  port kernel.invoke { query = "diskPressure.releaseEvidence"; input = { evidence = $row.releaseEvidence; id = $id; runtime = false;
+    path = concat($row.path, "/.sourcery-release-evidence.json"); policy = $input.policy } } → complete
+  when and($active, $complete):
+    assert includes($input.policy.rollbackReleaseIds, $complete.rollbackReleaseId)
+      otherwise "Active evidence-complete application release must retain a policy rollback release."
+  let capsuleBacked = false
+  when $capsule:
+    port kernel.invoke { query = "diskPressure.hash"; input = $capsule.manifestSha256 } → manifestHash
+    port kernel.invoke { query = "diskPressure.natural"; input = $capsule.capsuleCount } → capsuleCount
+    port kernel.invoke { query = "diskPressure.natural"; input = $capsule.capsuleBytes } → capsuleBytes
+    let capsuleBacked = and($manifestHash, $capsuleCount, $capsule.capsuleCount, $capsuleBytes,
+      eq($capsule.capsulesVerified, true),
+      eq($capsule.manifestPath, concat($input.policy.sourceCapsuleManifestRoot, "/", $capsule.manifestSha256, ".json")))
+  let directory = eq($row.type, "directory")
+  let classification = if(not($directory), "unknown", if($active, "live", if($rollback, "rollback",
+    if($referenced, "live", if(and($capsuleBacked, $recordPresent), "reconstructible", "isolated")))))
+  let reason = if(not($directory), "non-directory-release-entry", if($active, "effective-service-working-directory",
+    if($rollback, "policy-retained-rollback", if($referenced, "process-config-or-symlink-reference",
+      if($capsuleBacked, if($recordPresent, "source-capsule-and-release-record-retained", "release-record-incomplete"), "reconstruction-evidence-incomplete")))))
+  let evidence = { capsuleBacked = $capsuleBacked; releaseRecordPresent = $recordPresent;
+    releaseRecordPath = if($recordPresent, $recordPath, null); releaseRecordSha256 = if($recordPresent, $row.releaseRecordSha256, null);
+    evidenceComplete = if($complete, true, false); releaseEvidence = $complete }
+  when $capsuleBacked:
+    let evidence = { capsuleBacked = true; manifestPath = $capsule.manifestPath; manifestSha256 = $capsule.manifestSha256;
+      capsuleCount = $capsule.capsuleCount; capsuleBytes = $capsule.capsuleBytes; capsulesVerified = true;
+      releaseRecordPresent = $evidence.releaseRecordPresent; releaseRecordPath = $evidence.releaseRecordPath;
+      releaseRecordSha256 = $evidence.releaseRecordSha256; evidenceComplete = $evidence.evidenceComplete; releaseEvidence = $complete }
+  let result = { id = $id; path = $row.path; type = $row.type; bytes = $row.bytes; classification = $classification;
+    reason = concat($reason, if($complete, "; release-evidence-complete", "; release-evidence-legacy-or-incomplete"));
+    liveReferences = $row.liveReferences; evidence = $evidence;
+    action = if(eq($classification, "reconstructible"), "approval-required", "retain") }
+
+process diskPressure.closure:
+  let input = $eventInput
+  let row = $input.row
+  let observed = $row.manifest
+  port kernel.invoke { query = "diskPressure.natural"; input = $row.bytes } → bytes
+  port text.matches { value = $row.id; pattern = "\\A[A-Za-z0-9][A-Za-z0-9._-]{0,255}\\z" } → validId
+  let root = if($input.policy.dependencyClosureRoot, $input.policy.dependencyClosureRoot,
+    concat($input.policy.filesystemRoot, "/dependency-closures"))
+  assert and($bytes, $validId, eq($row.path, concat($root, "/", $row.id)))
+    otherwise "Invalid dependency closure observation."
+  let result = { id = $row.id; path = $row.path; type = "directory"; bytes = $row.bytes; closureHash = null;
+    classification = "isolated"; reason = "closure-manifest-incomplete-or-invalid"; references = list(); action = "retain" }
+  port kernel.invoke { query = "diskPressure.sealed"; input = { observation = $observed; key = "closureHash" } } → sealed
+  when $sealed:
+    let manifest = $observed.value
+    let valid = and(eq($manifest.protocol, "sourcery-core/content-addressed-dependency-closure.v1"), eq($manifest.closureKey, $row.id),
+      eq($observed.path, concat($row.path, "/.sourcery-dependency-closure.json")))
+    fold list($manifest.dependencyBundleHash, $manifest.lockfileHash, $manifest.treeHash) as hash; verified starts $valid:
+      port kernel.invoke { query = "diskPressure.hash"; input = $hash } → matches
+      yield and($verified, $matches) → verified
+    port kernel.invoke { query = "diskPressure.natural"; input = $manifest.bytes } → payloadBytes
+    when and($verified, $payloadBytes):
+      let matched = filter($input.references, "reference", eq($reference.closureHash, $manifest.closureHash))
+      let live = filter($matched, "reference", eq($reference.classification, "live"))
+      let rollback = filter($matched, "reference", eq($reference.classification, "rollback"))
+      port value.sort { values = map($matched, "reference", $reference.label) } → references
+      port value.sort { values = map($live, "reference", $reference.label) } → liveReferences
+      port value.sort { values = map($rollback, "reference", $reference.label) } → rollbackReferences
+      let classification = if(count($live), "live", if(count($rollback), "rollback",
+        if(count($matched), "reconstructible", "isolated")))
+      let reason = if(count($live), "referenced-by-live-evidence-complete-release", if(count($rollback),
+        "referenced-by-policy-rollback-release", if(count($matched), "referenced-by-retained-release-evidence",
+        "no-retained-release-evidence-reference")))
+      let result = { id = $row.id; path = $row.path; type = "directory"; bytes = $row.bytes;
+        manifestPath = $observed.path; manifestSha256 = $observed.sha256; closureHash = $manifest.closureHash;
+        closureKey = $manifest.closureKey; dependencyBundleHash = $manifest.dependencyBundleHash; lockfileHash = $manifest.lockfileHash;
+        platform = $manifest.platform; payloadBytes = $manifest.bytes; references = $references;
+        liveReferences = $liveReferences; rollbackReferences = $rollbackReferences;
+        classification = $classification; reason = $reason; action = "retain" }
+
+process diskPressure.pressure:
+  let observed = $eventInput.observed
+  let limits = $eventInput.limits
+  each list($observed.totalBytes, $observed.usedBytes, $observed.availableBytes, $observed.usedPercent,
+    $limits.criticalAvailablePercent, $limits.criticalAvailableBytes, $limits.warningAvailablePercent, $limits.warningAvailableBytes) as value:
+    port kernel.invoke { query = "diskPressure.natural"; input = $value } → valid
+    assert $valid
+      otherwise "Invalid disk-pressure measurement or threshold."
+  port number.calculate { operation = "lessEqual"; values = list($observed.usedPercent, 100) } → percent
+  assert $percent
+    otherwise "Disk use must be between zero and 100 percent."
+  port number.calculate { operation = "subtract"; values = list(100, $observed.usedPercent) } → available
+  port number.calculate { operation = "less"; values = list($available, $limits.criticalAvailablePercent) } → criticalPercent
+  port number.calculate { operation = "less"; values = list($available, $limits.warningAvailablePercent) } → warningPercent
+  port number.calculate { operation = "less"; values = list($observed.availableBytes, $limits.criticalAvailableBytes) } → criticalBytes
+  port number.calculate { operation = "less"; values = list($observed.availableBytes, $limits.warningAvailableBytes) } → warningBytes
+  let result = { totalBytes = $observed.totalBytes; usedBytes = $observed.usedBytes; availableBytes = $observed.availableBytes;
+    usedPercent = $observed.usedPercent; availablePercent = $available;
+    status = if(or($criticalPercent, $criticalBytes), "critical", if(or($warningPercent, $warningBytes), "warning", "healthy")) }
+
+process diskPressure.admit:
+  let policy = $eventInput
+  assert and(eq($policy.protocol, "sourcery/server-disk-pressure-assurance-policy.v1"),
+    eq($policy.safety.mode, "dry-run-only"), eq($policy.safety.automaticDeletion, false))
+    otherwise "Expected the disk-pressure dry-run contract."
+  let result = true
+
+process diskPressure.assess:
+  let input = $eventInput
+  let policy = $input.policy
+  assert eq($input.protocol, "sourcery/disk-pressure-observations.v1")
+    otherwise "Expected disk-pressure observations."
+  port kernel.invoke { query = "diskPressure.admit"; input = $policy } → admitted
+  assert $admitted
+    otherwise "Disk-pressure policy refused."
+  port text.matches { value = $input.createdAt; pattern = "\\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z\\z" } → timestamp
+  assert $timestamp
+    otherwise "Expected a UTC disk-pressure observation timestamp."
+  let authority = $input.authority
+  let current = $authority.referenceHash
+  each list($current, $authority.admissionHash, $authority.markerSha256) as hash:
+    port kernel.invoke { query = "diskPressure.hash"; input = $hash } → valid
+    assert $valid
+      otherwise "Invalid current runtime authority observation."
+  let ids = map($input.runtimes, "row", $row.referenceHash)
+  let releaseIds = map($input.releases, "row", $row.id)
+  let closureIds = map($input.dependencyClosures, "row", $row.id)
+  assert and(eq(count($ids), count(distinct($ids))), eq(count($releaseIds), count(distinct($releaseIds))),
+    eq(count($closureIds), count(distinct($closureIds))), includes($ids, $current),
+    some($input.releases, "row", and(eq($row.id, $input.activeReleaseId), eq($row.type, "directory"))))
+    otherwise "Disk-pressure inventory must contain the unique current runtime and active release."
+  port value.sort { values = $ids } → runtimeIds
+  fold $runtimeIds as id; rows starts list():
+    let row = at(filter($input.runtimes, "row", eq($row.referenceHash, $id)), 0)
+    port kernel.invoke { query = "diskPressure.runtime"; input = { row = $row; policy = $policy; current = $current } } → result
+    yield append($rows, list($result)) → runtimes
+  fold $input.releases as row; rows starts list():
+    port kernel.invoke { query = "diskPressure.release"; input = { row = $row; policy = $policy; active = $input.activeReleaseId } } → result
+    yield append($rows, list($result)) → releases
+  let runtimeEvidence = filter($runtimes, "row", $row.releaseEvidence)
+  let releaseEvidence = filter($releases, "row", $row.evidence.releaseEvidence)
+  let runtimeReferences = map($runtimeEvidence, "row", {
+    label = concat("runtime:", $row.referenceHash); closureHash = $row.releaseEvidence.dependencyClosureHash;
+    classification = if(or(eq($row.referenceHash, $current), count($row.liveReferences)), "live",
+      if(eq($row.reason, "policy-retained-rollback"), "rollback", "retained")) })
+  let releaseReferences = map($releaseEvidence, "row", {
+    label = concat("release:", $row.id); closureHash = $row.evidence.releaseEvidence.dependencyClosureHash;
+    classification = $row.classification })
+  let references = append($runtimeReferences, $releaseReferences)
+  let observedClosures = filter($input.dependencyClosures, "row", eq($row.type, "directory"))
+  fold $observedClosures as row; rows starts list():
+    port kernel.invoke { query = "diskPressure.closure"; input = { row = $row; policy = $policy; references = $references } } → result
+    yield append($rows, list($result)) → closures
+  fold $input.ancillary as row; rows starts list():
+    port text.matches { value = $row.id; pattern = "\\A(?:live|failed|qualification)-[A-Za-z0-9._-]+\\z" } → named
+    let result = $rows
+    when and($named, eq($row.path, concat($policy.filesystemRoot, "/", $row.id))):
+      port kernel.invoke { query = "diskPressure.natural"; input = $row.bytes } → bytes
+      assert $bytes
+        otherwise "Invalid disk-pressure ancillary tree size."
+      let result = append($rows, list({ id = $row.id; path = $row.path; type = $row.type; bytes = $row.bytes;
+        classification = "isolated"; reason = "outside-managed-runtime-and-release-inventory"; action = "retain" }))
+    yield $result → ancillary
+  let runtimeCandidates = filter($runtimes, "row", eq($row.status, "candidate"))
+  fold $runtimeCandidates as row; rows starts list():
+    let raw = at(filter($input.runtimes, "raw", eq($raw.referenceHash, $row.referenceHash)), 0)
+    let observed = $raw.reconstruction
+    let artifacts = map($observed.artifacts, "artifact", { kind = $artifact.kind; path = $artifact.path; sha256 = $artifact.sha256 })
+    let evidence = { admissionHash = $observed.admissionHash; coreBundleHash = $observed.coreBundleHash;
+      dependencyBundleHash = $observed.dependencyBundleHash; recoverySemantic = $row.reconstruction.recoverySemantic;
+      evidencePath = $observed.evidencePath; evidenceSha256 = $observed.evidenceSha256; artifacts = $artifacts }
+    yield append($rows, list({ kind = "runtime"; id = $row.referenceHash; path = $row.directory; bytes = $row.bytes; evidence = $evidence })) → candidates
+  let releaseCandidates = filter($releases, "row", eq($row.classification, "reconstructible"))
+  let candidates = append($candidates, map($releaseCandidates, "row",
+    { kind = "release"; id = $row.id; path = $row.path; bytes = $row.bytes; evidence = $row.evidence }))
+  fold $candidates as item; bytes starts 0:
+    yield add($bytes, $item.bytes) → candidateBytes
+  fold $closures as item; totals starts { closure = 0; avoided = 0 }:
+    port number.calculate { operation = "max"; values = list(0, add(count($item.references), -1)) } → copies
+    port number.calculate { operation = "multiply"; values = list($copies, if($item.payloadBytes, $item.payloadBytes, 0)) } → avoided
+    yield { closure = add($totals.closure, $item.bytes); avoided = add($totals.avoided, $avoided) } → totals
+  each list($candidateBytes, $totals.closure, $totals.avoided) as bytes:
+    port kernel.invoke { query = "diskPressure.natural"; input = $bytes } → valid
+    assert $valid
+      otherwise "Disk-pressure inventory totals exceed the safe integer range."
+  port kernel.invoke { query = "diskPressure.pressure"; input = { observed = $input.pressure; limits = $policy.pressure } } → pressure
+  let observed = $input.health.readiness
+  let readiness = { status = $observed.status; allow = $observed.allow; passed = and(eq($observed.status, $policy.readiness.expectedStatus),
+    eq($observed.allow, $policy.readiness.expectedAllow)) }
+  when $observed.error:
+    port record.put { record = $readiness; key = "error"; value = $observed.error } → readiness
+  port kernel.invoke { query = "diskPressure.seal"; input = $policy } → policyHash
+  let summary = { candidateCount = count($candidates); candidateBytes = $candidateBytes;
+    isolatedCount = add(add(count(filter($runtimes, "row", eq($row.status, "isolated"))),
+      count(filter($releases, "row", eq($row.classification, "isolated")))), count($ancillary));
+    unknownCount = count(filter($releases, "row", eq($row.classification, "unknown")));
+    dependencyClosureCount = count($closures); dependencyClosureBytes = $totals.closure; avoidedDependencyBytes = $totals.avoided;
+    evidenceCompleteRuntimeCount = count($runtimeEvidence); evidenceCompleteApplicationReleaseCount = count($releaseEvidence);
+    approvalRequired = not(eq(count($candidates), 0)) }
+  let body = { protocol = "sourcery/server-disk-pressure-assessment.v1"; mode = "dry-run-only"; createdAt = $input.createdAt;
+    policyHash = $policyHash; authority = $authority; pressure = $pressure; health = { services = $input.health.services; readiness = $readiness };
+    inventory = { runtimes = $runtimes; releases = $releases; dependencyClosures = $closures; ancillary = $ancillary };
+    summary = $summary; candidates = $candidates;
+    safety = { automaticDeletion = false; exactPathsRequired = true; freshScanRequiredAtExecution = true; explicitApprovalRequired = true };
+    retention = $policy.retention }
+  port kernel.invoke { query = "diskPressure.seal"; input = $body } → assessmentHash
+  port record.put { record = $body; key = "assessmentHash"; value = $assessmentHash } → result

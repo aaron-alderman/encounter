@@ -1,0 +1,64 @@
+process-module "temple/surface-process-module/1"
+
+process authorityClient.request:
+  let input = $eventInput
+  port number.isNatural { value = $input.timeoutMs } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($input.timeoutMs, 100) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($input.timeoutMs, 30000) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "Runtime authority timeout is invalid."
+  call authority.protocol
+  let protocol = $result
+  let body = $input.body
+  when includes(list("inspect-readiness", "sign-runtime-grant"), $input.operation):
+    port kernel.invoke { query = "authority.field"; input = $body.keyId } → key
+    assert $key
+      otherwise "Runtime grant key identity is invalid."
+    let result = { protocol = $protocol; requestId = $input.requestId; operation = $input.operation; keyId = $body.keyId }
+    when eq($input.operation, "sign-runtime-grant"):
+      assert $input.payloadValid
+        otherwise "Runtime grant signer requires a bounded payload."
+      port record.put { record = $result; key = "payload"; value = $body.payload } → result
+  when eq($input.operation, "authenticate-workload"):
+    assert includes(list("issue", "resolve"), $body.grantOperation)
+      otherwise "Runtime workload identity operation is invalid."
+    port kernel.invoke { query = "authority.field"; input = $body.presentedConsumerId } → consumer
+    assert or(eq($body.presentedConsumerId, null), $consumer)
+      otherwise "Presented runtime consumer identity is invalid."
+    let result = { protocol = $protocol; requestId = $input.requestId; operation = $input.operation;
+      grantOperation = $body.grantOperation; scope = $body.scope; presentedConsumerId = $body.presentedConsumerId }
+
+process authorityClient.response:
+  let input = $eventInput
+  let request = $input.request
+  let response = $input.response
+  let result = { error = "self-hosted-runtime-authority-response"; message = "Runtime authority returned a crossed response." }
+  when and(eq($response.protocol, $request.protocol), eq($response.requestId, $request.requestId)):
+    when eq($response.status, "denied"):
+      let code = "self-hosted-runtime-authority-denied"
+      port value.describe { value = $response.code } → shape
+      when eq($shape.type, "string"):
+        port text.matches { value = $response.code; pattern = "\\A[a-z0-9._-]{1,100}\\z" } → valid
+        when $valid:
+          let code = $response.code
+      let result = { error = $code; message = "Runtime authority denied the request." }
+    when eq($response.status, "ok"):
+      when eq($request.operation, "inspect-readiness"):
+        port number.isNatural { value = $response.workloadCount } → count
+        port number.calculate { operation = "lessEqual"; values = list($response.workloadCount, 10000) } → maximum
+        let result = { error = "self-hosted-runtime-authority-readiness";
+          message = "Runtime authority readiness does not match the active key and workload registry." }
+        when and(eq($response.keyId, $request.keyId), $count, $maximum, $response.workloadCount):
+          let result = { value = { protocol = $request.protocol; status = "ready"; keyId = $request.keyId;
+            workloadCount = $response.workloadCount } }
+      when eq($request.operation, "sign-runtime-grant"):
+        let result = { error = "self-hosted-runtime-authority-signature"; message = "Runtime authority returned an invalid signature." }
+        when $input.signatureValid:
+          let result = { value = { signature = $response.signature } }
+      when eq($request.operation, "authenticate-workload"):
+        port kernel.invoke { query = "authority.field"; input = $response.consumerId } → consumer
+        port kernel.invoke { query = "authority.hash"; input = $response.evidenceHash } → evidence
+        let result = { error = "self-hosted-runtime-authority-response"; message = "Runtime authority returned invalid workload evidence." }
+        when and($consumer, $evidence,
+          or(eq($request.presentedConsumerId, null), eq($response.consumerId, $request.presentedConsumerId))):
+          let result = { value = { consumerId = $response.consumerId; evidenceHash = $response.evidenceHash } }

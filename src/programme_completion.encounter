@@ -1,0 +1,199 @@
+process-module "temple/surface-process-module/1"
+
+process programmeCompletion.nonblank:
+  port value.type { value = $eventInput } → kind
+  let result = false
+  when eq($kind, "string"):
+    port text.trim { value = $eventInput } → trimmed
+    let result = not(eq($trimmed, ""))
+
+process programmeCompletion.entry:
+  let input = $eventInput
+  let entry = $input.entry
+  let expected = $input.expected
+  let subject = $expected.catalogueEntryId
+  let result = list()
+  when not($entry):
+    let result = list({ code = "unprojected-first-class-thing"; subject = $subject; detail = concat("No catalogue entry projects ", $expected.id, ".") })
+  when $entry:
+    let coordinate = at(at($entry, "projection"), "coordinate")
+    let standard = at(at($entry, "mechanisms"), "standard")
+    let underlying = at(at($entry, "mechanisms"), "underlying")
+    let evidence = at(at($entry, "admissibility"), "evidenceRefs")
+    when and($expected.kind, not(eq($entry.kind, $expected.kind))):
+      let result = append($result, list({ code = "catalogue-kind-drift"; subject = $subject;
+        detail = concat("Expected ", $expected.kind, "; observed ", or($entry.kind, "none"), ".") }))
+    when not($coordinate):
+      let result = append($result, list({ code = "missing-projection"; subject = $subject; detail = "A stable projection coordinate is required." }))
+    when and($expected.projection, not(eq($coordinate, $expected.projection))):
+      let result = append($result, list({ code = "projection-coordinate-drift"; subject = $subject;
+        detail = concat("Expected ", $expected.projection, "; observed ", or($coordinate, "none"), ".") }))
+    when not(and(isArray($standard), count($standard))):
+      let result = append($result, list({ code = "missing-standard-mechanism"; subject = $subject; detail = "The ordinary supported mechanism is absent." }))
+    when not(and(isArray($underlying), count($underlying))):
+      let result = append($result, list({ code = "missing-underlying-mechanism"; subject = $subject; detail = "The mechanism under the mechanism is absent." }))
+    fold list("inspect", "propose", "execute", "steward") as field; missing starts list():
+      port kernel.invoke { query = "programmeCompletion.nonblank"; input = at(at($entry, "authority"), $field) } → present
+      yield if($present, $missing, append($missing, list($field))) → missing
+    when count($missing):
+      port text.join { values = $missing; separator = ", " } → names
+      let result = append($result, list({ code = "missing-authority-boundary"; subject = $subject; detail = concat("Missing authority fields: ", $names, ".") }))
+    when and(eq(at(at($entry, "admissibility"), "state"), "admitted"), not(and(isArray($evidence), count($evidence)))):
+      let result = append($result, list({ code = "admitted-without-evidence"; subject = $subject; detail = "Admitted catalogue entries require evidence references." }))
+
+process programmeCompletion.sourceHash:
+  let observation = at($eventInput.observations, $eventInput.source)
+  let content = at($observation, "content")
+  port value.type { value = $content } → kind
+  let result = null
+  when and($observation, eq(at($observation, "source"), $eventInput.source), eq($kind, "string")):
+    port digest.sha256 { text = $content } → digest
+    when eq(at($observation, "contentHash"), $digest):
+      let result = $digest
+
+process programmeCompletion.evidence:
+  let input = $eventInput
+  let refs = if(isArray($input.refs), $input.refs, list())
+  fold $refs as ref; valid starts not(eq(count($refs), 0)):
+    port value.string { value = $ref } → key
+    port text.matches { value = $key; pattern = "\\Asha256:[a-f0-9]{64}\\z" } → syntax
+    let observation = at($input.observations, $key)
+    let content = at($observation, "content")
+    port value.type { value = $content } → kind
+    let verified = false
+    when and($syntax, eq($kind, "string")):
+      port digest.sha256 { text = $content } → digest
+      let verified = and(eq($key, concat("sha256:", $digest)), eq(at($observation, "contentHash"), $digest))
+      when $input.current:
+        let verified = and($verified, eq(at($observation, "source"), $input.source), eq(at($observation, "observedAt"), $input.time))
+    yield and($valid, $verified) → valid
+  let result = $valid
+
+process programmeCompletion.audit:
+  let input = $eventInput
+  let profile = $input.profile
+  let catalogue = $input.catalogue
+  assert eq(at($profile, "protocol"), "sourcery/programme-completeness-profile.v1")
+    otherwise "Exact programme completeness profile is required."
+  assert and(isArray($profile.tranches), eq(count($profile.tranches), 7))
+    otherwise "Completion profile must contain exactly seven tranches."
+  assert and(isArray($profile.programmes), eq(count($profile.programmes), 6))
+    otherwise "Completion profile must contain exactly six programme specimens."
+  assert and($profile.topology, $profile.terminology)
+    otherwise "Completion profile must state topology and terminology."
+  assert and(eq(at($catalogue, "protocol"), "sourcery-knowledge-catalogue/1"), isArray(at($catalogue, "entries")))
+    otherwise "An exact knowledge catalogue must be supplied."
+  assert and(isArray($input.integrationClaims), isArray($input.placeholderObservations))
+    otherwise "Integration claims and placeholder observations must be explicit arrays."
+  port value.describe { value = $input.sourceObservations } → sources
+  assert $sources.plain
+    otherwise "sourceObservations must contain exact observed source content."
+  port value.describe { value = $input.evidenceObservations } → evidence
+  assert $evidence.plain
+    otherwise "evidenceObservations must contain exact integration evidence content."
+  port kernel.invoke { query = "programmeCompletion.nonblank"; input = $input.observedAt } → time
+  assert $time
+    otherwise "observedAt is required."
+  port kernel.invoke { query = "knowledgeCatalogue.bodyDigest"; input = $catalogue } → digest
+  let findings = list()
+  when not(eq($catalogue.catalogueHash, $digest)):
+    let findings = list({ code = "catalogue-integrity-failed"; subject = or($catalogue.catalogueId, "catalogue"); detail = "Catalogue hash does not match its exact content." })
+  port record.fromEntries { entries = map($catalogue.entries, "entry", list($entry.id, $entry)) } → byId
+  fold $profile.tranches as tranche; findings starts $findings:
+    let entry = at($byId, $tranche.catalogueEntryId)
+    port kernel.invoke { query = "programmeCompletion.entry"; input = { entry = $entry; expected = $tranche } } → issues
+    let next = append($findings, $issues)
+    port kernel.invoke { query = "programmeCompletion.sourceHash"; input = { observations = $input.sourceObservations; source = $tranche.source } } → hash
+    when not($hash):
+      let next = append($next, list({ code = "missing-tranche-source"; subject = $tranche.id; detail = $tranche.source }))
+    when $hash:
+      let provenance = at($entry, "provenance")
+      when not(and(eq(at($provenance, "source"), $tranche.source), eq(at($provenance, "sourceHash"), $hash))):
+        let next = append($next, list({ code = "tranche-source-evidence-mismatch"; subject = $tranche.id; detail = $tranche.source }))
+      port text.matches { value = at(at($input.sourceObservations, $tranche.source), "content");
+        pattern = "(?:\\bTODO\\b|\\bTBD\\b|\\bFIXME\\b|not[- ]implemented|coming[- ]soon)"; flags = "iu" } → marker
+      when $marker:
+        let next = append($next, list({ code = "material-placeholder"; subject = $tranche.id; detail = concat("Material marker remains in ", $tranche.source, ".") }))
+    yield $next → findings
+  fold $profile.programmes as programme; findings starts $findings:
+    port record.put { record = $programme; key = "kind"; value = "programme" } → expected
+    port kernel.invoke { query = "programmeCompletion.entry"; input = { entry = at($byId, $programme.catalogueEntryId); expected = $expected } } → issues
+    yield append($findings, $issues) → findings
+  let term = $profile.terminology
+  let termEntry = at($byId, $term.catalogueEntryId)
+  port kernel.invoke { query = "programmeCompletion.entry"; input = { entry = $termEntry;
+    expected = { id = "terminology.srg"; catalogueEntryId = $term.catalogueEntryId; kind = "capability" } } } → issues
+  let findings = append($findings, $issues)
+  let provenance = at($termEntry, "provenance")
+  port kernel.invoke { query = "programmeCompletion.sourceHash"; input = { observations = $input.sourceObservations; source = at($provenance, "source") } } → hash
+  when not(and($hash, eq(at($provenance, "sourceHash"), $hash))):
+    let findings = append($findings, list({ code = "terminology-source-evidence-mismatch"; subject = $term.catalogueEntryId; detail = "Terminology projection is not bound to observed SRG source content." }))
+  port record.entries { value = $profile.topology } → roles
+  fold $roles as role; findings starts $findings:
+    let key = at($role, 0)
+    let expected = at($role, 1)
+    let observed = at($input.topology, $key)
+    let next = $findings
+    when not(eq($observed, $expected)):
+      let next = append($findings, list({ code = "topology-name-drift"; subject = $key;
+        detail = concat("Expected ", $expected, "; observed ", or($observed, "none"), ".") }))
+    yield $next → findings
+  let terminology = $input.terminology
+  when not(and(eq(at($terminology, "canonical"), $term.canonical), eq(at($terminology, "canonicalExpansion"), $term.canonicalExpansion))):
+    let findings = append($findings, list({ code = "terminology-canonical-drift"; subject = "SRG"; detail = "Canonical terminology must remain SRG: Semantic Representation Grammar." }))
+  fold $term.legacyAliases as alias; findings starts $findings:
+    let next = $findings
+    when not(includes(or(at($terminology, "legacyAliases"), list()), $alias)):
+      let next = append($findings, list({ code = "terminology-alias-missing"; subject = $alias;
+        detail = concat($alias, " must resolve as a legacy name for ", $term.canonical, ".") }))
+    yield $next → findings
+  fold append(list($term.canonical), $term.legacyAliases) as alias; findings starts $findings:
+    let next = $findings
+    when not(includes(or(at($termEntry, "aliases"), list()), $alias)):
+      let next = append($findings, list({ code = "terminology-catalogue-alias-missing"; subject = $alias;
+        detail = concat($alias, " must be discoverable through the canonical terminology catalogue entry.") }))
+    yield $next → findings
+  let history = at($terminology, "legacyHistory")
+  port value.type { value = $history } → historyType
+  let retained = false
+  when eq($historyType, "string"):
+    port text.matches { value = $history; pattern = "standalone/world era"; flags = "iu" } → retained
+  when not($retained):
+    let findings = append($findings, list({ code = "terminology-history-missing"; subject = "WCSS"; detail = "The standalone/world-era Temple/Sourcery history is required." }))
+  fold $input.integrationClaims as claim; findings starts $findings:
+    assert at($claim, "id")
+      otherwise "Each integration claim requires an id."
+    port kernel.invoke { query = "programmeCompletion.evidence"; input = { refs = $claim.evidenceRefs;
+      observations = $input.evidenceObservations; current = true; source = $claim.observedSource; time = $input.observedAt } } → verified
+    let next = $findings
+    when not(and($claim.observedSource, $verified)):
+      let next = append($next, list({ code = "stale-integration-claim"; subject = $claim.id; detail = "Integration claims require content-verified current source observations." }))
+    port kernel.invoke { query = "programmeCompletion.nonblank"; input = $claim.authorityBoundary } → authority
+    when not($authority):
+      let next = append($next, list({ code = "missing-authority-boundary"; subject = $claim.id; detail = "Integration claims require an explicit authority boundary." }))
+    yield $next → findings
+  fold $input.placeholderObservations as observation; findings starts $findings:
+    assert at($observation, "id")
+      otherwise "Each placeholder observation requires an id."
+    port value.string { value = or($observation.text, "") } → text
+    port text.matches { value = $text;
+      pattern = "(?:\\bTODO\\b|\\bTBD\\b|\\bFIXME\\b|\\bplaceholder\\b|not[- ]implemented|coming[- ]soon)"; flags = "iu" } → marker
+    port kernel.invoke { query = "programmeCompletion.evidence"; input = { refs = $observation.evidenceRefs;
+      observations = $input.evidenceObservations; current = false } } → verified
+    let next = $findings
+    when and(eq($observation.material, true), or($marker, not(eq($observation.resolved, true)), not($verified))):
+      let next = append($next, list({ code = "material-placeholder"; subject = $observation.id; detail = "Material scope remains placeholder, unresolved, or lacks content-verified evidence." }))
+    yield $next → findings
+  let keys = distinct(map($findings, "finding", concat($finding.code, ":", $finding.subject)))
+  port value.sort { values = $keys; mode = "locale" } → orderedKeys
+  fold $orderedKeys as key; ordered starts list():
+    yield append($ordered, filter($findings, "finding", eq(concat($finding.code, ":", $finding.subject), $key))) → ordered
+  let body = { protocol = "sourcery/programme-completeness-audit.v1"; profileProtocol = $profile.protocol;
+    catalogueHash = or($catalogue.catalogueHash, null); observedAt = $input.observedAt;
+    status = if(count($ordered), "incomplete", "complete");
+    gate = "all-seven-tranches-six-programmes-projected-with-authority-evidence-and-no-material-placeholders";
+    counts = { tranches = count($profile.tranches); programmes = count($profile.programmes); catalogueEntries = count($catalogue.entries); findings = count($ordered) };
+    findings = $ordered; authority = "read-only-completeness-assessment-no-admission-or-execution" }
+  port json.canonicalCompact { value = $body } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  port record.put { record = $body; key = "auditHash"; value = $hash } → result

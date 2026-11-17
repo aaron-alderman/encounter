@@ -1,0 +1,62 @@
+process-module "temple/surface-process-module/1"
+
+process google.settings:
+  let settings = $eventInput
+  port number.calculate { operation = "greaterEqual"; values = list($settings.port, 1) } → bindMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.port, 65535) } → bindMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.timeout, 500) } → timeoutMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.timeout, 30000) } → timeoutMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.ttl, 60000) } → ttlMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.ttl, 600000) } → ttlMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.sessionAge, 60) } → ageMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.sessionAge, 86400) } → ageMax
+  assert and($bindMin, $bindMax, $timeoutMin, $timeoutMax, $ttlMin, $ttlMax, $ageMin, $ageMax)
+    otherwise "Google identity listener, request deadline, or cookie lifetime is outside its permitted range."
+  let result = $settings
+
+process google.origin:
+  port text.matches { value = $eventInput; pattern = "\\Ahttps://(?:[A-Za-z0-9.-]+|\\[[0-9A-Fa-f:]+\\])(?::[0-9]{1,5})?/?\\z" } → valid
+  assert $valid
+    otherwise "SOURCERY_GOOGLE_PUBLIC_ORIGIN must be an HTTPS origin."
+  let result = $eventInput
+
+process google.route:
+  let request = $eventInput
+  let result = "missing"
+  when eq($request.method, "GET"):
+    let result = if(eq($request.path, "/identity/healthz"), "health",
+      if(eq($request.path, "/identity/login"), "login",
+      if(eq($request.path, "/identity/google/callback"), "callback", "missing")))
+
+process google.login:
+  let input = $eventInput
+  port text.matches { value = $input.returnPath; pattern = "\\A/(?!/)[^\\p{Cc}\\\\]{0,4095}\\z" } → safe
+  port number.calculate { operation = "divide"; values = list($input.ttl, 1000) } → seconds
+  port number.calculate { operation = "floor"; values = list($seconds) } → age
+  let result = { returnPath = if($safe, $input.returnPath, "/portal");
+    cookie = concat("__Host-sourcery_google=", $input.state, "; Path=/; Max-Age=", $age, "; Secure; HttpOnly; SameSite=Lax");
+    fields = { client_id = $input.client; redirect_uri = $input.callback; response_type = "code";
+      scope = "openid email profile"; state = $input.state; nonce = $input.nonce;
+      code_challenge = $input.challenge; code_challenge_method = "S256"; prompt = "select_account" } }
+
+process google.callback:
+  let callback = $eventInput
+  let result = null
+  when and($callback.pending, $callback.active, eq(count($callback.cookies), 1),
+    eq(at($callback.cookies, 0), $callback.state), not($callback.error), $callback.code):
+    let result = { code = $callback.code; client_id = $callback.client; redirect_uri = $callback.callback;
+      grant_type = "authorization_code"; code_verifier = $callback.verifier }
+
+process google.admission:
+  assert eq($eventInput.claims.nonce, $eventInput.expectedNonce)
+    otherwise "Google ID token nonce did not match."
+  let result = { idToken = $eventInput.idToken }
+
+process google.session:
+  let session = $eventInput
+  port text.matches { value = $session.token; pattern = "\\Asrc_session_[A-Za-z0-9_-]+\\z" } → valid
+  assert $valid
+    otherwise "A hosted browser cookie requires an opaque Sourcery session token."
+  let result = { sessionCookie = concat("__Host-sourcery_session=", $session.token, "; Path=/; Max-Age=", $session.age,
+      "; Secure; HttpOnly; SameSite=Lax");
+    clearCookie = "__Host-sourcery_google=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax" }

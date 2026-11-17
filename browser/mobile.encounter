@@ -1,0 +1,291 @@
+process-module "temple/surface-process-module/1"
+
+process mobile.tripStorage:
+  let result = { scope = "/workspace/mobile/"; worker = "/workspace/mobile/worker.mjs";
+    tripCache = "sourcery-mobile-trip-1"; session = "/workspace/mobile/local-session";
+    package = "/workspace/mobile/local-package"; receipt = "/workspace/mobile/local-receipt";
+    draftCache = "sourcery-mobile-pilot-drafts-1"; draftPrefix = "/workspace/mobile/pilot-draft/" }
+
+process mobile.pairRequest:
+  let suffix = if(eq($action, "claim"), "/claim", if(eq($action, "disconnect"), "/disconnect",
+    if(eq($action, "invalidate"), "/invalidate", if(eq($action, "receipt"), "/receipt", ""))))
+  let receipt = eq($action, "receipt")
+  let allowed = if(eq($action, "read"), true, not(eq($suffix, "")))
+  let result = { prefix = if($allowed, "/workspace/mobile/pair/", ""); suffix = $suffix;
+    method = if(eq($action, "read"), "GET", "POST"); authorization = "Bearer ";
+    digest = if($receipt, "digest", ""); challenge = if($receipt, "challenge", "") }
+
+# 0 refused, 1 no content, 2 read the body, 3 pairing expired.
+process mobile.pairReply:
+  let action = if($ok, if(eq($status, 204), 1, 2), if(eq($status, 404), 3, 0))
+  let message = if(eq($action, 3), "Pairing expired. Pair the phone again from Mobile.",
+    if(eq($action, 0), "The trip changed or confirmation was refused. Reconnect and check for the latest trip.", ""))
+  let result = { action = $action; message = $message }
+
+# 0 refuse the claim, 1 install it, 2 disconnect the previous pairing before installing.
+process mobile.claimAction:
+  port text.matches { value = $phone; pattern = "\\A[A-Za-z0-9_-]{43}\\z" } → validPhone
+  port text.matches { value = $code; pattern = "\\A[0-9]{6}\\z" } → validCode
+  let valid = and($validPhone, $validCode)
+  let replace = and($hasPrevious, not(eq($previous, $next)))
+  let message = if($valid, "", "Mobile received an invalid pairing response. Pair the phone again from Mobile.")
+  let result = { action = if($valid, if($replace, 2, 1), 0); message = $message }
+
+process mobile.invitationAdmission:
+  port text.matches { value = $id; pattern = "\\A[A-Za-z0-9_-]{16}\\z" } → validId
+  port text.matches { value = $bearer; pattern = "\\A[A-Za-z0-9_-]{43}\\z" } → validBearer
+  let result = and($pair, $validId, $validBearer)
+
+process mobile.digestText:
+  port text.matches { value = $digest; pattern = "\\A[a-f0-9]{64}\\z" } → matched
+  let result = $matched
+
+process mobile.draftBasis:
+  port text.matches { value = $task; pattern = "\\A[A-Za-z0-9_-]{1,80}\\z" } → validTask
+  port text.matches { value = $id; pattern = "\\A[A-Za-z0-9_-]{1,80}\\z" } → validId
+  let digest = $pin
+  call mobile.digestText
+  let validPin = $result
+  let digest = $base
+  call mobile.digestText
+  let result = and($validTask, $validId, $validPin, if(eq($base, "new"), true, $result))
+
+process mobile.snapshotInput:
+  let result = { hash = $hasText; message = if($hasText, "", "The trip copy is missing. Reconnect and send it again.") }
+
+process mobile.snapshotDigest:
+  let result = and(not(eq($claimed, "")), eq($actual, $claimed))
+
+process mobile.snapshotIntegrity:
+  call mobile.snapshotDigest
+  let result = { parse = $result; message = if($result, "", "The trip copy failed its integrity check. Reconnect and send it again.") }
+
+process mobile.refreshIntervals:
+  let result = { trip = 3000; drafts = 4000 }
+
+process mobile.snapshotAdmission:
+  port number.calculate { operation = "lessEqual"; values = list($expires, $now) } → expired
+  port number.calculate { operation = "less"; values = list(0, $count) } → hasItems
+  let complete = and($hasExpiry, $hasItems, eq($count, $expected), $sameRevision, $unique, $validItems)
+  let expired = and($hasExpiry, $expired)
+  let admit = and(not($expired), $complete)
+  let message = if($expired, "This trip copy expired. Reconnect and prepare it again.",
+    if($complete, "", "The trip item list is incomplete. Reconnect and send it again."))
+  let result = { admit = $admit; message = $message }
+
+# Return the start of the numeric suffix, or zero for a different identifier.
+process mobile.referenceOffset:
+  port text.startsWith { value = $id; search = "pilot-ref-" } → prefix
+  port number.calculate { operation = "less"; values = list(10, $length) } → hasSuffix
+  let result = if(and($prefix, $hasSuffix), 10, 0)
+
+process mobile.referenceDigits:
+  port text.matches { value = $digits; pattern = "\\A[0-9]{1,128}\\z" } → digitsOnly
+  let result = $digitsOnly
+
+process mobile.itemAdmission:
+  let basic = if(eq($id, "note"), true, eq($id, "project"))
+  let draft = eq($id, "pilot-draft")
+  let review = if(eq($id, "pilot-review"), true, eq($id, "pilot-plan"))
+  let evidence = if(eq($id, "pilot-checks"), true, eq($id, "pilot-diff"))
+  let pilot = if($draft, true, if($reference, true, if($review, true, $evidence)))
+  let result = and($text, if($basic, $nonempty, and($pilot, $title, if($draft, $validDraft, not($hasDraft)))))
+
+process mobile.tripItemView:
+  port text.startsWith { value = $id; search = "pilot-ref-" } → reference
+  let source = if($reference, true, eq($id, "pilot-diff"))
+  let draft = eq($id, "pilot-draft")
+  let result = { fallbackTitle = if(eq($id, "note"), "My first note", "Field visit task");
+    element = if($source, "pre", "p"); draft = $draft; position = if($draft, 1, $count) }
+
+# 0 leave online, 1 save the offline receipt, 2 confirmed local write, 3 failed write.
+process mobile.offlineReceipt:
+  let action = if($offline, if($reopened, if(eq($receipt, 2), 2, 3), 1), 0)
+  let message = if(eq($action, 2), "Offline check passed · all ",
+    if(eq($action, 3), "The offline receipt could not be saved. Reconnect and retry.", ""))
+  let detail = if(eq($action, 2), " selected items reopened. Reconnect to confirm Ready on your desktop.", "")
+  let result = { action = $action; message = $message; detail = $detail }
+
+# 0 reuse, 1 keep the open draft, 2 install, 3 invalidate and install.
+process mobile.tripAction:
+  let action = if($installed, 0, if($dirty, 1, if($confirmed, 3, 2)))
+  let ready = "Ready · this trip version reopened offline. Saved copies expire after 24 hours."
+  let check = "Trip saved. Turn on airplane mode, then reload this page to run the offline reopen check."
+  let held = "Save your open draft before switching to the new trip."
+  let saved = "Trip saved. Turn on airplane mode, then reload this page to check that every item reopens offline."
+  let message = if(eq($action, 0), if($confirmed, $ready, $check), if(eq($action, 1), $held, $saved))
+  let result = { action = $action; message = $message }
+
+process mobile.workerStartup:
+  let result = { register = not($active); refresh = and($active, $online) }
+
+# 0 request pairing, 1 resume removal, 2 reopen the trip.
+process mobile.pendingRemovalMessage:
+  let result = "Trip removed on this phone. Reconnect to end pairing on the desktop."
+
+process mobile.resumePairing:
+  let action = if($paired, if($pendingRemoval, 1, 2), 0)
+  call mobile.pendingRemovalMessage
+  let message = if(eq($action, 0), "Pair this phone from Mobile on your desktop to prepare a trip.",
+    if(eq($action, 1), $result, ""))
+  let result = { action = $action; message = $message }
+
+process mobile.canSynchronise:
+  let result = and(and(not($running), not($stopped)), and($booted, and($paired, $online)))
+
+# 0 wait for pairing, 1 wait for a trip, 2 inspect the trip.
+process mobile.roomAction:
+  let action = if(eq($status, "connected"), if($hasTrip, 2, 1), 0)
+  let message = if(eq($action, 1), "Phone paired. Choose what to take on your desktop, then send the trip.", "")
+  let result = { action = $action; message = $message }
+
+# 0 absent, 1 discard, 2 replay.
+process mobile.receiptAction:
+  let sameDigest = and(not(eq($digest, "")), eq($digest, $tripDigest))
+  let sameChallenge = and(not(eq($challenge, "")), eq($challenge, $tripChallenge))
+  let result = if($hasReceipt, if(and($sameDigest, $sameChallenge), 2, 1), 0)
+
+process mobile.receiptReply:
+  let superseded = and(not($accepted), eq($status, 409))
+  let clear = if($accepted, true, $superseded)
+  let message = if($superseded, "The desktop selection changed. Checking for the latest trip…", "")
+  let result = { retry = not($clear); confirm = $accepted; clear = $clear; message = $message }
+
+# 0 keep the current operation, 1 keep the open draft, 2 begin local removal.
+process mobile.localRemoval:
+  let busy = if($running, true, $stopped)
+  let action = if($busy, 0, if($dirty, 1, 2))
+  call mobile.pendingRemovalMessage
+  let message = if(eq($action, 1), "Save your open draft before removing this trip.",
+    if(eq($action, 2), $result, ""))
+  let result = { action = $action; message = $message }
+
+process mobile.canFinishRemoval:
+  let result = and($pending, $online, not($removing), not($removingLocally))
+
+process mobile.removalFinished:
+  let result = eq($status, 404)
+
+process mobile.removalMessages:
+  let result = { finished = "Trip and pairing removed from this phone. Pair again to prepare another trip.";
+    failed = "Could not remove the trip. Keep this page open and try again." }
+
+process mobile.draftRecordAdmission:
+  let knownState = if(eq($state, "pending"), true, if(eq($state, "sign-in"), true,
+    if(eq($state, "saved"), true, eq($state, "conflict"))))
+  let result = and($basis, $text, $sameKey, $knownState)
+
+process mobile.draftView:
+  let saved = eq($state, "saved")
+  let conflict = eq($state, "conflict")
+  let status = if($saved, 1, if($conflict, if($hasCurrent, 3, 2), if(eq($state, "sign-in"), 4, 0)))
+  let message = at(list(
+    "Saved on this phone. It will sync when Pilot is reachable.",
+    "Synced to Pilot staged comments.",
+    "The Pilot review or draft changed. Your phone copy is still here.",
+    "The desktop draft changed. Your phone copy is still here. Current Pilot draft: ",
+    "Sign in to Pilot to sync this draft."), $status)
+  let result = { message = $message; showInList = not(if($saved, true, $active)); removeWithTrip = $saved;
+    appendCurrent = eq($status, 3) }
+
+process mobile.draftSaveAdmission:
+  let result = $hasText
+
+process mobile.draftSaveState:
+  let result = if(eq($state, "conflict"), "conflict", "pending")
+
+process mobile.draftTextChanged:
+  let result = not(and(eq($currentLength, $savedLength), eq($current, $saved)))
+
+process mobile.canSyncDrafts:
+  let result = and(not($syncing), $online, $hasList)
+
+process mobile.draftPending:
+  let result = if(eq($state, "pending"), true, eq($state, "sign-in"))
+
+process mobile.pilotRoute:
+  let result = { path = "/encounter-pilot/task"; work = "1"; view = if($syncing, "", "comments"); travel = if($syncing, "1", ""); sync = if($syncing, "1", "") }
+
+process mobile.pilotRead:
+  let needsSession = if($redirected, true, if(eq($status, 401), true, eq($status, 403)))
+  let result = { readBody = and($ok, not($needsSession)); status = if($needsSession, "sign-in", "") }
+
+process mobile.pilotSubmit:
+  let send = and(eq($status, "open"), $hasCsrf)
+  let result = { send = $send; task = "task"; travel = "travel"; comment = "comment";
+    base = "draft-base"; pin = "pin"; note = "review-note"; csrf = "_csrf" }
+
+process mobile.pilotResult:
+  let signIn = if(eq($status, 401), true, eq($status, 403))
+  let replyStatus = if($ok, "", if($signIn, "sign-in", "retry"))
+  let result = { readBody = $ok; status = $replyStatus }
+
+process mobile.draftAction:
+  call mobile.draftPending
+  let eligible = and(eq($currentBase, $submittedBase), $result)
+  let digest = $replyBase
+  call mobile.digestText
+  let saved = and($eligible, eq($reply, "saved"), $result)
+  let conflict = and($eligible, if(eq($reply, "conflict"), true, eq($reply, "unavailable")))
+  let signIn = and($eligible, eq($reply, "sign-in"), not(eq($state, "sign-in")))
+  let nextState = if($saved, if($sameText, "saved", "pending"), if($conflict, "conflict", if($signIn, "sign-in", "")))
+  let result = { state = $nextState; updateBase = $saved; updateCurrent = $conflict }
+
+process mobile.shellPrefix:
+  let result = "sourcery-mobile-shell-"
+
+process mobile.phonePath:
+  let result = "/workspace/mobile/phone"
+
+process mobile.runtimePath:
+  let result = "/workspace/mobile/runtime.mjs"
+
+process mobile.shellPaths:
+  call mobile.shellPrefix
+  let prefix = $result
+  call mobile.phonePath
+  let phone = $result
+  call mobile.runtimePath
+  let result = { prefix = $prefix; phone = $phone; runtime = $result }
+
+process mobile.offlineMarkers:
+  let result = { online = "data-mobile-online"; offline = "data-mobile-offline"; removeHeader = "Content-Length" }
+
+process mobile.shellUnavailable:
+  let result = { message = "Mobile is unavailable. Reconnect and open your trip again."; status = 503 }
+
+# 0 leave the request to the browser, 1 phone shell, 2 shell runtime.
+process mobile.shellPathCode:
+  call mobile.phonePath
+  let phone = $result
+  call mobile.runtimePath
+  let result = if(eq($path, $phone), 1, if(eq($path, $result), 2, 0))
+
+process mobile.shellRoute:
+  call mobile.shellPathCode
+  let eligible = and($sameOrigin, eq($method, "GET"))
+  let result = if($eligible, $result, 0)
+
+# 0 network response, 1 cached runtime, 2 offline shell markup, 3 unavailable.
+process mobile.shellReply:
+  let result = if($networkOk, 0, if($hasCache, if(eq($route, 1), 2, 1), 3))
+
+process mobile.shellCacheKey:
+  call mobile.phonePath
+  let phone = $result
+  call mobile.runtimePath
+  let result = if(eq($route, 1), $phone, if(eq($route, 2), $result, ""))
+
+# Refresh only from the canonical phone document, in request order.
+process mobile.shellCacheRefresh:
+  port number.calculate { operation = "less"; values = list($latest, $request) } → newer
+  let refresh = and(eq($route, 1), not($hasQuery), not($redirected), $sameUrl,
+    eq($status, 200), eq($contentType, "text/html"), $hasPolicy, $newer)
+  let result = { refresh = $refresh; latest = if($refresh, $request, $latest) }
+
+process mobile.shellPolicyMatches:
+  let result = and(eq($currentLength, $savedLength), eq($current, $saved))
+
+process mobile.retiredShellCache:
+  call mobile.shellPrefix
+  let result = and(not(eq($key, $current)), eq($prefix, $result))

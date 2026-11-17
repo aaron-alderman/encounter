@@ -1,0 +1,197 @@
+process-module "temple/surface-process-module/1"
+
+process hostedOidc.refuse:
+  port json.stringify { value = $eventInput } → diagnostic
+  let result = raise($diagnostic)
+
+process hostedOidc.endpointSyntax:
+  port text.matches { value = if($eventInput, $eventInput, "");
+    pattern = "\\Ahttps://(?:[A-Za-z0-9._-]+|\\[[0-9A-Fa-f:]+\\])(?::(?:[0-9]{1,4}|[0-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?][!$&'()*+,./0-9:;=?@A-Z_~a-z%\\[\\]-]*)?\\z" } → result
+
+process hostedOidc.providers:
+  assert and(isArray($eventInput), count($eventInput))
+    otherwise "OIDC verification requires one or more provider configurations."
+  fold $eventInput as provider; result starts list():
+    let issuer = at($provider, "issuer")
+    let uri = at($provider, "jwksUri")
+    port value.type { value = $issuer } → issuerType
+    port value.type { value = $uri } → uriType
+    assert and(eq($issuerType, "string"), eq($uriType, "string"))
+      otherwise "OIDC provider configuration requires issuer and jwksUri strings."
+    port text.trim { value = $issuer } → issuer
+    port text.trim { value = $uri } → uri
+    port kernel.invoke { query = "hostedOidc.endpointSyntax"; input = $issuer } → issuerUrl
+    port text.matches { value = $issuer; pattern = "[?]" } → issuerQuery
+    assert and($issuerUrl, not($issuerQuery))
+      otherwise "OIDC issuer must be an HTTPS URL without user info, query, or fragment."
+    port kernel.invoke { query = "hostedOidc.endpointSyntax"; input = $uri } → jwksUrl
+    assert $jwksUrl
+      otherwise "OIDC JWKS URI must be an HTTPS URL without user info or fragment."
+    let existing = map($result, "entry", $entry.issuer)
+    assert not(includes($existing, $issuer))
+      otherwise "OIDC issuer is configured more than once."
+    yield append($result, list({ issuer = $issuer; jwksUri = $uri })) → result
+
+process hostedOidc.configuration:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedOidc.providers"; input = $input.providers } → providers
+  assert or(eq($input.localKeys, null), and(eq(count($providers), 1), isArray($input.localKeys)))
+    otherwise "Local OIDC keys require a single configured provider."
+  port kernel.invoke { query = "hostedOidc.cacheTtl"; input = $input.ttlMs } → ttl
+  port kernel.invoke { query = "hostedOidc.requestDeadline"; input = $input.timeoutMs } → timeout
+  let result = { providers = $providers; ttlMs = $ttl; timeoutMs = $timeout }
+
+process hostedOidc.cacheTtl:
+  port number.isNatural { value = $eventInput } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput, 1000) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 86400000) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "OIDC JWKS cache TTL must be between one second and 24 hours."
+  let result = $eventInput
+
+process hostedOidc.requestDeadline:
+  port number.isNatural { value = $eventInput } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput, 100) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 30000) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "OIDC JWKS timeout must be between 100 ms and 30 seconds."
+  let result = $eventInput
+
+process hostedOidc.jwksEndpoint:
+  let input = $eventInput
+  let entries = filter($input.endpoints, "endpoint", eq(at($endpoint, "issuer"), $input.issuer))
+  let uri = at(at($entries, 0), "jwksUri")
+  port kernel.invoke { query = "hostedOidc.endpointSyntax"; input = $uri } → https
+  when not(and(eq(count($entries), 1), $https)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-unavailable";
+      message = "The configured identity provider key set is unavailable." } } → denied
+  port kernel.invoke { query = "hostedOidc.requestDeadline"; input = $input.timeoutMs } → timeout
+  let result = { uri = $uri; timeoutMs = $timeout }
+
+process hostedOidc.jwksDocument:
+  let input = $eventInput
+  when $input.exceeded:
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-invalid";
+      message = "The configured identity provider key set exceeds the size limit." } } → denied
+  when not($input.available):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-unavailable";
+      message = "The configured identity provider key set is unavailable." } } → denied
+  when not($input.parsed):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-invalid";
+      message = "The configured identity provider key set is invalid JSON." } } → denied
+  let keys = at($input.document, "keys")
+  port number.calculate { operation = "lessEqual"; values = list(count($keys), 128) } → bounded
+  when not(and(isArray($keys), $bounded)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-invalid";
+      message = "The configured identity provider key set is invalid." } } → denied
+  let result = $keys
+
+process hostedOidc.admit:
+  let input = $eventInput
+  let header = $input.header
+  let claims = $input.claims
+  let kid = at($header, "kid")
+  port value.type { value = $kid } → kind
+  when not(and(includes(list("RS256", "ES256"), at($header, "alg")), eq($kind, "string"), $kid)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-algorithm-invalid";
+      message = "OIDC token signing algorithm or key identity is not admitted." } } → denied
+  when at($header, "critical"):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-header-invalid";
+      message = "OIDC token critical header extensions are not admitted." } } → denied
+  let issuer = at($claims, "iss")
+  let allowedIssuer = if(isArray($input.issuers), includes($input.issuers, $issuer), true)
+  let providers = map($input.endpoints, "endpoint", at($endpoint, "issuer"))
+  when not(and(includes($providers, $issuer), $allowedIssuer)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-issuer-invalid";
+      message = "OIDC token issuer is not configured." } } → denied
+  let audience = $input.audience
+  port value.type { value = $audience } → kind
+  let aud = at($claims, "aud")
+  let accepted = if(isArray($aud), includes($aud, $audience), eq($aud, $audience))
+  when not(and(eq($kind, "string"), $audience, $accepted)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-audience-invalid";
+      message = "OIDC token audience is invalid." } } → denied
+  port number.calculate { operation = "greater"; values = list(count($aud), 1) } → multiple
+  let azp = at($claims, "azp")
+  when and(or(and(isArray($aud), $multiple), not(eq($azp, null))), not(eq($azp, $audience))):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-authorized-party-invalid";
+      message = "OIDC token authorized party is invalid." } } → denied
+  let result = $issuer
+
+process hostedOidc.key:
+  let input = $eventInput
+  let header = $input.header
+  let keys = $input.keys
+  let admitted = filter($keys, "key", and(eq(at($key, "kid"), $header.kid),
+    or(not(at($key, "use")), eq(at($key, "use"), "sig")),
+    if(isArray(at($key, "key_ops")), includes(at($key, "key_ops"), "verify"), true),
+    or(not(at($key, "alg")), eq(at($key, "alg"), $header.alg)),
+    or(and(eq($header.alg, "RS256"), eq(at($key, "kty"), "RSA")),
+      and(eq($header.alg, "ES256"), eq(at($key, "kty"), "EC"), eq(at($key, "crv"), "P-256")))))
+  let result = at($admitted, 0)
+  when not(count($admitted)):
+    let result = null
+
+process hostedOidc.cachedKeys:
+  let input = $eventInput
+  let cache = $input.cache
+  let expiry = at($cache, "expiresAt")
+  port number.calculate { operation = "greater"; values = list($expiry, $input.nowMs) } → fresh
+  let keys = at($cache, "keys")
+  let result = null
+  when and(eq(at($cache, "issuer"), $input.issuer), $fresh, isArray($keys)):
+    let result = $keys
+
+process hostedOidc.cacheEntry:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedOidc.cacheTtl"; input = $input.ttlMs } → ttl
+  port number.calculate { operation = "add"; values = list($input.nowMs, $ttl) } → expires
+  let result = { issuer = $input.issuer; keys = $input.keys; expiresAt = $expires }
+
+process hostedOidc.select:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedOidc.key"; input = $input } → key
+  let result = { key = $key; refresh = false }
+  when eq($key, null):
+    when $input.refreshed:
+      port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-signing-key-missing";
+        message = "OIDC token signing key is not available." } } → denied
+    let result = { key = null; refresh = true }
+
+process hostedOidc.current:
+  let input = $eventInput
+  let claims = $input.claims
+  port number.calculate { operation = "divide"; values = list($input.nowMs, 1000) } → seconds
+  port number.calculate { operation = "floor"; values = list($seconds) } → now
+  port number.calculate { operation = "add"; values = list($now, 60) } → skew
+  let exp = at($claims, "exp")
+  port value.type { value = $exp } → kind
+  port number.calculate { operation = "greater"; values = list($exp, $now) } → later
+  when not(and(eq($kind, "number"), $later)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-token-expired";
+      message = "OIDC token has expired." } } → denied
+  each list(
+    list("nbf", "oidc-token-not-active", "OIDC token is not active."),
+    list("iat", "oidc-issued-at-invalid", "OIDC token issued-at time is invalid.")) as rule:
+    let time = at($claims, at($rule, 0))
+    when not(eq($time, null)):
+      port value.type { value = $time } → kind
+      port number.calculate { operation = "lessEqual"; values = list($time, $skew) } → bounded
+      when not(and(eq($kind, "number"), $bounded)):
+        port kernel.invoke { query = "hostedOidc.refuse"; input = { code = at($rule, 1); message = at($rule, 2) } } → denied
+  let subject = at($claims, "sub")
+  port value.type { value = $subject } → kind
+  when not(and(eq($kind, "string"), $subject)):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-subject-invalid";
+      message = "OIDC token subject is missing." } } → denied
+  let result = true
+
+process hostedOidc.signature:
+  let observation = $eventInput
+  when not($observation.keyValid):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-jwks-invalid";
+      message = "OIDC signing key is invalid." } } → denied
+  when not($observation.matched):
+    port kernel.invoke { query = "hostedOidc.refuse"; input = { code = "oidc-signature-invalid";
+      message = "OIDC token signature is invalid." } } → denied
+  port kernel.invoke { query = "hostedOidc.current"; input = $observation } → result

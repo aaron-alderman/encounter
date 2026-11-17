@@ -1,0 +1,84 @@
+process-module "temple/surface-process-module/1"
+
+# A zero caption is paused. A negative caption is refreshing.
+process countdown.caption:
+  port number.calculate { operation = "lessEqual"; values = list($remaining, 0) } → due
+  port number.calculate { operation = "divide"; values = list($remaining, 1000) } → seconds
+  port number.calculate { operation = "ceil"; values = list($seconds) } → rounded
+  let result = if(eq($interval, 0), 0, if(if($refreshing, true, $due), -1, $rounded))
+
+process countdown.dispatch:
+  port number.calculate { operation = "lessEqual"; values = list($remaining, 0) } → due
+  let result = and(not(eq($interval, 0)), not($refreshing), $due, $idle)
+
+process countdown.deadline:
+  let result = if($hasAnchor, add($anchor, $interval), $now)
+
+process countdown.anchor:
+  port number.calculate { operation = "subtract"; values = list($now, $deadline) } → lateness
+  port number.calculate { operation = "less"; values = list($lateness, 1000) } → onTime
+  let result = if($onTime, $deadline, $now)
+
+process countdown.delay:
+  port number.calculate { operation = "lessEqual"; values = list($remaining, 0) } → due
+  port number.calculate { operation = "divide"; values = list($remaining, 1000) } → seconds
+  port number.calculate { operation = "floor"; values = list($seconds) } → wholeSeconds
+  port number.calculate { operation = "multiply"; values = list($wholeSeconds, 1000) } → wholeMilliseconds
+  port number.calculate { operation = "subtract"; values = list($remaining, $wholeMilliseconds) } → remainder
+  let result = if(if($refreshing, true, $due), 250, if(eq($remainder, 0), 1000, $remainder))
+
+process countdown.bindingAllowed:
+  port text.matches { value = $ref; pattern = "\\A#[a-z0-9-]{1,80}\\z" } → validRef
+  port text.matches { value = $storage; pattern = "\\A[a-z0-9.-]{1,120}\\z" } → validStorage
+  port number.calculate { operation = "less"; values = list($used, 16) } → room
+  port number.calculate { operation = "lessEqual"; values = list(1, $count) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($count, 12) } → bounded
+  let result = and($validRef, not($duplicate), $room, $validStorage, $array, $nonempty, $bounded)
+
+process countdown.choiceAllowed:
+  port text.matches { value = $name; pattern = "\\A[a-z0-9-]{1,32}\\z" } → validName
+  port number.calculate { operation = "lessEqual"; values = list(1000, $milliseconds) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($milliseconds, 3600000) } → bounded
+  let interval = if(eq($milliseconds, 0), true, and($minimum, $bounded))
+  let result = and($validName, not($duplicate), $whole, $interval, not($defaultConflict))
+
+process countdown.optionsReady:
+  let result = and($hasDefault, $optionsPresent)
+
+process countdown.controlsAllowed:
+  let result = and($captionInPanel, $preferenceInPanel, $panelInDesktop, $correctTypes)
+
+process countdown.tickVisible:
+  let result = and($bound, not($panelHidden), not($desktopHidden))
+
+# Manual refresh restarts the interval. Scheduled refresh keeps its anchor.
+process countdown.refreshAnchor:
+  let result = and($bound, not($scheduled))
+
+process countdown.tick:
+  port number.calculate { operation = "less"; values = list(0, $requests) } → inFlight
+  let refreshing = if($scheduled, true, $inFlight)
+  call countdown.deadline
+  let deadline = $result
+  port number.calculate { operation = "subtract"; values = list($deadline, $now) } → remaining
+  call countdown.caption
+  let caption = $result
+  call countdown.dispatch
+  let dispatch = $result
+  call countdown.anchor
+  let nextAnchor = $result
+  call countdown.delay
+  let delay = if(eq($interval, 0), 0, $result)
+  let paused = eq($caption, 0)
+  let due = eq($caption, -1)
+  let showSeconds = and(not($paused), not($due))
+  let label = if($paused, "Paused", if($due, "Refreshing…", "Next refresh in "))
+  let suffix = if($showSeconds, "s", "")
+  let result = { caption = $caption; dispatch = $dispatch; anchor = $nextAnchor; delay = $delay; label = $label; suffix = $suffix; showSeconds = $showSeconds }
+
+process countdown.selectedInterval:
+  let result = if($known, $selected, $defaultInterval)
+
+process countdown.preferenceChoice:
+  let selected = if($known, $candidateSelected, $defaultSelected)
+  let result = { useCandidate = $known; update = not($selected) }

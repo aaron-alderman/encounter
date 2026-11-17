@@ -1,0 +1,73 @@
+process-module "temple/surface-process-module/1"
+
+process hostedPostgres.integer:
+  let input = $eventInput
+  port number.isNatural { value = $input.value } → whole
+  port number.calculate { operation = "greaterEqual"; values = list($input.value, $input.min) } → lower
+  port number.calculate { operation = "lessEqual"; values = list($input.value, $input.max) } → upper
+  assert and($whole, $lower, $upper)
+    otherwise "Self-hosted PostgreSQL pool limits must be bounded integers."
+  let result = $input.value
+
+process hostedPostgres.config:
+  let input = $eventInput
+  let options = $input.options
+  port value.describe { value = $options } → shape
+  assert $shape.plain
+    otherwise "Self-hosted PostgreSQL options are required."
+  port record.entries { value = $options } → entries
+  let keys = map($entries, "entry", at($entry, 0))
+  let allowed = list("applicationName", "connectionTimeoutMs", "database", "idleTimeoutMs",
+    "maximumConnections", "socketDirectory", "user")
+  assert not(some($keys, "key", not(includes($allowed, $key))))
+    otherwise "Self-hosted PostgreSQL has unsupported fields."
+  when $input.manifest:
+    let fields = list("database", "maximumConnections", "socketDirectory", "user")
+    assert and(eq(count($keys), count($fields)), not(some($fields, "field", not(includes($keys, $field)))),
+      $options.socketDirectory, $options.maximumConnections)
+      otherwise "Self-hosted PostgreSQL manifest must provide its exact connection fields."
+  let socket = or($options.socketDirectory, "/run/postgresql")
+  port text.matches { value = $socket; pattern = "\\A/[^,\\p{Cc}]+\\z" } → local
+  assert $local
+    otherwise "Self-hosted PostgreSQL requires an absolute Unix socket directory."
+  port text.replace { value = $socket; pattern = "\\A/var/run/"; replacement = "/run/" } → socket
+  port path.resolvePosix { base = "/"; path = $socket } → socket
+  port text.matches { value = $options.database; pattern = "\\A[a-z_][a-z0-9_]{0,62}\\z" } → database
+  port text.matches { value = $options.user; pattern = "\\A[a-z_][a-z0-9_]{0,62}\\z" } → role
+  assert and($database, $role)
+    otherwise "Self-hosted PostgreSQL database and user must be canonical PostgreSQL identifiers."
+  let application = or($options.applicationName, "sourcery-hosted")
+  port text.matches { value = $application; pattern = "\\A[a-z0-9._-]{1,63}\\z" } → name
+  assert $name
+    otherwise "Self-hosted PostgreSQL application name is invalid."
+  let maximum = if(and(includes($keys, "maximumConnections"), not(eq($options.maximumConnections, null))), $options.maximumConnections, 20)
+  let idle = if(and(includes($keys, "idleTimeoutMs"), not(eq($options.idleTimeoutMs, null))), $options.idleTimeoutMs, 30000)
+  let timeout = if(and(includes($keys, "connectionTimeoutMs"), not(eq($options.connectionTimeoutMs, null))), $options.connectionTimeoutMs, 5000)
+  port kernel.invoke { query = "hostedPostgres.integer"; input = { value = $maximum; min = 2; max = 100 } } → maximum
+  port kernel.invoke { query = "hostedPostgres.integer"; input = { value = $idle; min = 1000; max = 300000 } } → idle
+  port kernel.invoke { query = "hostedPostgres.integer"; input = { value = $timeout; min = 1000; max = 30000 } } → timeout
+  let result = { protocol = "sourcery.hosted/self-hosted-postgres.v1"; socketDirectory = $socket; port = 5432;
+    database = $options.database; user = $options.user; applicationName = $application;
+    maximumConnections = $maximum; idleTimeoutMs = $idle; connectionTimeoutMs = $timeout }
+  when $input.manifest:
+    let result = { socketDirectory = $socket; database = $options.database; user = $options.user; maximumConnections = $maximum }
+
+process hostedPostgres.ready:
+  let input = $eventInput
+  let observed = $input.observed
+  port number.isNatural { value = $observed.version } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($observed.version, 140000) } → version
+  assert and(eq($observed.database, $input.config.database), eq($observed.role, $input.config.user),
+    $integer, $version, eq($observed.checksums, "on"), eq($observed.inRecovery, false), eq($observed.unixSocket, true),
+    eq($observed.readOnly, "on"), eq($observed.isolation, "serializable"))
+    otherwise "Self-hosted PostgreSQL identity, primary status, version, or checksums are not ready."
+  port number.calculate { operation = "greaterEqual"; values = list($observed.version, 160000) } → reportsAuthentication
+  when $reportsAuthentication:
+    port value.describe { value = $observed.systemUser } → auth
+    assert eq($auth.type, "string")
+      otherwise "Self-hosted PostgreSQL must report Unix peer authentication."
+    port text.matches { value = $observed.systemUser; pattern = "\\Apeer:[^\\p{Cc}]+\\z" } → peer
+    assert $peer
+      otherwise "Self-hosted PostgreSQL must report Unix peer authentication."
+  let result = { protocol = $input.config.protocol; status = "ready"; database = $observed.database; role = $observed.role;
+    serverVersionNumber = $observed.version; dataChecksums = true; primary = true; transactionIsolation = $observed.isolation }

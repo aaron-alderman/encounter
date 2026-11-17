@@ -1,0 +1,209 @@
+process-module "temple/surface-process-module/1"
+
+process mcpObservation.text:
+  let input = $eventInput
+  port value.type { value = $input.value } → kind
+  assert eq($kind, "string")
+    otherwise "Observation text must be a bounded non-empty string."
+  port text.trim { value = $input.value } → trimmed
+  port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.maximum) } → bounded
+  assert and($trimmed, $bounded)
+    otherwise "Observation text must be a bounded non-empty string."
+  let result = $trimmed
+
+process mcpObservation.number:
+  let input = $eventInput
+  port value.type { value = $input.value } → kind
+  let result = false
+  when eq($kind, "number"):
+    port number.calculate { operation = "greaterEqual"; values = list($input.value, 0) } → nonnegative
+    let result = $nonnegative
+    when $input.integer:
+      port number.calculate { operation = "floor"; values = list($input.value) } → whole
+      let result = and($result, eq($input.value, $whole))
+
+process mcpObservation.verify:
+  let ledger = $eventInput
+  assert eq(at($ledger, "protocol"), "sourcery-mcp-observation-ledger/1")
+    otherwise "MCP observation ledger protocol is invalid."
+  port record.entries { value = $ledger } → fields
+  port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "ledgerHash"))) } → body
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  assert eq($ledger.ledgerHash, $hash)
+    otherwise "MCP observation ledger hash does not match its content."
+  let result = true
+
+process mcpObservation.seal:
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $eventInput } → hash
+  port record.put { record = $eventInput; key = "ledgerHash"; value = $hash } → result
+
+process mcpObservation.empty:
+  let input = $eventInput
+  port value.string { value = $input.catalogueHash } → catalogueHash
+  port text.matches { value = $catalogueHash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert and($valid, eq($input.catalogueHash, $catalogueHash))
+    otherwise "catalogueHash must be sha256 hex."
+  port kernel.invoke { query = "mcpObservation.text"; input = { value = $input.retainedAt; maximum = 4096 } } → retainedAt
+  port kernel.invoke { query = "mcpObservation.seal"; input = { protocol = "sourcery-mcp-observation-ledger/1";
+    catalogueHash = $catalogueHash; retainedAt = $retainedAt; observations = list(); proposals = list() } } → result
+
+process mcpObservation.optionalText:
+  let result = null
+  port value.type { value = $eventInput.value } → kind
+  when and(not(eq($eventInput.value, null)), not(eq($kind, "undefined"))):
+    port kernel.invoke { query = "mcpObservation.text"; input = $eventInput } → result
+
+process mcpObservation.normalize:
+  let raw = $eventInput
+  port kernel.invoke { query = "mcpObservation.text"; input = { value = $raw.tool; maximum = 256 } } → tool
+  port kernel.invoke { query = "mcpObservation.text"; input = { value = $raw.outcome; maximum = 32 } } → outcome
+  assert includes(list("failed", "succeeded"), $outcome)
+    otherwise "observation.outcome is unsupported."
+  port kernel.invoke { query = "mcpObservation.number"; input = { value = $raw.requestBytes; integer = true } } → request
+  assert $request
+    otherwise "observation.requestBytes must be a non-negative integer."
+  port kernel.invoke { query = "mcpObservation.number"; input = { value = $raw.responseBytes; integer = true } } → response
+  assert $response
+    otherwise "observation.responseBytes must be a non-negative integer."
+  port kernel.invoke { query = "mcpObservation.number"; input = { value = $raw.latencyMs; integer = false } } → latency
+  assert $latency
+    otherwise "observation.latencyMs must be non-negative."
+  port kernel.invoke { query = "mcpObservation.text"; input = { value = $raw.observedAt; maximum = 4096 } } → time
+  port kernel.invoke { query = "mcpObservation.optionalText"; input = { value = $raw.errorCode; maximum = 256 } } → error
+  port kernel.invoke { query = "mcpObservation.optionalText"; input = { value = $raw.missingCapability; maximum = 512 } } → missing
+  port kernel.invoke { query = "mcpObservation.optionalText"; input = { value = $raw.wrongnessSignal; maximum = 2000 } } → wrongness
+  let body = { tool = $tool; outcome = $outcome; requestBytes = $raw.requestBytes; responseBytes = $raw.responseBytes;
+    latencyMs = $raw.latencyMs; observedAt = $time; errorCode = $error; missingCapability = $missing; wrongnessSignal = $wrongness }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "observationId"; value = concat("mcp-observation.", $hash) } → result
+
+process mcpObservation.proposal:
+  let input = $eventInput
+  let body = { protocol = "sourcery-reflexive-remediation-proposal/1"; recordType = "remediation-ticket"; kind = "work-item";
+    trigger = $input.trigger; observationId = $input.observation.observationId;
+    title = concat("Investigate ", $input.trigger, " for ", $input.observation.tool);
+    details = $input.details; status = "proposed"; visibility = "catalogue-visible-proposal";
+    priority = if(eq($input.trigger, "failure"), "first", "unassessed");
+    authority = { formation = "automatic-from-retained-observation"; judgement = "llm-or-human-estimate-only";
+      admission = "separate-authorized-work-admission-required"; execution = "none" } }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "proposalId"; value = concat("remediation.", $hash) } → result
+
+process mcpObservation.append:
+  let input = $eventInput
+  let ledger = $input.ledger
+  port kernel.invoke { query = "mcpObservation.verify"; input = $ledger } → verified
+  let policy = $input.policy
+  port record.entries { value = $policy } → fields
+  port value.sort { values = map($fields, "field", at($field, 0)) } → keys
+  assert eq($keys, list("latencyMs", "requestBytes"))
+    otherwise "Reflexive policy requires exactly latencyMs and requestBytes thresholds."
+  port kernel.invoke { query = "mcpObservation.number"; input = { value = $policy.latencyMs; integer = false } } → latency
+  port kernel.invoke { query = "mcpObservation.number"; input = { value = $policy.requestBytes; integer = true } } → bytes
+  assert and($latency, $bytes, $policy.latencyMs, $policy.requestBytes)
+    otherwise "Reflexive policy thresholds must be positive numbers."
+  port kernel.invoke { query = "mcpObservation.normalize"; input = $input.observation } → observation
+  port number.calculate { operation = "greater"; values = list($observation.latencyMs, $policy.latencyMs) } → slow
+  port number.calculate { operation = "greater"; values = list($observation.requestBytes, $policy.requestBytes) } → large
+  let conditions = list(
+    { active = eq($observation.outcome, "failed"); trigger = "failure"; details = { errorCode = or($observation.errorCode, "unspecified") } },
+    { active = $observation.missingCapability; trigger = "missing-capability"; details = { capability = $observation.missingCapability } },
+    { active = $slow; trigger = "latency"; details = { observed = $observation.latencyMs; threshold = $policy.latencyMs } },
+    { active = $large; trigger = "request-size"; details = { observed = $observation.requestBytes; threshold = $policy.requestBytes } },
+    { active = $observation.wrongnessSignal; trigger = "wrongness-signal"; details = { signal = $observation.wrongnessSignal } })
+  fold $conditions as condition; generated starts list():
+    let next = $generated
+    when $condition.active:
+      port kernel.invoke { query = "mcpObservation.proposal"; input = { observation = $observation;
+        trigger = $condition.trigger; details = $condition.details } } → proposal
+      let next = append($next, list($proposal))
+    yield $next → generated
+  let candidates = append($ledger.proposals, $generated)
+  port record.fromEntries { entries = map($candidates, "proposal", list($proposal.proposalId, $proposal)) } → byId
+  port value.sort { values = distinct(map($candidates, "proposal", $proposal.proposalId)); mode = "locale" } → ids
+  let body = { protocol = "sourcery-mcp-observation-ledger/1"; catalogueHash = $ledger.catalogueHash;
+    retainedAt = $observation.observedAt; observations = append($ledger.observations, list($observation));
+    proposals = map($ids, "id", at($byId, $id)) }
+  port kernel.invoke { query = "mcpObservation.seal"; input = $body } → retained
+  let result = { ledger = $retained; observation = $observation; generatedProposals = $generated }
+
+process mcpObservation.summarize:
+  let ledger = $eventInput
+  port kernel.invoke { query = "mcpObservation.verify"; input = $ledger } → verified
+  let calls = count($ledger.observations)
+  let failures = count(filter($ledger.observations, "observation", eq($observation.outcome, "failed")))
+  fold $ledger.observations as observation; totals starts { latency = 0; request = 0; response = 0 }:
+    port number.calculate { operation = "add"; values = list($totals.latency, $observation.latencyMs) } → latency
+    port number.calculate { operation = "add"; values = list($totals.request, $observation.requestBytes) } → request
+    port number.calculate { operation = "add"; values = list($totals.response, $observation.responseBytes) } → response
+    yield { latency = $latency; request = $request; response = $response } → totals
+  let failureRate = 0
+  let average = 0
+  when $calls:
+    port number.calculate { operation = "divide"; values = list($failures, $calls) } → failureRate
+    port number.calculate { operation = "divide"; values = list($totals.latency, $calls) } → average
+  let result = { protocol = "sourcery-mcp-observation-summary/1"; ledgerHash = $ledger.ledgerHash; calls = $calls;
+    failures = $failures; failureRate = $failureRate; latencyMs = { total = $totals.latency; average = $average };
+    bytes = { request = $totals.request; response = $totals.response }; proposalCount = count($ledger.proposals) }
+
+process mcpObservation.retentionPolicy:
+  let policy = $eventInput
+  let bounds = list("maximumBytes", "maximumEntries", "maximumObservationBytes", "maximumRequestBytes", "maximumResponseBytes", "maximumWindowMs")
+  port value.describe { value = $policy } → shape
+  assert $shape.plain
+    otherwise "Observation retention policy requires explicit bounds and overflow behavior."
+  port record.entries { value = $policy } → fields
+  port value.sort { values = map($fields, "field", at($field, 0)) } → keys
+  assert eq($keys, append($bounds, list("overflow")))
+    otherwise "Observation retention policy requires explicit bounds and overflow behavior."
+  assert eq($policy.overflow, "reject-requires-explicit-archive")
+    otherwise "Observation retention policy is invalid."
+  each $bounds as key:
+    let value = at($policy, $key)
+    port kernel.invoke { query = "mcpObservation.number"; input = { value = $value; integer = true } } → bound
+    assert and($bound, $value)
+      otherwise "Observation retention policy is invalid."
+  let result = $policy
+
+process mcpObservation.checkRetention:
+  let input = $eventInput
+  let ledger = $input.ledger
+  port kernel.invoke { query = "mcpObservation.verify"; input = $ledger } → verified
+  assert eq($ledger.catalogueHash, $input.catalogueHash)
+    otherwise "Observation ledger belongs to a different catalogue."
+  port kernel.invoke { query = "mcpObservation.retentionPolicy"; input = $input.policy } → policy
+  port json.stringify { value = $ledger } → encoded
+  port text.utf8Length { value = $encoded } → bytes
+  port number.calculate { operation = "lessEqual"; values = list($bytes, $policy.maximumBytes) } → size
+  port number.calculate { operation = "lessEqual"; values = list(count($ledger.observations), $policy.maximumEntries) } → count
+  assert and($size, $count)
+    otherwise "Observation ledger retention bound reached; explicit archive or larger admitted policy is required."
+  each $ledger.observations as observation:
+    port json.stringify { value = $observation } → encoded
+    port text.utf8Length { value = $encoded } → bytes
+    port number.calculate { operation = "lessEqual"; values = list($bytes, $policy.maximumObservationBytes) } → size
+    assert $size
+      otherwise "Observation entry size bound reached; explicit archive or larger admitted policy is required."
+    port number.calculate { operation = "lessEqual"; values = list($observation.requestBytes, $policy.maximumRequestBytes) } → request
+    assert $request
+      otherwise "Observation request size bound reached; explicit archive or larger admitted policy is required."
+    port number.calculate { operation = "lessEqual"; values = list($observation.responseBytes, $policy.maximumResponseBytes) } → response
+    assert $response
+      otherwise "Observation response size bound reached; explicit archive or larger admitted policy is required."
+  assert eq(count($input.times), count($ledger.observations))
+    otherwise "Expected one timestamp observation per retained MCP call."
+  let times = filter($input.times, "time", not(eq($time, null)))
+  when count($times):
+    port number.calculate { operation = "min"; values = $times } → first
+    port number.calculate { operation = "max"; values = $times } → last
+    port number.calculate { operation = "subtract"; values = list($last, $first) } → window
+    port number.calculate { operation = "lessEqual"; values = list($window, $policy.maximumWindowMs) } → bounded
+    assert $bounded
+      otherwise "Observation ledger time window reached; explicit archive is required."
+  let result = true
+
+process mcpObservation.compareAndSwap:
+  let input = $eventInput
+  assert or(eq($input.expected, null), eq($input.expected, $input.current))
+    otherwise "Observation ledger compare-and-swap conflict; reload before retrying."
+  let result = true

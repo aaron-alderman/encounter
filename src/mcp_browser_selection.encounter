@@ -1,0 +1,77 @@
+process-module "temple/surface-process-module/1"
+
+process mcpBrowserSelection.form:
+  let input = $eventInput
+  let csrf = filter($input.fields, "field", eq(at($field, 0), "csrf"))
+  let ids = filter($input.fields, "field", eq(at($field, 0), "portfolio"))
+  port number.calculate { operation = "lessEqual"; values = list($input.size, 16384) } → fits
+  let result = { error = "encoding" }
+  when eq($input.mime, "application/x-www-form-urlencoded"):
+    let result = { error = "size" }
+    when $fits:
+      let result = { error = "csrf" }
+      when eq(count($csrf), 1):
+        let result = { csrf = at(at($csrf, 0), 1); cookieName = "__Host-sourcery_mcp_portfolio";
+          selected = map($ids, "field", at($field, 1)) }
+
+process mcpBrowserSelection.binding:
+  let input = $eventInput
+  let claims = $input.claims
+  let href = $claims.authorizeHref
+  port value.describe { value = $href } → path
+  port number.isNatural { value = $claims.expiresAt } → expiration
+  let result = false
+  when and(eq($claims.protocol, "sourcery-mcp-workspace-csrf/1"), eq($claims.userId, $input.userId),
+    eq($path.type, "string"), $expiration):
+    port number.calculate { operation = "lessEqual"; values = list($claims.expiresAt, 9007199254740991) } → safe
+    when $safe:
+      port number.calculate { operation = "greater"; values = list($claims.expiresAt, $input.nowMs) } → result
+
+process mcpBrowserSelection.plan:
+  let input = $eventInput
+  let selections = $input.selected
+  let result = { error = "selection" }
+  when eq(count($selections), 1):
+    let matches = filter($input.portfolios, "item", eq($item.id, at($selections, 0)))
+    let result = { error = "stale" }
+    when eq(count($matches), 1):
+      let existing = filter($input.query, "field", eq(at($field, 0), "sourcery_portfolio"))
+      let result = { error = "retained" }
+      when and(eq($input.path, "/oauth/authorize"), not(count($existing))):
+        let selected = at($matches, 0)
+        port json.stringify { value = $input.query } → encoded
+        port digest.sha256 { text = $encoded } → requestHash
+        let expires = add($input.nowMs, 300000)
+        let result = { claims = { protocol = "sourcery-mcp-workspace-selection/1";
+          userId = $input.userId; requestHash = $requestHash; scope = $selected.scope;
+          summary = $selected.summary; nonce = $input.nonce; expiresAt = $expires } }
+
+process mcpBrowserSelection.error:
+  let reason = $eventInput
+  let status = 503
+  let error = "server_error"
+  let description = "Workspace selection could not be completed."
+  when eq($reason, "session"):
+    let status = 401
+    let error = "access_denied"
+    let description = "A valid signed-in Sourcery browser session is required."
+  when eq($reason, "encoding"):
+    let status = 415
+    let error = "invalid_request"
+    let description = "Workspace selection requires form encoding."
+  when eq($reason, "size"):
+    let status = 413
+    let error = "invalid_request"
+    let description = "Workspace selection is too large."
+  when includes(list("csrf", "binding", "stale"), $reason):
+    let status = 403
+    let error = "access_denied"
+    let description = if(eq($reason, "csrf"), "Workspace-selection CSRF validation failed.",
+      if(eq($reason, "binding"), "Workspace selection is invalid, expired, or belongs to another user.",
+        "The selected MCP application portfolio is no longer available. Browser application access and a shared identity provider do not establish this authority."))
+  when includes(list("selection", "retained"), $reason):
+    let status = 400
+    let error = "invalid_request"
+    let description = if(eq($reason, "selection"), "Select exactly one organizational boundary.",
+      "The retained authorization request is invalid.")
+  let result = { status = $status; body = { error = $error; error_description = $description } }

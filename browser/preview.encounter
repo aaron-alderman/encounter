@@ -1,0 +1,156 @@
+process-module "temple/surface-process-module/1"
+
+process preview.formContext:
+  let notify = eq($action, "notify-sick")
+  let increase = and(eq($action, "adjust-sick"), eq($step, "7"))
+  let context = if($notify, "notify", if(eq($action, "approve-sick"), "approve", if($increase, "increase", if(eq($action, "approve-reduction"), "confirm", ""))))
+  let useListItem = and($hasListItem, not(eq($context, "")), not($notify))
+  let result = { context = $context; useListItem = $useListItem }
+
+process preview.approvedContext:
+  let result = if(eq($approvedCount, 1), if(eq($step, "3"), "approve", if(eq($step, "6"), "confirm", "")), "")
+
+process preview.commonTargets:
+  let result = { screen = "screen"; app = "app" }
+
+process preview.menuTarget:
+  let result = if($emptyValue, "screen", "")
+
+process preview.targetAdmission:
+  let result = and($hasId, $visible)
+
+# 0 ignore, 1 cancel picking, 2 choose the focused target.
+process preview.pickKey:
+  let activation = if(eq($key, "Enter"), true, eq($key, " "))
+  let choose = and($hasTarget, $activation)
+  let result = if($picking, if(eq($key, "Escape"), 1, if($choose, 2, 0)), 0)
+
+process preview.selectionView:
+  let hasValue = not(eq($value, ""))
+  let hasLinkContext = and($hasTarget, $hasValue)
+  let scrollTarget = and($scroll, $hasTarget)
+  let scrollApp = and($scrollTarget, eq($value, "app"))
+  let unavailable = and($hasValue, not($hasTarget))
+  let label = and($hasTarget, not($picking), not(eq($value, "screen")))
+  let message = if($unavailable, "This area is unavailable in the current preview.", if($label, "Highlighted: ", ""))
+  let url = if($updateUrl, if($hasValue, 2, 1), 0)
+  let result = { url = $url; linkContext = $hasLinkContext;
+    scrollApp = $scrollApp; scrollBlock = if($scrollTarget, if($scrollApp, "start", "center"), "");
+    updateStatus = if($unavailable, true, not($picking)); label = $label;
+    message = $message; fallback = if($label, "selected area", "") }
+
+process preview.optionDisabled:
+  let result = and(not(eq($value, "")), not($available))
+
+process preview.selectValue:
+  let result = and($available, not(eq($value, "screen")))
+
+process preview.commentVisible:
+  let result = if(eq($filterLength, 0), true, and(eq($filterLength, $contextLength), eq($filter, $context)))
+
+process preview.returnVisible:
+  port number.calculate { operation = "subtract"; values = list($viewport, 120) } → threshold
+  port number.calculate { operation = "less"; values = list($top, $threshold) } → aboveThreshold
+  port number.calculate { operation = "less"; values = list(0, $bottom) } → belowTop
+  let result = and($offered, not(and($aboveThreshold, $belowTop)))
+
+# 0 common targets, 1 leave controls, 2 timesheet entries, 3 report sections.
+process preview.targetFamily:
+  let result = if(eq($route, "sick-leave"), 1, if(eq($route, "timesheet"), 2, if(eq($route, "report"), 3, 0)))
+
+process preview.leaveStep:
+  port text.endsWith { value = $path; search = "-3/sick-leave" } → approval
+  port text.endsWith { value = $path; search = "-6/sick-leave" } → confirmation
+  port text.endsWith { value = $path; search = "-7/sick-leave" } → increase
+  let result = if($approval, "3", if($confirmation, "6", if($increase, "7", "")))
+
+process preview.targetSelectors:
+  let leave = eq($family, 1)
+  let timesheet = eq($family, 2)
+  let primary = if($leave, "form", if($timesheet, "section[aria-label='Your entries'] li a[href]", ""))
+  let secondary = if($leave, "main > ul > li", if($timesheet, "li", ""))
+  let coordinate = if($leave, "action", if($timesheet, "entry", ""))
+  let result = { primary = $primary; secondary = $secondary; coordinate = $coordinate;
+    forms = $leave; links = $timesheet; report = eq($family, 3) }
+
+process preview.reportTarget:
+  let id = if(eq($index, 0), "filters", if(eq($index, 1), "employee-totals", if(eq($index, 2), "minutes-by-employee", "")))
+  let selector = if(eq($index, 0), "[aria-label='Report filters']", if(eq($index, 1), "table[aria-label='Employee totals']",
+    if(eq($index, 2), "section[aria-label='Minutes by employee']", "")))
+  let result = { id = $id; selector = $selector }
+
+process preview.pickClick:
+  let result = and($picking, $hasTarget)
+
+# A shared target keeps its selected context, or the first available context.
+process preview.pickAlias:
+  let initialise = not($hasAlias)
+  let result = { bind = if($selected, true, $initialise); initialise = $initialise }
+
+process preview.pickerStarts:
+  let result = and(not($picking), $hasTargets)
+
+# 0 ignore an unavailable option, 1 select the screen, 2 select the named target.
+process preview.menuChoice:
+  let available = if($emptyValue, $screenAvailable, $targetAvailable)
+  let result = if($available, if($emptyValue, 1, 2), 0)
+
+# The menu scrolls to the selected area. Picking and returning open the composer.
+process preview.selectionFollowup:
+  let fromMenu = eq($source, "menu")
+  let returning = eq($source, "return")
+  let compose = if($returning, true, eq($source, "picker"))
+  let focusFilter = and(not($fromMenu), not($compose))
+  let result = { scroll = $fromMenu; syncSelect = and(not($fromMenu), not($returning));
+    focusSidebar = not($fromMenu); focusComposer = $compose; focusFilter = $focusFilter;
+    sidebarBlock = "nearest"; filterBlock = "center" }
+
+process preview.commentControls:
+  let result = { back = "Back to comments"; clear = "Show all comments" }
+
+process preview.commentSummary:
+  port number.calculate { operation = "less"; values = list(0, $count) } → showList
+  let separator = if($filtered, " · ", "")
+  let suffix = if(eq($count, 1), " comment", " comments")
+  let result = { showList = $showList; showCaption = $filtered; separator = $separator; suffix = $suffix }
+
+# 0 skip, 1 app scope, 2 screen start, 3 list item, 4 before the target.
+process preview.commentBadge:
+  let placement = if($hasTarget, if($onApp, 1, if($onScreen, 2, if($inList, 3, 4))), 0)
+  let prefix = if(eq($context, "screen"), "This screen · ", "")
+  let suffix = if(eq($count, 1), " comment", " comments")
+  let result = { placement = $placement; prefix = $prefix; suffix = $suffix; labelSeparator = ": " }
+
+# A blank label asks the browser port for the target's accessible label.
+process preview.contextLabel:
+  let result = if(eq($context, "screen"), "This screen", if(eq($context, "app"), "Whole app", ""))
+
+process preview.sameContext:
+  let result = and(eq($currentLength, $savedLength), eq($current, $saved))
+
+# Sources follow the order of the observed menu, the target, and the comment.
+process preview.contextLabelSource:
+  let source = if($option, 1, if($element, 2, if($comment, 3, 0)))
+  let result = { source = $source; fallback = if(eq($source, 0), "Selected area", "") }
+
+process preview.pickerView:
+  let button = if($active, "Cancel picking", "Pick on preview")
+  let notice = if($active, "Pick an area, this screen, or Whole app. Press Escape to cancel.", "")
+  let result = { button = $button; notice = $notice }
+
+process preview.paneAdmission:
+  let result = and($hasPane, not($alreadyBound))
+
+process preview.leaveCard:
+  port text.endsWith { value = $statusTail; search = " approved minutes" } → approved
+  port text.startsWith { value = $reductionHead; search = "Reduction to " } → reduction
+  let proposalContext = if(and($reduction, not($proposalFound)), "propose", "")
+  let result = { approved = $approved; proposalContext = $proposalContext }
+
+# Coordinate order remains stable regardless of the incoming query order.
+process preview.supportCoordinates:
+  let result = { task = "review-task"; entry = "entry"; context = "context"; source = "source" }
+
+process preview.panePlan:
+  let result = { useDefault = and($hasMenu, not($hasSelection)); showPicker = $hasMenu;
+    showPanePicker = and($hasMenu, $hasTargets); scroll = $jumpOnLoad }

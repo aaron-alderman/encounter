@@ -1,0 +1,219 @@
+process-module "temple/surface-process-module/1"
+
+process admissionHandoff.payloadHash:
+  let input = $eventInput
+  let defaults = or($input.defaults, list())
+  fold $input.fields as field; payload starts { protocol = $input.protocol }:
+    let item = at($input.record, $field)
+    let item = if(includes($defaults, $field), if($item, $item, ""), $item)
+    port value.type { value = $item } → kind
+    let updated = $payload
+    when not(eq($kind, "undefined")):
+      port record.put { record = $payload; key = $field; value = $item } → updated
+    yield $updated → payload
+  let encoded = ""
+  when $input.canonical:
+    port json.canonical { value = $payload } → encoded
+  when not($input.canonical):
+    port json.stringify { value = $payload } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  let result = concat("sha256:", $hash)
+
+process admissionHandoff.exactTime:
+  port time.parseRfc3339 { value = $eventInput } → result
+  port time.formatUtc { milliseconds = $result; fractional = true } → canonical
+  assert eq($eventInput, $canonical)
+    otherwise "Retained semantic handoff requires an exact UTC instant."
+
+process admissionHandoff.claim:
+  let claim = $eventInput
+  port text.trim { value = concat($claim.statement) } → statement
+  port text.trim { value = concat($claim.falsifier) } → falsifier
+  port text.trim { value = concat($claim.basisRevision) } → revision
+  assert and($statement, $falsifier, $revision, isArray($claim.scope))
+    otherwise "Retained semantic restake requires an exact epistemic claim."
+  fold $claim.scope as value; scope starts list():
+    port text.trim { value = concat($value) } → item
+    yield if($item, append($scope, list($item)), $scope) → scope
+  assert count($scope)
+    otherwise "Retained semantic restake requires an explicit claim scope."
+  port value.sort { values = $scope } → ordered
+  port json.canonicalCompact { value = { protocol = "sourcery-epistemic-claim/0"; statement = $statement;
+    scope = $ordered; falsifier = $falsifier; basisRevision = $revision } } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  let result = concat("sha256:", $hash)
+
+process admissionHandoff.restake:
+  let proposal = $eventInput
+  let restake = $proposal.restake
+  assert eq($restake.protocol, "sourcery-semantic-authoring-restake-authorization/1")
+    otherwise "Invalid retained semantic restake authorization protocol."
+  port kernel.invoke { query = "admissionHandoff.payloadHash"; input = { protocol = $restake.protocol; record = $restake;
+    canonical = true; fields = list("workspaceId", "workspaceHash", "workspaceHeadHash", "predecessor", "successorDraft",
+      "successorClaim", "dispositionEvent", "lineagePolicy", "authority", "productMutation", "predecessorMutation",
+      "lifecycleAuthority") } } → authorization
+  assert eq($authorization, $restake.authorizationHash)
+    otherwise "Retained semantic restake authorization hash does not verify."
+  let draft = $restake.successorDraft
+  assert eq(at($draft, "protocol"), "sourcery-semantic-authoring-restake-draft/1")
+    otherwise "Invalid retained semantic restake draft."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $draft; omit = list("draftHash") } } → draftHash
+  port kernel.invoke { query = "admissionHandoff.claim"; input = $draft.claim } → claimHash
+  assert and(eq(concat("sha256:", $draftHash), $draft.draftHash), eq($claimHash, $draft.claim.claimHash))
+    otherwise "Retained semantic restake draft or claim hash does not verify."
+  let event = $restake.dispositionEvent
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $event; omit = list("eventHash") } } → eventHash
+  assert and(eq(concat("sha256:", $eventHash), $event.eventHash), eq($event.kind, "draft-disposition"),
+    eq($event.action, "authorize"), eq($event.draftHash, $draft.draftHash))
+    otherwise "Retained semantic restake lacks the exact draft authorization event."
+  let successor = $restake.successorClaim
+  port json.canonical { value = $successor } → successorBytes
+  port json.canonical { value = $draft.claim } → claimBytes
+  port value.type { value = at($successor, "subject") } → subjectType
+  port value.type { value = $proposal.target } → targetType
+  assert and(eq($successorBytes, $claimBytes), eq($successor.claimHash, $proposal.claimHash),
+    or(not(eq($subjectType, "undefined")), eq($targetType, "undefined")))
+    otherwise "Retained semantic restake successor does not match the proposal."
+  assert and(eq($restake.authority, "joinedHumanSuccessorSelection"), eq($restake.productMutation, "none"),
+    eq($restake.predecessorMutation, "none"), eq($restake.lifecycleAuthority, "not-yet-authored"),
+    eq($restake.lineagePolicy, "coordinate-linked-durable-workspace-retains-full-origin-and-all-branches"),
+    eq($proposal.humanWording.successorRationale, $draft.rationale))
+    otherwise "Retained semantic restake authority or human rationale does not match."
+  let result = true
+
+process admissionHandoff.proposal:
+  let proposal = $eventInput
+  assert eq(at($proposal, "protocol"), "sourcery-semantic-authoring-proposal/1")
+    otherwise "Invalid retained semantic proposal protocol."
+  let initial = list("compiler", "target", "claimHash", "basisRevision", "request", "changeName", "intent", "scope",
+    "adjudicationHash", "lifecycleHeadHash", "interpretation", "finalAdjudication", "lifecycle", "retainedAlternatives", "portability")
+  let fields = append(append($initial, if($proposal.restake, list("restake"), list())),
+    list("humanWording", "constraints", "nextCall", "authority", "productMutation"))
+  port kernel.invoke { query = "admissionHandoff.payloadHash";
+    input = { protocol = $proposal.protocol; record = $proposal; fields = $fields } } → proposalHash
+  assert eq($proposalHash, $proposal.proposalHash)
+    otherwise "Retained semantic proposal hash does not verify."
+  assert and(eq($proposal.authority, "proposalOnly"), eq($proposal.productMutation, "none"),
+    eq($proposal.mutatedSemanticFacts, false), eq($proposal.nextCall.tool, "sourcery_admission_inspect"),
+    eq($proposal.nextCall.args.intentDetail, "full"), eq($proposal.nextCall.args.semanticAuthoringHandoff.operation, "challenge"),
+    eq($proposal.downstreamTemplate.tool, "sourcery_change_start"),
+    eq($proposal.downstreamTemplate.status, "awaiting-admission-inspection"))
+    otherwise "Retained semantic proposal crosses its evidence-only authoring boundary."
+  let alternatives = $proposal.retainedAlternatives
+  assert isArray($alternatives)
+    otherwise "Retained semantic proposal lacks its alternatives."
+  port number.calculate { operation = "greaterEqual"; values = list(count($alternatives), 2) } → enough
+  let subjects = map($alternatives, "item", $item.subject)
+  assert and($enough, eq(count(distinct($subjects)), count($subjects)),
+    every($alternatives, "item", and($item.subject, $item.label, $item.reading, isArray($item.consequences),
+      or(eq($item.selected, true), eq($item.selected, false)))),
+    some($alternatives, "item", $item.selected))
+    otherwise "Retained semantic proposal alternatives are incomplete."
+  let decision = $proposal.finalAdjudication
+  port kernel.invoke { query = "admissionHandoff.payloadHash"; input = { protocol = "sourcery-inquiry-adjudication/1";
+    record = $decision; defaults = list("authoredInquiry"); fields = list("lattice", "kind", "options", "authoredInquiry",
+      "rationale", "scope", "authoredBy", "authoredAt", "authority") } } → decisionHash
+  assert and(eq($decision.authority, "joinedHuman"), eq($decision.adjudicationHash, $proposal.adjudicationHash),
+    eq($decisionHash, $proposal.adjudicationHash), isArray($decision.retainedOptions))
+    otherwise "Retained semantic proposal lacks its exact joined-human adjudication."
+  port value.sort { values = $subjects } → alternativesSorted
+  port value.sort { values = map($decision.retainedOptions, "item", $item.subject) } → retainedSorted
+  assert and(eq($alternativesSorted, $retainedSorted),
+    every($alternatives, "item", eq($item.selected, includes($decision.options, $item.subject))))
+    otherwise "Retained semantic proposal alternatives do not match the adjudication."
+  let lifecycle = $proposal.lifecycle
+  let events = at($lifecycle, "events")
+  assert and(eq($lifecycle.status, "active"), eq($lifecycle.headHash, $proposal.lifecycleHeadHash),
+    eq($lifecycle.currentAdjudicationHash, $proposal.adjudicationHash), isArray($events), count($events))
+    otherwise "Retained semantic proposal lifecycle is not the active adjudication."
+  port number.calculate { operation = "subtract"; values = list(count($events), 1) } → last
+  let head = at($events, $last)
+  assert eq($head.eventHash, $proposal.lifecycleHeadHash)
+    otherwise "Retained semantic proposal lifecycle head does not match."
+  each $events as event:
+    port kernel.invoke { query = "admissionHandoff.payloadHash"; input = {
+      protocol = "sourcery-adjudication-lifecycle-transition/1"; record = $event;
+      fields = list("lifecycle", "adjudicationHash", "predecessorHash", "kind", "resultingStatus", "reason", "scope",
+        "authoredBy", "effectiveAt", "validFrom", "validUntil", "replacementAdjudicationHash", "authority",
+        "authorizationBasisHash", "decisionText");
+      defaults = list("validUntil", "replacementAdjudicationHash", "authorizationBasisHash", "decisionText") } } → eventHash
+    assert eq($eventHash, $event.eventHash)
+      otherwise "Retained semantic proposal lifecycle event hash does not verify."
+  each list("claimStatement", "finalDecisionText", "lifecycleDecisionText") as field:
+    port text.trim { value = at($proposal.humanWording, $field) } → wording
+    assert $wording
+      otherwise "Retained semantic proposal requires exact human wording."
+  assert and(eq($proposal.humanWording.finalDecisionText, $decision.decisionText),
+    eq($proposal.humanWording.lifecycleDecisionText, $head.decisionText))
+    otherwise "Retained semantic proposal wording does not match its decisions."
+  when $proposal.portability:
+    let portability = $proposal.portability
+    let adoption = $portability.localAdoption
+    port kernel.invoke { query = "admissionHandoff.payloadHash"; input = {
+      protocol = "sourcery-local-adjudication-adoption/1"; record = $adoption; defaults = list("decisionText");
+      fields = list("grammar", "evidenceHash", "assessmentHash", "retainedAssessmentHashes", "mapping", "context",
+        "localAdjudicationHash", "lineageDifferences", "rationale", "authoredBy", "authoredAt", "decisionText", "authority") } } → adoptionHash
+    assert and(eq($portability.authority, "joinedHumanLocalAdoption"), eq($portability.adoptionHash, $adoptionHash),
+      eq($adoption.adoptionHash, $adoptionHash), eq($proposal.humanWording.localAdoptionDecisionText, $adoption.decisionText))
+      otherwise "Retained semantic proposal local adoption does not verify."
+  when $proposal.restake:
+    port kernel.invoke { query = "admissionHandoff.restake"; input = $proposal } → restake
+  let result = true
+
+process admissionHandoff.verify:
+  let evidence = $eventInput
+  assert eq(at($evidence, "protocol"), "sourcery-semantic-authoring-handoff-evidence/1")
+    otherwise "Invalid retained semantic handoff evidence protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $evidence; omit = list("hash", "handle") } } → evidenceHash
+  assert and(eq($evidence.hash, $evidenceHash), eq($evidence.handle, concat("handoff.", $evidenceHash)),
+    eq($evidence.authority, "retainedEvidenceOnly"), eq($evidence.productMutation, "none"), at($evidence.provider, "id"))
+    otherwise "Retained semantic handoff evidence identity or authority does not verify."
+  port time.parseRfc3339 { value = $evidence.acceptedAt } → accepted
+  port time.parseRfc3339 { value = $evidence.expiresAt } → expiry
+  port number.calculate { operation = "lessEqual"; values = list($accepted, $expiry) } → timely
+  assert $timely
+    otherwise "Retained semantic handoff was accepted after expiry."
+  let envelope = $evidence.envelope
+  assert eq(at($envelope, "protocol"), "sourcery-semantic-authoring-handoff-envelope/1")
+    otherwise "Invalid retained semantic handoff envelope protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $envelope; omit = list("envelopeHash") } } → envelopeHash
+  assert eq($envelopeHash, $envelope.envelopeHash)
+    otherwise "Retained semantic handoff envelope hash does not verify."
+  port kernel.invoke { query = "admissionHandoff.proposal"; input = $envelope.proposal } → proposal
+  port json.canonical { value = $envelope.humanWording } → envelopeWording
+  port json.canonical { value = $envelope.proposal.humanWording } → proposalWording
+  assert and(eq($envelope.proposalHash, $envelope.proposal.proposalHash), eq($envelopeWording, $proposalWording),
+    eq($envelope.relay.sourceSurface, "/workbench/claim-field"), eq($envelope.relay.browserMutationTransport, "none"),
+    eq($envelope.authority, "callerAttestedProposalEvidence"), eq($envelope.productMutation, "none"))
+    otherwise "Retained semantic handoff envelope does not bind the proposal wording and authority."
+  let challenge = $envelope.challenge
+  assert eq(at($challenge, "protocol"), "sourcery-semantic-authoring-handoff-challenge/1")
+    otherwise "Invalid retained semantic handoff challenge protocol."
+  port kernel.invoke { query = "admissionEvidence.digest"; input = { record = $challenge; omit = list("challengeHash") } } → challengeHash
+  assert and(eq($challengeHash, $challenge.challengeHash), eq($challengeHash, $envelope.challengeHash),
+    eq($challenge.authority, "readOnlyAdmissionChallenge"), eq($challenge.productMutation, "none"),
+    or(not($evidence.connectionId), eq($challenge.connectionId, $evidence.connectionId)))
+    otherwise "Retained semantic handoff challenge identity, connection or authority does not verify."
+  let basis = $evidence.admission
+  let declared = at($basis, "passed")
+  port value.type { value = $declared } → declaredType
+  assert and(at($basis, "application"), or(eq($declaredType, "undefined"), $declared))
+    otherwise "Retained semantic handoff requires an admitted application basis."
+  port kernel.invoke { query = "admissionEvidence.hash"; input = $basis.artifactHash } → artifactHash
+  port json.canonical { value = { artifactHash = $basis.artifactHash; application = $basis.application;
+    buildReceiptHash = or($basis.buildReceiptHash, null); authoringIntentHash = or($basis.authoringIntentHash, null) } } → basisBytes
+  port json.canonical { value = $challenge.admission } → admittedBytes
+  assert eq($basisBytes, $admittedBytes)
+    otherwise "Retained semantic handoff challenge does not bind the admission basis."
+  port kernel.invoke { query = "admissionHandoff.exactTime"; input = $envelope.issuedAt } → issued
+  port kernel.invoke { query = "admissionHandoff.exactTime"; input = $envelope.expiresAt } → expires
+  port kernel.invoke { query = "admissionHandoff.exactTime"; input = $challenge.issuedAt } → challengeIssued
+  port kernel.invoke { query = "admissionHandoff.exactTime"; input = $challenge.expiresAt } → challengeExpires
+  port number.calculate { operation = "greaterEqual"; values = list($issued, $challengeIssued) } → issuedWithin
+  port number.calculate { operation = "lessEqual"; values = list($expires, $challengeExpires) } → expiresWithin
+  port number.calculate { operation = "greater"; values = list($expires, $accepted) } → envelopeLive
+  port number.calculate { operation = "greater"; values = list($challengeExpires, $accepted) } → challengeLive
+  port number.calculate { operation = "lessEqual"; values = list($challengeIssued, add($accepted, 30000)) } → challengeStarted
+  assert and($issuedWithin, $expiresWithin, $envelopeLive, $challengeLive, $challengeStarted)
+    otherwise "Retained semantic handoff falls outside its challenge or acceptance window."
+  let result = true

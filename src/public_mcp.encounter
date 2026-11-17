@@ -1,0 +1,343 @@
+process-module "temple/surface-process-module/1"
+
+process publicMcp.surface:
+  call mcpProjectPortfolio.definition
+  let project = $result
+  port record.entries { value = $project.inputSchema.properties } → arguments
+  let result = {
+    methods = list("initialize", "server/discover", "notifications/initialized", "tools/list", "tools/call", "ping");
+    tools = list("sourcery_project");
+    projectActions = $project.inputSchema.properties.action.enum;
+    projectArguments = map($arguments, "argument", at($argument, 0));
+    scope = "authoring.read"
+  }
+
+process publicMcp.transport:
+  let result = { authority = "mcp.sourcerytech.com.au" }
+
+process publicMcp.route:
+  let request = $eventInput
+  let method = $request.method
+  let path = $request.path
+  let result = "refuse"
+  when and(eq($path, "/health"), eq($method, "GET"), not($request.query)):
+    let result = "health"
+  when and(eq($path, "/mcp"), eq($method, "POST"), not($request.query), eq($request.type, "application/json")):
+    let result = "mcp"
+  when and(eq($method, "GET"), eq($path, "/oauth/authorize")):
+    let result = "authorize"
+  when and(eq($method, "POST"), eq($path, "/oauth/portfolio"), not($request.query)):
+    let result = "portfolio"
+  when and(eq($method, "POST"), eq($path, "/oauth/consent"), not($request.query)):
+    let result = "consent"
+  when and(eq($method, "POST"), includes(list("/oauth/token", "/oauth/revoke"), $path)):
+    let result = "oauth"
+  when and(eq($method, "POST"), eq($path, "/oauth/register")):
+    let result = "oauthUnavailable"
+  when and(eq($method, "GET"), eq($path, "/.well-known/oauth-authorization-server")):
+    let result = "authorizationMetadata"
+  when and(eq($method, "GET"), eq($path, "/.well-known/oauth-protected-resource/mcp")):
+    let result = "resourceMetadata"
+
+process publicMcp.admitAuthorization:
+  let contract = $eventInput
+  call publicMcp.surface
+  let surface = $result
+  call publicMcp.transport
+  let transport = $result
+  let origin = concat("https://", $transport.authority)
+  assert and(eq($contract.protocol, "sourcery-hosted-mcp-authorization/1"),
+    eq($contract.resource, concat($origin, "/mcp")), eq($contract.authorizationServers, list(concat($origin, "/"))),
+    eq($contract.discoveryScope, $surface.scope), eq($contract.modes.unmappedTool, "denyV1"))
+    otherwise "The public MCP boundary requires its matched authorization contract."
+  assert and(eq($contract.modes.authorizationFlow, "authorizationCodePkceS256ResourceIndicatorV1"),
+    eq($contract.modes.consentInteraction, "authoredConsequenceSignedDoubleSubmitV1"),
+    eq($contract.modes.workspaceSelection, "explicitCurrentApplicationPortfolioEncryptedResumeV1"),
+    eq($contract.modes.authorizationCode, "singleUseDigestClientRedirectPkceResourceBoundV1"),
+    eq($contract.modes.accessToken, "opaqueDigestAudienceScopeGrantBoundV1"),
+    eq($contract.modes.refreshToken, "rotatingFamilyReplayRevocationV1"))
+    otherwise "The public MCP boundary requires the supported authorization and consent modes."
+  assert eq(at($contract.scopeImplications, $surface.scope), list())
+    otherwise "The public MCP read scope must grant no additional scopes."
+  each $surface.tools as tool:
+    assert eq(at($contract.toolScopes, $tool), $surface.scope)
+      otherwise "Public MCP tools must belong to the authored read scope."
+  let issuer = at($contract.authorizationServers, 0)
+  let scopes = list($surface.scope)
+  let result = { transport = $transport; origin = $origin;
+    challenge = concat("Bearer resource_metadata=\"", $origin, "/.well-known/oauth-protected-resource/mcp\", scope=\"", $surface.scope, "\"");
+    resourceMetadata = { resource = $contract.resource; authorization_servers = $contract.authorizationServers;
+      scopes_supported = $scopes; bearer_methods_supported = list("header") };
+    authorizationMetadata = { issuer = $issuer; authorization_endpoint = concat($issuer, "oauth/authorize");
+      token_endpoint = concat($issuer, "oauth/token"); revocation_endpoint = concat($issuer, "oauth/revoke");
+      response_types_supported = list("code"); grant_types_supported = list("authorization_code", "refresh_token");
+      code_challenge_methods_supported = list("S256"); token_endpoint_auth_methods_supported = list("none");
+      scopes_supported = $scopes;
+      client_id_metadata_document_supported = includes($contract.clientRegistrationModes, "clientIdMetadataDocumentV1") } }
+
+process publicMcp.ingress:
+  let input = $eventInput
+  port text.lowerCase { value = $input.accept } → accept
+  port text.matches { value = $input.authorization; pattern = "\\ABearer [A-Za-z0-9._~+/-]+\\z" } → bearer
+  let result = "bearer"
+  when not($bearer):
+    let result = "challenge"
+  when not(and(includes($accept, "application/json"), includes($accept, "text/event-stream"))):
+    let result = "accept"
+  when and($input.origin, not(eq($input.origin, $input.publicOrigin))):
+    let result = "origin"
+
+process publicMcp.ingressError:
+  let input = $eventInput
+  let code = -32600
+  let message = "Origin is not allowed."
+  when eq($input.reason, "challenge"):
+    let code = -32001
+    let message = "Authentication is required."
+  when eq($input.reason, "accept"):
+    let message = "MCP requests must accept application/json and text/event-stream."
+  let error = { code = $code; message = $message }
+  when eq($input.reason, "accept"):
+    port record.put { record = $error; key = "data"; value = {
+      sourceryCode = "accept-invalid"; requestId = $input.requestId } } → error
+  let status = if(eq($input.reason, "challenge"), "401 Unauthorized",
+    if(eq($input.reason, "accept"), "406 Not Acceptable", "403 Forbidden"))
+  let result = { status = $status; body = { jsonrpc = "2.0"; id = null; error = $error } }
+
+process publicMcp.projectUnavailable:
+  let result = { jsonrpc = "2.0"; id = $eventInput; error = { code = -32603; message = "Hosted project authority is unavailable." } }
+
+process publicMcp.health:
+  let result = { status = "ready"; lane = "public-read-only"; serverPush = false }
+
+process publicMcp.refuse:
+  let result = { jsonrpc = "2.0"; id = $eventInput; error = {
+    code = -32003; message = "Public MCP/Temple lane is read-only.";
+    data = { sourceryCode = "public-lane-read-only"; authority = "no-server-push"; privateLaneRequired = true }
+  } }
+
+process publicMcp.invalid:
+  let result = { error = "public-read-request-refused"; authority = "no-server-push" }
+
+process publicMcp.oauthUnavailable:
+  let result = { error = "invalid_request"; error_description = "OAuth endpoint not found." }
+
+process publicMcp.portfolioCookies:
+  let result = list(
+    "__Host-sourcery_mcp_portfolio=; Path=/oauth/portfolio; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+    "__Host-sourcery_mcp_portfolio=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
+
+process publicMcp.consentCookies:
+  let result = list(
+    "__Host-sourcery_mcp_consent=; Path=/oauth/consent; Max-Age=0; Secure; HttpOnly; SameSite=Lax",
+    "__Host-sourcery_mcp_consent=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Lax")
+
+process publicMcp.oauth:
+  call publicMcp.surface
+  let scope = $result.scope
+  fold $eventInput as supplied; admitted starts true:
+    port value.describe { value = $supplied } → shape
+    let valid = false
+    when eq($shape.type, "string"):
+      port text.split { value = $supplied; pattern = "\\s+" } → words
+      fold $words as word; matches starts true:
+        yield and($matches, eq($word, $scope)) → matches
+      let valid = or(eq($supplied, ""), $matches)
+    yield and($admitted, $valid) → result
+
+process publicMcp.oauthForm:
+  let input = $eventInput
+  let revoke = eq($input.path, "/oauth/revoke")
+  let values = map(filter($input.fields, "field", eq(at($field, 0), "grant_type")), "field", at($field, 1))
+  let grant = if($revoke, "revoke", at($values, 0))
+  let result = { error = "encoding" }
+  when eq($input.mime, "application/x-www-form-urlencoded"):
+    let result = { error = "unsupported" }
+    when and(not($revoke), not(and(eq(count($values), 1), $grant))):
+      let result = { error = "parameter"; detail = "grant_type" }
+    when or($revoke, and(eq(count($values), 1), includes(list("authorization_code", "refresh_token"), $grant))):
+      let key = if($revoke, "token", if(eq($grant, "authorization_code"), "code", "refresh_token"))
+      let required = if($revoke, list("client_id", $key), if(eq($grant, "authorization_code"),
+        list($key, "client_id", "redirect_uri", "resource", "code_verifier"), list($key, "client_id", "resource")))
+      fold $required as field; missing starts "":
+        let supplied = map(filter($input.fields, "entry", eq(at($entry, 0), $field)), "entry", at($entry, 1))
+        yield if(or($missing, and(eq(count($supplied), 1), at($supplied, 0))), $missing, $field) → missing
+      let result = { error = "parameter"; detail = $missing }
+      when not($missing):
+        let credential = at(map(filter($input.fields, "field", eq(at($field, 0), $key)), "field", at($field, 1)), 0)
+        port digest.sha256 { text = $credential } → digest
+        let result = { grant = $grant; digest = $digest }
+        when not($revoke):
+          let client = at(map(filter($input.fields, "field", eq(at($field, 0), "client_id")), "field", at($field, 1)), 0)
+          let resource = at(map(filter($input.fields, "field", eq(at($field, 0), "resource")), "field", at($field, 1)), 0)
+          let redirect = at(map(filter($input.fields, "field", eq(at($field, 0), "redirect_uri")), "field", at($field, 1)), 0)
+          let verifier = at(map(filter($input.fields, "field", eq(at($field, 0), "code_verifier")), "field", at($field, 1)), 0)
+          let result = { grant = $grant; digest = $digest; client = $client; resource = $resource;
+            redirect = if(eq($grant, "authorization_code"), $redirect, ""); verifier = if(eq($grant, "authorization_code"), $verifier, "") }
+          when eq($grant, "authorization_code"):
+            port text.matches { value = $verifier; pattern = "\\A[A-Za-z0-9._~-]{43,128}\\z" } → pkce
+            when not($pkce):
+              let result = { error = "pkce" }
+
+process publicMcp.oauthError:
+  let input = $eventInput
+  let status = "503 Service Unavailable"
+  let error = "server_error"
+  let description = "The public OAuth scope authority is unavailable."
+  when eq($input.reason, "encoding"):
+    let status = "415 Unsupported Media Type"
+    let error = "invalid_request"
+    let description = "OAuth token operations require form encoding."
+  when eq($input.reason, "parameter"):
+    let status = "400 Bad Request"
+    let error = "invalid_request"
+    let description = concat("OAuth parameter ", $input.detail, " is missing or repeated.")
+  when eq($input.reason, "unsupported"):
+    let status = "400 Bad Request"
+    let error = "unsupported_grant_type"
+    let description = "Only authorization_code and refresh_token grants are supported."
+  when eq($input.reason, "responseType"):
+    let status = "400 Bad Request"
+    let error = "unsupported_response_type"
+    let description = "Only the authorization code response type is supported."
+  when eq($input.reason, "challenge"):
+    let status = "400 Bad Request"
+    let error = "invalid_request"
+    let description = "S256 PKCE with a valid code challenge is required."
+  when eq($input.reason, "authorizationTarget"):
+    let status = "400 Bad Request"
+    let error = "invalid_target"
+    let description = "The authorization request targets a different resource."
+  when eq($input.reason, "unknown"):
+    let status = "400 Bad Request"
+    let error = "invalid_grant"
+    let description = if(eq($input.detail, "authorization_code"), "The authorization code or its binding is invalid.",
+      "The refresh token or its binding is invalid.")
+  when eq($input.reason, "outside"):
+    let status = "400 Bad Request"
+    let error = "invalid_scope"
+    let description = "The retained grant is outside the public read scope."
+  when eq($input.reason, "target"):
+    let status = "400 Bad Request"
+    let error = "invalid_target"
+    let description = "The token request targets a different resource."
+  when eq($input.reason, "pkce"):
+    let status = "400 Bad Request"
+    let error = "invalid_grant"
+    let description = "The PKCE verifier is invalid."
+  when eq($input.reason, "replay"):
+    let status = "400 Bad Request"
+    let error = "invalid_grant"
+    let description = "Refresh-token replay revoked the complete token family."
+  when eq($input.reason, "reply"):
+    let status = "502 Bad Gateway"
+    let description = "The OAuth response is outside the public read scope."
+  let result = { status = $status; body = { error = $error; error_description = $description } }
+
+process publicMcp.oauthTokenReply:
+  let input = $eventInput
+  let reply = $input.body
+  port value.describe { value = $reply } → shape
+  let result = false
+  when $shape.plain:
+    call publicMcp.surface
+    let scope = $result.scope
+    let allowed = if($input.success, list("scope", "token_type", "access_token", "refresh_token", "expires_in"),
+      list("error", "error_description", "sourcery_diagnostic"))
+    port kernel.invoke { query = "publicMcp.keys"; input = { object = $reply; allowed = $allowed } } → keys
+    port value.describe { value = $reply.access_token } → access
+    port value.describe { value = $reply.refresh_token } → refresh
+    port value.describe { value = $reply.expires_in } → lifetime
+    port value.describe { value = $reply.error } → error
+    let result = and($keys, if($input.success,
+      and(eq($reply.scope, $scope), eq($reply.token_type, "Bearer"), eq($access.type, "string"), $reply.access_token,
+        eq($refresh.type, "string"), $reply.refresh_token, eq($lifetime.type, "number")),
+      and(eq($error.type, "string"), not(eq($reply.error, "")))))
+
+process publicMcp.keys:
+  let object = $eventInput.object
+  let allowed = $eventInput.allowed
+  port value.describe { value = $object } → shape
+  let result = false
+  when $shape.plain:
+    port record.entries { value = $object } → entries
+    fold $entries as field; valid starts true:
+      yield and($valid, includes($allowed, at($field, 0))) → result
+
+process publicMcp.callAllowed:
+  let call = $eventInput
+  call publicMcp.surface
+  let surface = $result
+  let arguments = if($call.arguments, $call.arguments, {})
+  let result = false
+  when includes($surface.tools, $call.name):
+    port kernel.invoke { query = "publicMcp.keys"; input = { object = $arguments; allowed = $surface.projectArguments } } → keys
+    let result = and($keys, includes($surface.projectActions, if($arguments.action, $arguments.action, "list")))
+
+process publicMcp.message:
+  let message = $eventInput
+  call publicMcp.surface
+  let methods = $result.methods
+  port kernel.invoke { query = "publicMcp.keys"; input = { object = $message; allowed = list("jsonrpc", "id", "method", "params") } } → keys
+  call mcpProjectHttp.unbound
+  let result = and($keys, eq($message.jsonrpc, "2.0"), includes($methods, $message.method), $result)
+  when and($result, eq($message.method, "tools/call")):
+    let params = $message.params
+    port kernel.invoke { query = "publicMcp.keys"; input = { object = $params; allowed = list("name", "arguments", "_meta") } } → valid
+    port kernel.invoke { query = "publicMcp.callAllowed"; input = $params } → allowed
+    let result = and($valid, $allowed)
+
+process publicMcp.tool:
+  let tool = $eventInput
+  let annotations = if($tool.annotations, $tool.annotations, {})
+  port record.put { record = $annotations; key = "readOnlyHint"; value = true } → annotations
+  port record.put { record = $tool; key = "annotations"; value = $annotations } → result
+
+process publicMcp.field:
+  let key = $eventInput.key
+  let value = $eventInput.value
+  let surface = $eventInput.surface
+  let depth = $eventInput.depth
+  let toolList = and(eq($key, "tools"), isArray($value))
+  let scopes = includes(list("scopes_supported", "scopesSupported"), $key)
+  let instructions = eq($key, "instructions")
+  when $toolList:
+    let tools = filter($value, "tool", includes($surface.tools, $tool.name))
+    fold $tools as tool; projected starts list():
+      port kernel.invoke { query = "publicMcp.tool"; input = $tool } → restricted
+      yield append($projected, list($restricted)) → result
+  when $scopes:
+    let result = if(isArray($value), filter($value, "scope", eq($scope, $surface.scope)), list())
+  when $instructions:
+    call mcpProjectHttp.publicInstructions
+  when not(or($toolList, $scopes, $instructions)):
+    let allowed = true
+    when and(eq($key, "nextCall"), at($value, "tool")):
+      port kernel.invoke { query = "publicMcp.callAllowed"; input = { name = $value.tool; arguments = $value.args } } → allowed
+    let result = null
+    when $allowed:
+      port kernel.invoke { query = "publicMcp.walk"; input = { value = $value; surface = $surface; depth = $depth } } → result
+
+process publicMcp.walk:
+  let value = $eventInput.value
+  let surface = $eventInput.surface
+  let depth = add($eventInput.depth, 1)
+  assert not(eq($depth, 24))
+    otherwise "Public MCP response nesting exceeds its limit."
+  let result = $value
+  when isArray($value):
+    fold $value as item; projected starts list():
+      port kernel.invoke { query = "publicMcp.walk"; input = { value = $item; surface = $surface; depth = $depth } } → restricted
+      yield append($projected, list($restricted)) → result
+  port value.describe { value = $value } → shape
+  when $shape.plain:
+    port record.entries { value = $value } → fields
+    fold $fields as field; projected starts list():
+      let key = at($field, 0)
+      port kernel.invoke { query = "publicMcp.field"; input = { key = $key; value = at($field, 1); surface = $surface; depth = $depth } } → restricted
+      yield append($projected, list(list($key, $restricted))) → fields
+    port record.fromEntries { entries = $fields } → result
+
+process publicMcp.sanitize:
+  call publicMcp.surface
+  port kernel.invoke { query = "publicMcp.walk"; input = { value = $eventInput; surface = $result; depth = 0 } } → result

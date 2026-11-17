@@ -1,0 +1,154 @@
+process-module "temple/surface-process-module/1"
+
+process mcpWorkspaceAccess.expand:
+  let input = $eventInput
+  assert includes($input.contract.scopesSupported, $input.scope)
+    otherwise "Unrecognized hosted MCP scope."
+  let scopes = list($input.scope)
+  fold at($input.contract.scopeImplications, $input.scope) as scope; inherited starts $scopes:
+    port kernel.invoke { query = "mcpWorkspaceAccess.expand"; input = { contract = $input.contract; scope = $scope } } → implied
+    yield distinct(append($inherited, $implied)) → scopes
+  let result = $scopes
+
+process mcpWorkspaceAccess.lineage:
+  let input = $eventInput
+  let rows = filter($input.rows, "row", eq($row.collection, $input.collection))
+  assert eq(count($rows), 1)
+    otherwise "The hosted MCP workspace lineage is unavailable or ambiguous."
+  let record = at($rows, 0)
+  assert and(eq($record.id, $input.id), eq($record.deletedAt, null))
+    otherwise "The hosted MCP workspace lineage is unavailable."
+  let result = $record
+
+process mcpWorkspaceAccess.snapshot:
+  let snapshot = $eventInput
+  let oauthAbsent = and(eq($snapshot.oauthSchemaVersion, null), eq($snapshot.oauthRevision, null), eq($snapshot.oauthDocumentRevision, null))
+  let oauthCurrent = and(eq($snapshot.oauthSchemaVersion, 1), eq($snapshot.oauthRevision, $snapshot.oauthDocumentRevision))
+  assert and(eq($snapshot.projectionProtocol, "encounter/hosted-mcp-access/2"),
+    or($oauthAbsent, $oauthCurrent),
+    includes(list(1, 2), $snapshot.controlSchemaVersion), eq($snapshot.controlRevision, $snapshot.controlDocumentRevision))
+    otherwise "The hosted MCP access snapshot is missing or crossed."
+  let result = true
+
+process mcpWorkspaceAccess.authenticate:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  port kernel.invoke { query = "mcpWorkspaceAccess.snapshot"; input = $snapshot } → admitted
+  assert eq(count($snapshot.tokens), 1)
+    otherwise "The hosted MCP access snapshot is missing, crossed, or ambiguous."
+  let token = at($snapshot.tokens, 0)
+  port value.describe { value = $token.expiresMs } → expires
+  port value.describe { value = $token.userId } → user
+  port value.describe { value = $token.tenantId } → tenant
+  port value.describe { value = $token.appId } → app
+  port number.calculate { operation = "greater"; values = list($token.expiresMs, $input.nowMs) } → current
+  assert and(eq($expires.type, "number"), $current, eq($token.revokedAt, null), eq($user.type, "string"), $token.userId,
+    eq($tenant.type, "string"), $token.tenantId, eq($app.type, "string"), $token.appId, count($token.scopes))
+    otherwise "The hosted MCP credential is invalid, expired, revoked, or outside this grant."
+  assert includes(list("oauth", "personal"), $token.credentialKind)
+    otherwise "Unsupported hosted MCP credential."
+  when eq($token.credentialKind, "oauth"):
+    port text.matches { value = if($token.familyId, $token.familyId, ""); pattern = "\\Amcp_family_[a-f0-9]{24}\\z" } → family
+    port text.matches { value = if($token.clientId, $token.clientId, ""); pattern = "\\A[^\\x00-\\x1f\\x7f]{1,2048}\\z" } → client
+    assert and(eq($snapshot.oauthSchemaVersion, 1), $family, $client,
+      eq($token.principalKind, "user"), eq($token.resource, $input.contract.resource))
+      otherwise "The hosted MCP OAuth credential is invalid or outside this grant."
+  when eq($token.credentialKind, "personal"):
+    port text.matches { value = if($token.familyId, $token.familyId, ""); pattern = "\\Advc_[a-f0-9]{24}\\z" } → family
+    let tenantRole = at($snapshot.tenantRoles, 0)
+    assert and($family, eq($token.scopeMode, "application-portfolio-v1"),
+      eq($token.projectId, null), eq($token.workspaceId, null), eq($snapshot.applicationCount, 1),
+      eq(count($snapshot.tenantRoles), 1), includes(list("owner", "admin", "developer", "viewer"), $tenantRole))
+      otherwise "The personal MCP credential requires an active application portfolio and tenant membership."
+    each $token.scopes as scope:
+      assert includes(list("authoring.read", "authoring.write", "projects.observe", "projects.request",
+        "projects.decide", "projects.provision"), $scope)
+        otherwise "The personal MCP credential exceeds its application-portfolio scope ceiling."
+    port record.put { record = $token; key = "clientId"; value = "urn:sourcery:personal-mcp-connection" } → token
+  when $input.scope:
+    assert and(eq($token.tenantId, $input.scope.tenantId), eq($token.appId, $input.scope.appId))
+      otherwise "The hosted MCP credential is outside this grant."
+  assert eq($snapshot.identityCount, 1)
+    otherwise "The hosted MCP token has no current, unique user identity."
+  fold $token.scopes as scope; granted starts list():
+    port kernel.invoke { query = "mcpWorkspaceAccess.expand"; input = { contract = $input.contract; scope = $scope } } → implied
+    yield distinct(append($granted, $implied)) → granted
+  let result = { token = $token; granted = $granted }
+
+process mcpWorkspaceAccess.role:
+  let input = $eventInput
+  let tenantRole = at($input.tenantRoles, 0)
+  let inherited = includes(list("owner", "admin"), $tenantRole)
+  let projectRoles = if(eq($input.schemaVersion, 1), list(), $input.projectRoles)
+  let role = if($inherited, "steward", at($projectRoles, 0))
+  let result = null
+  when and(eq(count($input.tenantRoles), 1), includes(list("owner", "admin", "developer", "viewer"), $tenantRole),
+    or($inherited, eq(count($projectRoles), 1)), includes(list("viewer", "author", "steward"), $role)):
+    let result = $role
+
+process mcpWorkspaceAccess.roleScopes:
+  let role = $eventInput
+  let readable = list("authoring.read")
+  let writable = append($readable, list("authoring.write"))
+  let steward = append($writable, list("governance.decide", "runtime.records.inspect", "runtime.records.capture",
+    "operations.observe", "operations.prepare", "operations.execute"))
+  let result = if(eq($role, "viewer"), $readable, if(eq($role, "author"), $writable, $steward))
+
+process mcpWorkspaceAccess.inventory:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  port number.calculate { operation = "lessEqual"; values = list(count($snapshot.candidates), 4096) } → bounded
+  assert and(isArray($snapshot.candidates), $bounded)
+    otherwise "The hosted MCP project inventory exceeded its candidate limit or is missing."
+  fold $snapshot.candidates as row; state starts { admitted = 0; rows = {} }:
+    let next = $state
+    port number.calculate { operation = "less"; values = list($state.admitted, 500) } → room
+    when and($room, not($row.deleted)):
+      port kernel.invoke { query = "mcpWorkspaceAccess.role"; input = {
+        tenantRoles = $row.tenantRoles; projectRoles = $row.projectRoles; schemaVersion = $snapshot.controlSchemaVersion } } → role
+      when $role:
+        assert eq($row.lineageMatches, true)
+          otherwise "The hosted project inventory has crossed workspace lineage."
+        let rows = $state.rows
+        when or($input.allPortfolios, and(eq($row.tenantId, $input.tenantId), eq($row.appId, $input.appId))):
+          let key = $row.labels.sortKey
+          assert and($key, not(at($rows, $key)))
+            otherwise "The hosted project inventory has missing or ambiguous labels."
+          port record.put { record = $row; key = "role"; value = $role } → authorized
+          port record.put { record = $rows; key = $key; value = $authorized } → rows
+        let next = { admitted = add($state.admitted, 1); rows = $rows }
+    yield $next → inventory
+  port record.entries { value = $inventory.rows } → entries
+  port value.sort { values = map($entries, "entry", at($entry, 0)); mode = "locale" } → order
+  let result = map($order, "key", at($inventory.rows, $key))
+
+process mcpWorkspaceAccess.admit:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  let scope = $input.scope
+  port kernel.invoke { query = "mcpWorkspaceAccess.authenticate"; input = $input } → authenticated
+  let token = $authenticated.token
+  port kernel.invoke { query = "mcpWorkspaceAccess.lineage"; input = {
+    rows = $snapshot.lineage; collection = "tenants"; id = $scope.tenantId } } → tenant
+  port kernel.invoke { query = "mcpWorkspaceAccess.lineage"; input = {
+    rows = $snapshot.lineage; collection = "apps"; id = $scope.appId } } → app
+  port kernel.invoke { query = "mcpWorkspaceAccess.lineage"; input = {
+    rows = $snapshot.lineage; collection = "projects"; id = $scope.projectId } } → project
+  port kernel.invoke { query = "mcpWorkspaceAccess.lineage"; input = {
+    rows = $snapshot.lineage; collection = "workspaces"; id = $scope.workspaceId } } → workspace
+  assert and(eq($app.tenantId, $tenant.id), eq($project.tenantId, $tenant.id), eq($project.appId, $app.id),
+    eq($workspace.tenantId, $tenant.id), eq($workspace.appId, $app.id), eq($workspace.projectId, $project.id))
+    otherwise "The hosted MCP workspace has crossed tenant, app, or project lineage."
+  assert count($snapshot.tenantRoles)
+    otherwise "The hosted MCP principal has no current tenant membership."
+  port kernel.invoke { query = "mcpWorkspaceAccess.role"; input = {
+    tenantRoles = $snapshot.tenantRoles; projectRoles = $snapshot.projectRoles; schemaVersion = $snapshot.controlSchemaVersion } } → role
+  assert $role
+    otherwise "The hosted MCP principal has no current project membership."
+  port kernel.invoke { query = "mcpWorkspaceAccess.roleScopes"; input = $role } → roleScopes
+  let scopes = filter($roleScopes, "scope", includes($authenticated.granted, $scope))
+  assert count($scopes)
+    otherwise "The hosted MCP token and current workspace role share no scopes."
+  let result = { protocol = "sourcery-hosted-mcp-workspace-access/1"; principal = { kind = "user"; userId = $token.userId };
+    scope = $scope; scopes = $scopes; projectRole = $role; region = $workspace.region; storageNamespace = $workspace.storageNamespace;
+    clientId = $token.clientId; familyId = $token.familyId }

@@ -1,0 +1,111 @@
+process-module "temple/surface-process-module/1"
+
+process identity.settings:
+  let settings = $eventInput
+  port text.matches { value = $settings.origin; pattern = "\\Ahttps://(?:[A-Za-z0-9.-]+|\\[[0-9A-Fa-f:]+\\])(?::[0-9]{1,5})?\\z" } → origin
+  port text.matches { value = $settings.issuer; pattern = "\\Ahttps://[^?#@\\p{Cc}\\s\\\\]+/[^?#@\\p{Cc}\\s\\\\]+\\z" } → issuer
+  port text.matches { value = $settings.keyId; pattern = "\\A[A-Za-z0-9._-]{1,128}\\z" } → key
+  port text.matches { value = $settings.email; pattern = "\\A[^\\s@]{1,318}@[^\\s@]+\\.[^\\s@]+\\z" } → email
+  port number.calculate { operation = "lessEqual"; values = list($settings.emailLength, 320) } → emailLength
+  port number.calculate { operation = "lessEqual"; values = list($settings.subjectLength, 255) } → subject
+  port number.calculate { operation = "lessEqual"; values = list($settings.audienceLength, 255) } → audience
+  assert and($origin, $issuer, $settings.issuerBelowOrigin, $key, $email, $emailLength, $subject, $audience)
+    otherwise "Self-hosted identity HTTPS issuer, audience, subject, key, or email is invalid."
+  port number.calculate { operation = "greaterEqual"; values = list($settings.port, 1) } → portMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.port, 65535) } → portMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.timeout, 500) } → timeoutMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.timeout, 30000) } → timeoutMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.sessionAge, 60) } → sessionMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.sessionAge, 86400) } → sessionMax
+  port number.calculate { operation = "greaterEqual"; values = list($settings.tokenTtl, 30) } → tokenMin
+  port number.calculate { operation = "lessEqual"; values = list($settings.tokenTtl, 300) } → tokenMax
+  assert and($portMin, $portMax, $timeoutMin, $timeoutMax, $sessionMin, $sessionMax, $tokenMin, $tokenMax)
+    otherwise "Self-hosted identity listener, deadline, or token lifetime is outside its permitted range."
+  let result = true
+
+process identity.passwordRecord:
+  let record = $eventInput
+  port number.calculate { operation = "greaterEqual"; values = list($record.cost, 16384) } → costMin
+  port number.calculate { operation = "lessEqual"; values = list($record.cost, 1048576) } → costMax
+  port number.calculate { operation = "greaterEqual"; values = list($record.blockSize, 8) } → blockMin
+  port number.calculate { operation = "lessEqual"; values = list($record.blockSize, 32) } → blockMax
+  port number.calculate { operation = "greaterEqual"; values = list($record.parallelization, 1) } → parallelMin
+  port number.calculate { operation = "lessEqual"; values = list($record.parallelization, 8) } → parallelMax
+  port number.calculate { operation = "greaterEqual"; values = list($record.saltBytes, 16) } → saltMin
+  port number.calculate { operation = "lessEqual"; values = list($record.saltBytes, 64) } → saltMax
+  port number.calculate { operation = "greaterEqual"; values = list($record.keyLength, 32) } → keyMin
+  port number.calculate { operation = "lessEqual"; values = list($record.keyLength, 64) } → keyMax
+  port number.calculate { operation = "lessEqual"; values = list($record.memoryBytes, 201326592) } → memory
+  assert and(eq($record.algorithm, "scrypt-v1"), $record.powerOfTwo, $costMin, $costMax, $blockMin, $blockMax,
+    $parallelMin, $parallelMax, $saltMin, $saltMax, $keyMin, $keyMax, eq($record.digestBytes, $record.keyLength), $memory)
+    otherwise "Unsupported self-hosted operator password record."
+  let result = true
+
+process identity.provision:
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput, 20) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 1024) } → maximum
+  assert and($minimum, $maximum)
+    otherwise "Operator secret must contain between 20 and 1024 characters."
+  let result = { algorithm = "scrypt-v1"; cost = 65536; blockSize = 8; parallelization = 1; keyLength = 32;
+    keyIdPrefix = "self-hosted-" }
+
+process identity.productionCustody:
+  let keyId = "runtime-grant-key.self-hosted-v1"
+  let clientId = "sourcery-local-production-preflight"
+  let scope = { tenantId = "tenant.production-preflight"; appId = "app.sourcery";
+    projectId = "project.production-preflight"; workspaceId = "workspace.production-preflight" }
+  let publicKey = { kty = "OKP"; crv = "Ed25519"; x = $eventInput }
+  port record.put { record = {}; key = $keyId; value = $publicKey } → keys
+  let result = { clients = list({ clientId = $clientId; name = "Sourcery local production preflight";
+    redirectUris = list("http://127.0.0.1:8765/oauth/callback") }); keys = $keys;
+    workloads = { protocol = "sourcery.hosted/self-hosted-workload-registry.v1";
+      workloads = list({ consumerId = "runtime.sourcery-authoring-worker"; scope = $scope; operations = list("issue", "resolve") }) };
+    receipt = { status = "provisioned"; runtimeKeyId = $keyId; preflightClientId = $clientId; preflightScope = $scope;
+      files = list("assignment-private-key.pem", "interaction-secrets.json", "oauth-clients.json", "runtime-authority-private-key.pem",
+        "runtime-verification-keys.json", "runtime-workloads.json") } }
+
+process identity.route:
+  let request = $eventInput
+  let result = "missing"
+  when eq($request.method, "GET"):
+    let result = if(eq($request.path, "/identity/healthz"), "health", if(eq($request.path, "/identity/jwks.json"), "keys",
+      if(eq($request.path, "/identity/login"), "challenge", "missing")))
+  when and(eq($request.method, "POST"), eq($request.path, "/identity/login")):
+    let result = "submit"
+
+process identity.returnPath:
+  port text.matches { value = $eventInput; pattern = "\\A/(?!/)[^\\p{Cc}\\\\]{0,4095}\\z" } → safe
+  let result = if($safe, $eventInput, "/oauth/authorize")
+
+process identity.admitRequest:
+  let request = $eventInput
+  let result = and($request.loopback, eq($request.origin, $request.publicOrigin))
+
+process identity.rate:
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 5) } → allowed
+  let result = $allowed
+
+process identity.checkChallenge:
+  let request = $eventInput
+  port number.calculate { operation = "greaterEqual"; values = list($request.secretLength, 12) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($request.secretLength, 1024) } → maximum
+  let result = and($request.active, $request.challenge, eq(count($request.cookies), 1),
+    eq(at($request.cookies, 0), $request.challenge), eq($request.returnPath, $request.retainedPath), $minimum, $maximum)
+
+process identity.credential:
+  let result = if($eventInput, "assert", "challenge")
+
+process identity.assertion:
+  let identity = $eventInput
+  let result = { header = { alg = "ES256"; kid = $identity.keyId; typ = "JWT" };
+    claims = { iss = $identity.issuer; sub = $identity.subject; aud = $identity.audience; iat = $identity.now;
+      nbf = add($identity.now, -5); exp = add($identity.now, $identity.ttl); jti = $identity.nonce;
+      email = $identity.email; email_verified = true } }
+
+process identity.session:
+  let session = $eventInput
+  port text.matches { value = $session.token; pattern = "\\Asrc_session_[A-Za-z0-9_-]+\\z" } → valid
+  assert $valid
+    otherwise "The control plane did not issue a valid operator session."
+  let result = { session = concat("__Host-sourcery_session=", $session.token, "; Path=/; Max-Age=", $session.age,
+    "; Secure; HttpOnly; SameSite=Lax"); clear = "__Host-sourcery_login=; Path=/; Max-Age=0; Secure; HttpOnly; SameSite=Strict" }

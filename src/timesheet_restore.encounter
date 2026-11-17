@@ -1,0 +1,49 @@
+process-module "temple/surface-process-module/1"
+
+process restore.source:
+  let input = $eventInput
+  port text.matches { value = $input.expected; pattern = "\\A[a-f0-9]{64}\\z" } → digest
+  assert $digest
+    otherwise "Expected archive SHA-256 is invalid."
+  assert $input.sameManifest
+    otherwise "Timesheet changed while the source snapshot was captured."
+  let result = true
+
+process restore.archive:
+  assert eq($eventInput.expected, $eventInput.observed)
+    otherwise "Timesheet archive digest mismatch."
+  let result = true
+
+process restore.path:
+  let input = $eventInput
+  port text.matches { value = $input.path; pattern = "\\A[^\\p{Cc}\\\\]{1,4096}\\z" } → safe
+  port text.matches { value = $input.path; pattern = "\\A/" } → absolute
+  assert and($safe, or($input.manifest, not($absolute)))
+    otherwise "Timesheet contains an unsafe member path."
+  port text.split { value = $input.path; pattern = "/" } → components
+  assert not(includes($components, ".."))
+    otherwise "Timesheet contains an unsafe member path."
+  let components = filter($components, "part", and(not(eq($part, "")), not(eq($part, "."))))
+  port text.join { values = $components; separator = "/" } → result
+
+process restore.manifestLine:
+  port text.match { value = $eventInput; pattern = "\\A[ \\t]*([a-f0-9]{64})[ \\t]+\\*?([^\\r\\n]+?)[ \\t]*\\z" } → line
+  assert $line
+    otherwise "Timesheet consistency manifest is malformed."
+  port kernel.invoke { query = "restore.path"; input = { path = at($line.groups, 1); manifest = true } } → path
+  assert $path
+    otherwise "Timesheet consistency manifest must name a regular file."
+  let result = { sha256 = at($line.groups, 0); path = $path }
+
+process restore.member:
+  assert and($eventInput.expected, eq($eventInput.expected, $eventInput.observed))
+    otherwise "Restored Timesheet file failed its path-bound digest."
+  let result = true
+
+process restore.receipt:
+  let input = $eventInput
+  assert and($input.members, $input.expected, eq($input.expected, $input.verified))
+    otherwise "Timesheet restore does not match its consistency manifest."
+  let result = { protocol = "sourcery.hosted/timesheet-restore-rehearsal.v1"; status = "restored-and-path-content-verified";
+    archiveSha256 = $input.archiveSha256; fileCount = $input.verified; restoredManifestSha256 = $input.manifestSha256;
+    processStarted = false; liveStateAccessed = false }

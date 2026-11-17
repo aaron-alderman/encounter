@@ -1,0 +1,178 @@
+process-module "temple/surface-process-module/1"
+
+process programmeCatalogue.trancheDescriptions:
+  let result = {
+    "tranche.federation-substrate" = list("Temple federation substrate", "Capsule-bound peer admission, delivery, recovery, suspension, rotation, negotiation, and diagnosis.");
+    "tranche.temple-topology" = list("Personal, organization, and Common Temple topology", "Reference-safe publication, provenance, withdrawal, conflict, relationship modes, and independently governed Temple boundaries.");
+    "tranche.work-resource-priority-funding" = list("Federated work and resource lifecycle", "First-class proposals, work, estimates, commitments, funding, compute, failures, remediation, outcomes, and explainable human-selected priority.");
+    "tranche.governed-coordination" = list("Governed coordination", "Composable market, funding, tax, safeguarding, access, compute, appeal, correction, and voluntary-exit policy without software enactment authority.");
+    "tranche.mcp-authoring-catalogue-learning" = list("MCP-first knowledge catalogue and learning paths", "Inspectable first-class things, authoring pathways, observations, metrics, and remediation proposals through a closed MCP surface.");
+    "tranche.claimipedia-journeys" = list("Claimipedia reader journeys", "Cohort entry intents and shareable, no-persistence, fail-closed journeys over standardized claim dossiers.");
+    "tranche.six-programme-proof-portfolio" = list("Six-programme reference portfolio", "Public-safe synthetic programme scenarios joining work, policy, private references, remediation, and outcomes without claiming real-world execution.") }
+
+process programmeCatalogue.programmeDescriptions:
+  let result = {
+    "global-ai-partnership" = list("Global AI Application Partnership", "International AI application delivery with attributable contribution, standards, cross-border evidence, and voluntary exit.");
+    "local-trade-insurance" = list("Local Trade and Insurance Continuity", "Evidence-bearing make-safe, repair, insurer, plumbing, and automotive coordination for independent operators.");
+    "mission-community" = list("Mission and Community Support", "Consent-led church, ministry, charity, safeguarding, and sponsored-access coordination under human stewardship.");
+    "family-support" = list("Family Support Agreements", "Private-by-default marriage, co-parenting, extended-family support, consented commitments, and bounded referrals.");
+    "neurodiversity-support" = list("Person-Led Support Navigation", "Agency-preserving practical and neurodiversity support with explicit separation from regulated service authority.");
+    "creative-enterprise-commons" = list("Alderman Creative and Enterprise Commons", "Attributable creative space, bakery learning, enterprise mentorship, sponsored access, and independently owned offers.") }
+
+process programmeCatalogue.entry:
+  let input = $eventInput
+  let hash = at($input.evidence, $input.source)
+  port value.type { value = $hash } → kind
+  let valid = false
+  when eq($kind, "string"):
+    port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert $valid
+    otherwise "Missing sha256 source evidence for catalogue entry."
+  let body = { id = $input.id; kind = $input.kind; title = $input.title; summary = $input.summary;
+    aliases = $input.aliases; audiences = list("agent-author", "operator", "public-reader"); tags = $input.tags;
+    relations = { dependsOn = list(); implements = list(); related = list(); alternateProjections = list() };
+    projection = { coordinate = $input.coordinate; format = "standard-inspect-envelope"; title = concat("Inspect ", $input.title) };
+    mechanisms = { standard = list("Use the admitted projection and its supported control-plane surface.");
+      underlying = list("Inspect the source contract, content-addressed evidence, authority boundary, and retained lifecycle records.") };
+    authority = { inspect = "public-safe-read"; propose = "authorized-contributor"; execute = "separate-person-and-domain-authority"; steward = "steward.sourcery-tech" };
+    admissibility = { state = "admitted"; criteria = list("source-present", "projection-present", "authority-boundary-present");
+      evidenceRefs = list(concat("sha256:", $hash));
+      limitations = list("Projection and computation do not confer admission, legal, financial, pastoral, medical, or execution authority.") };
+    provenance = { source = $input.source; sourceHash = $hash; observedAt = $input.observedAt } }
+  port kernel.invoke { query = "catalogueBuild.entry"; input = $body } → result
+
+process programmeCatalogue.entries:
+  let input = $eventInput
+  let profile = $input.profile
+  assert eq(at($profile, "protocol"), "sourcery/programme-completeness-profile.v1")
+    otherwise "Exact completion profile is required."
+  port value.type { value = $input.observedAt } → timeType
+  assert eq($timeType, "string")
+    otherwise "observedAt is required."
+  port text.trim { value = $input.observedAt } → time
+  assert $time
+    otherwise "observedAt is required."
+  port kernel.invoke { query = "programmeCatalogue.trancheDescriptions"; input = null } → descriptions
+  fold $profile.tranches as tranche; entries starts list():
+    let copy = at($descriptions, $tranche.id)
+    assert at($copy, 0)
+      otherwise "No catalogue copy is registered for the requested tranche."
+    port kernel.invoke { query = "programmeCatalogue.entry"; input = {
+      id = $tranche.catalogueEntryId; kind = $tranche.kind; title = at($copy, 0); summary = at($copy, 1);
+      aliases = list($tranche.id); coordinate = $tranche.projection; source = $tranche.source;
+      evidence = $input.sourceEvidence; observedAt = $input.observedAt; tags = list("programme-tranche", $tranche.id) } } → entry
+    yield append($entries, list($entry)) → entries
+  let portfolio = at(filter($profile.tranches, "tranche", eq($tranche.id, "tranche.six-programme-proof-portfolio")), 0)
+  assert at($portfolio, "source")
+    otherwise "Missing sha256 source evidence for programme portfolio."
+  port kernel.invoke { query = "programmeCatalogue.programmeDescriptions"; input = null } → descriptions
+  fold $profile.programmes as programme; entries starts $entries:
+    let copy = at($descriptions, $programme.id)
+    assert at($copy, 0)
+      otherwise "No catalogue copy is registered for the requested programme."
+    port kernel.invoke { query = "programmeCatalogue.entry"; input = {
+      id = $programme.catalogueEntryId; kind = "programme"; title = at($copy, 0); summary = at($copy, 1);
+      aliases = list($programme.id); coordinate = concat("catalogue:", $programme.catalogueEntryId); source = $portfolio.source;
+      evidence = $input.sourceEvidence; observedAt = $input.observedAt; tags = list("programme-reference-scenario", $programme.id) } } → entry
+    yield append($entries, list($entry)) → entries
+  let terminology = $profile.terminology
+  port kernel.invoke { query = "programmeCatalogue.entry"; input = {
+    id = $terminology.catalogueEntryId; kind = "capability"; title = "Semantic Representation Grammar";
+    summary = $terminology.legacyHistory; aliases = append(list($terminology.canonical), $terminology.legacyAliases);
+    coordinate = concat("catalogue:", $terminology.catalogueEntryId);
+    source = "plugins/sourcery-app-foundation/semantic-representation-grammar-catalogue.rel";
+    evidence = $input.sourceEvidence; observedAt = $input.observedAt;
+    tags = list("representation-grammar", "terminology-history", "wcss-legacy-alias") } } → grammar
+  let result = append($entries, list($grammar))
+
+process programmeCatalogue.sourcePlan:
+  let profile = $eventInput.profile
+  assert and(eq(at($profile, "protocol"), "sourcery/programme-completeness-profile.v1"),
+    isArray(at($profile, "tranches")), eq(count(at($profile, "tranches")), 7))
+    otherwise "Exact completion profile with seven tranches is required."
+  let sources = distinct(append(map($profile.tranches, "tranche", $tranche.source),
+    list("plugins/sourcery-app-foundation/semantic-representation-grammar-catalogue.rel")))
+  let hooks = {}
+  when $eventInput.production:
+    let hooks = {
+      admittedSystemAtlas = "plugins/sourcery-app-foundation/system-atlas-control-plane.mjs";
+      claimInventory = "applications/claimipedia/domain.rel";
+      pluginSemanticRegistry = "plugins/sourcery-app-foundation/semantic-plugin-registry.mjs";
+      workInventory = "plugins/sourcery-app-foundation/authoring-work-item-contracts.rel" }
+  port record.entries { value = $hooks } → fields
+  let paths = distinct(append($sources, map($fields, "field", at($field, 1))))
+  each $paths as path:
+    port value.type { value = $path } → type
+    assert eq($type, "string")
+      otherwise "Catalogue source must be a composed-relative file."
+    port text.matches { value = $path; pattern = "\\A[^/\\\\:\\p{Cc}]+(?:/[^/\\\\:\\p{Cc}]+)*\\z" } → syntax
+    port text.split { value = $path; pattern = "/" } → components
+    assert and($syntax, not(includes($components, ".")), not(includes($components, "..")))
+      otherwise "Catalogue source must be a composed-relative file."
+  let result = { paths = $paths; sources = $sources; hooks = $fields }
+
+process programmeCatalogue.observe:
+  let input = $eventInput
+  fold $input.plan.paths as path; observations starts {}:
+    let content = at($input.contents, $path)
+    port digest.sha256 { text = $content } → hash
+    port record.put { record = $observations; key = $path; value = { source = $path; content = $content;
+      contentHash = $hash; observedAt = $input.observedAt } } → next
+    yield $next → observations
+  port record.fromEntries { entries = map($input.plan.sources, "path", list($path, at(at($observations, $path), "contentHash"))) } → sourceEvidence
+  let result = { sourceObservations = $observations; sourceEvidence = $sourceEvidence }
+
+process programmeCatalogue.productionEvidence:
+  let input = $eventInput
+  port kernel.invoke { query = "programmeCatalogue.observe"; input = { plan = $input.plan; contents = $input.contents; observedAt = null } } → evidence
+  port digest.sha256 { text = $input.profileContent } → profileHash
+  port record.fromEntries { entries = map($input.plan.hooks, "field",
+    list(at($field, 0), at(at($evidence.sourceObservations, at($field, 1)), "contentHash"))) } → hookHashes
+  let result = { profile = $input.profile; profileHash = $profileHash; sourceEvidence = $evidence.sourceEvidence; hookHashes = $hookHashes }
+
+process programmeCatalogue.integrated:
+  let input = $eventInput
+  let profile = $input.profile
+  let runtime = $input.runtime
+  let payloadHash = at($runtime, "payloadHash")
+  port value.type { value = $payloadHash } → type
+  assert and(eq(at($runtime, "valid"), true), eq($type, "string"))
+    otherwise "A verified assembled Platform runtime proof is required."
+  port text.matches { value = $payloadHash; pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert $valid
+    otherwise "A verified assembled Platform runtime proof is required."
+  port kernel.invoke { query = "programmeCatalogue.observe"; input = { plan = $input.plan;
+    contents = $input.contents; observedAt = $input.observedAt } } → evidence
+  port kernel.invoke { query = "programmeCatalogue.entries"; input = { profile = $profile;
+    sourceEvidence = $evidence.sourceEvidence; observedAt = $input.observedAt } } → entries
+  port kernel.invoke { query = "catalogueBuild.create"; input = {
+    catalogueId = "programme.completion.assembled"; entries = $entries; pathways = list(); sourceRevision = $payloadHash;
+    authority = { inspect = "public-safe-read"; propose = "authorized-contributor"; execute = "separate-person-authority"; steward = "steward.sourcery-tech" } } } → catalogue
+  port kernel.invoke { query = "knowledgeCatalogue.read"; input = { catalogue = $catalogue;
+    args = { operation = "inspect"; entryId = "application.claimipedia-journeys" } } } → dispatch
+  let projection = $dispatch.result
+  let coordinate = at(at($projection, "projection"), "coordinate")
+  assert eq($coordinate, "claimipedia:#/journey/create")
+    otherwise "Catalogue dispatch did not resolve the admitted Claimipedia journey projection."
+  let claimipedia = at($evidence.sourceObservations, "applications/claimipedia/ui/journey-codec.mjs")
+  assert at($claimipedia, "contentHash")
+    otherwise "The Claimipedia source must be present in the observed profile."
+  let integrationSource = "assembled:mcp:claimipedia-journey-projection"
+  port json.stringify { value = { assemblyPayloadHash = $payloadHash; catalogueHash = $catalogue.catalogueHash;
+    claimipediaSourceHash = $claimipedia.contentHash; projectionHash = $projection.projectionHash; projectionCoordinate = $coordinate } } → content
+  port digest.sha256 { text = $content } → hash
+  let ref = concat("sha256:", $hash)
+  port record.put { record = {}; key = $ref; value = { source = $integrationSource; content = $content;
+    contentHash = $hash; observedAt = $input.observedAt } } → integration
+  port kernel.invoke { query = "programmeCompletion.audit"; input = { profile = $profile; catalogue = $catalogue;
+    topology = $profile.topology; terminology = $profile.terminology;
+    integrationClaims = list({ id = "integration.assembled-catalogue-claimipedia"; observedSource = $integrationSource;
+      evidenceRefs = list($ref); authorityBoundary = "Read-only assembled projection; source, admission, and deployment authority remain separate." });
+    placeholderObservations = list({ id = "future.mobile"; material = false; resolved = false; text = "Future mobile application is outside this completion scope." });
+    sourceObservations = $evidence.sourceObservations; evidenceObservations = $integration; observedAt = $input.observedAt } } → report
+  when not(eq($report.status, "complete")):
+    port json.stringify { value = $report.findings } → findings
+    let rejected = raise(concat("Integrated programme completion failed: ", $findings, "."))
+  let result = { protocol = "sourcery/integrated-programme-completion-proof.v1"; auditHash = $report.auditHash;
+    catalogueHash = $catalogue.catalogueHash; claimipediaSourceHash = $claimipedia.contentHash;
+    integrationEvidenceRef = $ref; projectionHash = $projection.projectionHash; status = $report.status }

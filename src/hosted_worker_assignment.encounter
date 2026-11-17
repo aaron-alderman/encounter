@@ -1,0 +1,92 @@
+process-module "temple/surface-process-module/1"
+
+process workerAssignment.field:
+  let input = $eventInput
+  port value.type { value = $input.value } → kind
+  assert and(eq($kind, "string"), $input.value)
+    otherwise "Worker assignment identity fields must be nonempty strings."
+  port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.maximum) } → bounded
+  assert $bounded
+    otherwise "Worker assignment identity field exceeds its bound."
+  let result = $input.value
+
+process workerAssignment.config:
+  let input = $eventInput
+  port kernel.invoke { query = "workerAssignment.field"; input = { value = $input.issuer; maximum = 256 } } → issuer
+  port kernel.invoke { query = "workerAssignment.field"; input = { value = $input.audience; maximum = 256 } } → audience
+  port number.isNatural { value = $input.lifetimeMs } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($input.lifetimeMs, 1000) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($input.lifetimeMs, 1800000) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "Worker assignment lifetime must be between 1 and 1800 seconds."
+  let result = { issuer = $issuer; audience = $audience; lifetimeMs = $input.lifetimeMs }
+
+process workerAssignment.issue:
+  let input = $eventInput
+  port kernel.invoke { query = "workerAssignment.config"; input = $input } → config
+  port kernel.invoke { query = "workerAssignment.field"; input = { value = $input.requestId; maximum = 128 } } → requestId
+  port kernel.invoke { query = "workerAssignment.field"; input = { value = $input.workerId; maximum = 256 } } → workerId
+  port text.matches { value = $input.targetDigest; pattern = "\\A[a-f0-9]{64}\\z" } → target
+  port text.matches { value = $input.envelopeDigest; pattern = "\\A[a-f0-9]{64}\\z" } → envelope
+  assert and($target, $envelope)
+    otherwise "Worker assignment digests are invalid."
+  port time.formatUtc { milliseconds = $input.nowMs; fractional = true } → issuedAt
+  port time.formatUtc { milliseconds = add($input.nowMs, $config.lifetimeMs); fractional = true } → expiresAt
+  let protocol = "sourcery.hosted/authoring-worker-assignment.v1"
+  let claims = { protocol = $protocol; issuer = $config.issuer; audience = $config.audience; requestId = $requestId;
+    targetDigest = $input.targetDigest; envelopeDigest = $input.envelopeDigest; workerId = $workerId;
+    issuedAt = $issuedAt; expiresAt = $expiresAt }
+  port kernel.invoke { query = "workerAssignment.serialize"; input = $claims } → payload
+  let result = { protocol = $protocol; payload = $payload }
+
+process workerAssignment.serialize:
+  let input = $eventInput
+  let claims = { protocol = "sourcery.hosted/authoring-worker-assignment.v1";
+    issuer = $input.issuer; audience = $input.audience; requestId = $input.requestId;
+    targetDigest = $input.targetDigest; envelopeDigest = $input.envelopeDigest; workerId = $input.workerId;
+    issuedAt = $input.issuedAt; expiresAt = $input.expiresAt }
+  port json.stringify { value = $claims } → result
+
+process workerAssignment.containerAdmission:
+  let input = $eventInput
+  let envelope = $input.envelope
+  let claims = $input.claims
+  let protocol = "sourcery.hosted/authoring-worker-assignment.v1"
+  assert and(eq($envelope.protocol, "sourcery.hosted/authoring-worker.v1"), eq($input.proofProtocol, $protocol),
+    eq($claims.protocol, $protocol))
+    otherwise "The worker assignment proof is malformed."
+  port signature.ed25519.verify { text = $input.payload; publicKey = $input.publicKey; signature = $input.signature } → matched
+  assert $matched
+    otherwise "The worker assignment signature is invalid."
+  port kernel.invoke { query = "workerAssignment.serialize"; input = $claims } → canonical
+  let target = $input.target
+  port json.stringify { value = list($target.tenantId, $target.appId, $target.projectId, $target.workspaceId,
+    $target.region, $target.storageNamespace) } → coordinates
+  port digest.sha256 { text = $coordinates } → targetDigest
+  port json.canonical { value = $envelope } → document
+  port digest.sha256 { text = $document } → envelopeDigest
+  assert and(eq($canonical, $input.payload), eq($claims.issuer, $input.issuer), eq($claims.audience, $input.audience),
+    eq($claims.requestId, $envelope.requestId), eq($claims.workerId, $input.workerId),
+    eq($target, $envelope.target), eq($targetDigest, $envelope.targetDigest), eq($claims.targetDigest, $targetDigest),
+    eq($claims.envelopeDigest, $envelopeDigest))
+    otherwise "The worker assignment is not bound to this request and worker."
+  port time.parseRfc3339 { value = $claims.issuedAt } → issued
+  port time.parseRfc3339 { value = $claims.expiresAt } → expires
+  port number.calculate { operation = "subtract"; values = list($expires, $issued) } → lifetime
+  port number.calculate { operation = "lessEqual"; values = list($lifetime, 1800000) } → bounded
+  port number.calculate { operation = "greater"; values = list($lifetime, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($issued, add($input.nowMs, 5000)) } → started
+  port number.calculate { operation = "greater"; values = list($expires, $input.nowMs) } → fresh
+  assert and($bounded, $positive, $started, $fresh)
+    otherwise "The worker assignment is expired or outside its lifetime bound."
+  let authority = $input.importedAuthority
+  let assignmentKey = $input.assignmentPublicJwk
+  when not(eq($authority, null)):
+    assert and(eq($authority.protocol, "sourcery.hosted/container-imported-admission-authority.v1"),
+      eq($authority.issuer, concat($claims.issuer, "#imported-admission")),
+      eq($authority.keyId, "self-hosted-imported-admission-v1"),
+      eq($authority.audience, "sourcery-imported-admission"),
+      eq($authority.publicJwk, $assignmentKey), eq($authority.privatePublicJwk, $assignmentKey),
+      eq($authority.derivedX, $assignmentKey.x))
+      otherwise "The imported-admission authority is not bound to this worker assignment."
+  let result = true

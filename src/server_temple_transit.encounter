@@ -1,0 +1,328 @@
+process-module "temple/surface-process-module/1"
+
+process transit.configure:
+  let input = $eventInput
+  assert eq($input.protocol, "sourcery/temple-transit-http-config.v1")
+    otherwise "Invalid Server Temple transit configuration."
+  port value.type { value = $input.host } → hostType
+  port value.type { value = $input.port } → portType
+  port value.type { value = $input.maximumBytes } → limitType
+  port value.type { value = $input.carrierDescription } → carrierType
+  let host = if(eq($hostType, "undefined"), "127.0.0.1", $input.host)
+  let port = if(eq($portType, "undefined"), 0, $input.port)
+  let maximumBytes = if(eq($limitType, "undefined"), 1048576, $input.maximumBytes)
+  let carrier = if(eq($carrierType, "undefined"), "loopback HTTP Temple transport", $input.carrierDescription)
+  assert includes(list("127.0.0.1", "::1", "localhost"), $host)
+    otherwise "Temple transit HTTP may bind only to a loopback interface."
+  port number.isNatural { value = $port } → portInteger
+  port number.calculate { operation = "lessEqual"; values = list($port, 65535) } → portBound
+  port number.isNatural { value = $maximumBytes } → limitInteger
+  port number.calculate { operation = "greater"; values = list($maximumBytes, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($maximumBytes, 16777216) } → limitBound
+  port text.matches { value = $carrier; pattern = "\\S" } → named
+  assert and($portInteger, $portBound, $limitInteger, $positive, $limitBound, $named)
+    otherwise "Invalid Server Temple transit port, byte limit, or carrier."
+  let result = { host = $host; port = $port; maximumBytes = $maximumBytes; carrier = $carrier }
+
+process transit.route:
+  let input = $eventInput
+  let result = { kind = "refuse"; status = 404; body = { error = "not-found" } }
+  when eq($input.path, "/v1/transit"):
+    let result = if(eq($input.method, "POST"), { kind = "receive" },
+      { kind = "refuse"; status = 405; body = { error = "method-not-allowed" } })
+  when and(eq($input.path, "/health"), eq($input.method, "GET")):
+    let result = { kind = "health" }
+
+process transit.error:
+  port text.matches { value = $eventInput; pattern = "(?i)signature|admitted peer|addressed to another|source manifest" } → unauthorized
+  let result = { status = if($unauthorized, 403, 400);
+    body = { error = if($unauthorized, "temple-transit-not-authorized", "temple-transit-rejected"); message = $eventInput } }
+
+process transit.hash:
+  port value.type { value = $value } → kind
+  let bytes = $value
+  when not(eq($kind, "string")):
+    port json.canonical { value = $value } → bytes
+  port digest.sha256 { text = $bytes } → result
+
+process transit.keys:
+  port value.describe { value = $object } → shape
+  assert $shape.plain
+    otherwise "Temple transit requires a closed record."
+  port record.entries { value = $object } → entries
+  assert eq(count($entries), count($keys))
+    otherwise "Temple transit record has an unexpected shape."
+  each $entries as entry:
+    assert includes($keys, at($entry, 0))
+      otherwise "Temple transit record has an unexpected field."
+
+process transit.digestText:
+  port text.matches { value = $value; pattern = "\\A[a-f0-9]{64}\\z" } → digest
+  assert $digest
+    otherwise "Temple transit requires a lowercase SHA-256 digest."
+
+process transit.incoming:
+  let input = $eventInput
+  let bundle = $input.bundle
+  let object = $bundle
+  let keys = list("protocol", "envelope", "envelopeHash", "carrier", "createdAt", "bundleHash")
+  call transit.keys
+  assert and(eq($bundle.protocol, "sourcery/temple-transit-bundle.v1"), $input.canonicalBundleTime)
+    otherwise "Invalid Temple transit bundle protocol or time."
+  port text.matches { value = $bundle.carrier.description; pattern = "\\S" } → carrier
+  assert and($carrier, eq($bundle.carrier.grantsAuthority, false), eq($bundle.carrier.containsSecrets, false))
+    otherwise "Temple transit carrier boundary is invalid."
+  let envelope = $bundle.envelope
+  let value = $envelope
+  call transit.hash
+  let envelopeHash = $result
+  let value = { protocol = $bundle.protocol; envelope = $envelope; envelopeHash = $bundle.envelopeHash;
+    carrier = $bundle.carrier; createdAt = $bundle.createdAt }
+  call transit.hash
+  assert and(eq($envelopeHash, $bundle.envelopeHash), eq($result, $bundle.bundleHash))
+    otherwise "Temple transit bundle or envelope differs from its digest."
+  let object = $envelope
+  let keys = list("protocol", "messageId", "fromTempleId", "fromManifestHash", "toTempleId", "kind", "createdAt", "payload", "signature")
+  call transit.keys
+  assert and(eq($envelope.protocol, "sourcery/temple-signed-peer-message.v1"), $input.canonicalEnvelopeTime)
+    otherwise "Invalid Temple transit message protocol or time."
+  port number.calculate { operation = "lessEqual"; values = list($input.ageMs, 604800000) } → recent
+  port number.calculate { operation = "greaterEqual"; values = list($input.ageMs, -300000) } → elapsed
+  assert and($recent, $elapsed)
+    otherwise "Signed Temple message is outside the admitted time window."
+  assert eq($envelope.toTempleId, $input.templeId)
+    otherwise "Signed Temple message is addressed to another Temple."
+  port text.matches { value = $envelope.fromTempleId; pattern = "\\S" } → sender
+  let value = $envelope.fromManifestHash
+  call transit.digestText
+  assert $sender
+    otherwise "Expected an admitted peer Temple identity."
+  port json.canonical { value = $envelope } → encoded
+  port text.utf8Length { value = $encoded } → size
+  port number.calculate { operation = "lessEqual"; values = list($size, 65536) } → bounded
+  port number.calculate { operation = "lessEqual"; values = list($input.payloadShape.depth, 16) } → depth
+  port number.calculate { operation = "lessEqual"; values = list($input.payloadShape.members, 256) } → members
+  port number.calculate { operation = "lessEqual"; values = list($input.payloadShape.stringBytes, 8192) } → string
+  assert and($bounded, $depth, $members, $string)
+    otherwise "Signed Temple message exceeds its envelope or payload limit."
+  let payload = $envelope.payload
+  let kind = $envelope.kind
+  call transit.payload
+  let basis = { fromTempleId = $envelope.fromTempleId; fromManifestHash = $envelope.fromManifestHash;
+    toTempleId = $envelope.toTempleId; kind = $kind; createdAt = $envelope.createdAt; payload = $payload }
+  let value = $basis
+  call transit.hash
+  assert eq($envelope.messageId, concat("temple-message.", $result))
+    otherwise "Signed Temple message ID differs from its digest."
+  let object = $envelope.signature
+  let keys = list("algorithm", "value")
+  call transit.keys
+  assert eq($object.algorithm, "Ed25519")
+    otherwise "Signed Temple message requires an Ed25519 signature."
+  port text.matches { value = $object.value; pattern = "\\A[A-Za-z0-9+/]{86}==\\z" } → signature
+  assert $signature
+    otherwise "Signed Temple message requires a bounded Ed25519 signature."
+  let body = { protocol = $envelope.protocol; messageId = $envelope.messageId; fromTempleId = $basis.fromTempleId;
+    fromManifestHash = $basis.fromManifestHash; toTempleId = $basis.toTempleId; kind = $basis.kind;
+    createdAt = $basis.createdAt; payload = $basis.payload }
+  port json.canonical { value = $body } → signedBytes
+  let result = { envelope = $envelope; envelopeHash = $envelopeHash; signedBytes = $signedBytes }
+
+process transit.payload:
+  assert includes(list("temple-handshake", "temple-publication", "temple-publication-control",
+    "federated-work-reference", "federation-diagnostic", "temple-delivery-receipt"), $kind)
+    otherwise "Signed Temple message kind is not admitted."
+  let object = $payload
+  when eq($kind, "temple-handshake"):
+    let keys = list("authorityRequested", "privateStateShared")
+    call transit.keys
+    assert and(eq($payload.authorityRequested, false), eq($payload.privateStateShared, false))
+      otherwise "Temple handshake cannot request authority or share private state."
+  when eq($kind, "federated-work-reference"):
+    let keys = list("protocol", "programmeId", "objectHash", "locator", "authorityGranted", "privateStateShared")
+    call transit.keys
+    let value = $payload.objectHash
+    call transit.digestText
+    port value.type { value = $payload.programmeId } → programme
+    port value.type { value = $payload.locator } → locator
+    assert and(eq($payload.protocol, "sourcery/federated-work-reference.v1"), eq($programme, "string"),
+      eq($locator, "string"), $payload.programmeId, $payload.locator,
+      eq($payload.authorityGranted, false), eq($payload.privateStateShared, false))
+      otherwise "Federated work message must be an authority-free content-addressed reference."
+  when eq($kind, "temple-publication"):
+    let value = $payload.envelopeHash
+    call transit.digestText
+    assert eq($payload.protocol, "sourcery/temple-publication.v1")
+      otherwise "Invalid Temple publication message."
+  when eq($kind, "temple-publication-control"):
+    let value = $payload.noticeHash
+    call transit.digestText
+    assert eq($payload.protocol, "sourcery/temple-publication-control.v1")
+      otherwise "Invalid Temple publication control message."
+  when eq($kind, "federation-diagnostic"):
+    let keys = list("protocol", "code", "evidenceHash", "authorityGranted", "privateStateShared")
+    call transit.keys
+    let value = $payload.evidenceHash
+    call transit.digestText
+    port text.matches { value = $payload.code; pattern = "\\A[\\s\\S]{1,128}\\z" } → code
+    assert and(eq($payload.protocol, "sourcery/temple-federation-diagnostic.v1"), $code,
+      eq($payload.authorityGranted, false), eq($payload.privateStateShared, false))
+      otherwise "Invalid federation diagnostic payload."
+  when eq($kind, "temple-delivery-receipt"):
+    let value = $payload.acceptedEnvelopeHash
+    call transit.digestText
+    port text.matches { value = $payload.inReplyTo; pattern = "\\Atemple-message\\.[a-f0-9]{64}\\z" } → reference
+    assert and(eq($payload.protocol, "sourcery/temple-delivery-receipt.v1"), $reference,
+      includes(list("accepted", "already-accepted"), $payload.acceptanceStatus), eq($payload.authorityGranted, false))
+      otherwise "Invalid Temple delivery receipt payload."
+
+process transit.peer:
+  let input = $eventInput
+  let peerId = $input.envelope.fromTempleId
+  let peer = null
+  when $input.projection:
+    port json.parse { text = $input.projection.content_json } → state
+    let value = $state
+    call transit.hash
+    assert and(eq($result, $input.projection.content_hash), eq($state.protocol, "sourcery/temple-federation-control.v1"))
+      otherwise "The admitted peer projection differs from its digest or protocol."
+    port value.describe { value = $state.peers } → peerShape
+    assert $peerShape.plain
+      otherwise "Expected an admitted peer identity index."
+    let peer = at($state.peers, $peerId)
+  when not($peer):
+    fold $input.admissions as row; matches starts list():
+      call transit.readMessage
+      let envelope = $result
+      let matchesPeer = and(eq($envelope.protocol, "sourcery/temple-peer-admission.v1"), eq($envelope.peerTempleId, $peerId))
+      yield if($matchesPeer, append($matches, list($envelope)), $matches) → admissions
+    assert eq(count($admissions), 1)
+      otherwise "Expected exactly one admitted peer identity."
+    let admission = at($admissions, 0)
+    let peer = { status = "active"; manifestHash = $admission.peerManifestHash;
+      identityPublicKey = $admission.peerIdentityPublicKey; authorityGranted = $admission.authorityGranted;
+      privateStateShared = $admission.privateStateShared }
+  assert and(eq($peer.status, "active"), eq($peer.authorityGranted, false), eq($peer.privateStateShared, false))
+    otherwise "The admitted peer has no active authority-free identity."
+  assert eq($peer.manifestHash, $input.envelope.fromManifestHash)
+    otherwise "Signed Temple message source manifest is not the admitted peer identity."
+  let result = $peer.identityPublicKey
+
+process transit.readMessage:
+  port json.parse { text = $row.envelope_json } → storedEnvelope
+  let value = $storedEnvelope
+  call transit.hash
+  assert eq($result, $row.envelope_hash)
+    otherwise "Retained Temple bridge message differs from its digest."
+  let result = $storedEnvelope
+
+process transit.signature:
+  assert eq($eventInput, true)
+    otherwise "Signed Temple message signature is invalid."
+  let result = true
+
+process transit.deliver:
+  let input = $eventInput
+  let incoming = $input.incoming
+  let envelope = $incoming.envelope
+  let envelopeHash = $incoming.envelopeHash
+  let acceptance = "accepted"
+  let inbox = { messageId = $envelope.messageId; direction = "inbox"; status = "accepted-signature-verified";
+    envelope = $envelope; hash = $envelopeHash }
+  let acceptedPayload = { messageId = $envelope.messageId; fromTempleId = $envelope.fromTempleId;
+    kind = $envelope.kind; envelopeHash = $envelopeHash; authorityGranted = false }
+  let eventKind = "TemplePeerMessageAccepted"
+  when $input.inbox:
+    let row = $input.inbox
+    call transit.readMessage
+    assert and(eq($row.direction, "inbox"), eq($row.status, "accepted-signature-verified"),
+      eq($row.envelope_hash, $envelopeHash))
+      otherwise "Signed Temple message replay conflicts with a retained message."
+    let acceptance = "already-accepted"
+    let inbox = null
+  when and($inbox, eq($envelope.kind, "temple-delivery-receipt")):
+    let row = $input.correlated
+    assert and($row, eq($row.direction, "outbox"), eq($row.envelope_hash, $envelope.payload.acceptedEnvelopeHash))
+      otherwise "Temple delivery receipt does not correlate to an exact retained outbox message."
+    call transit.readMessage
+    assert eq($result.toTempleId, $envelope.fromTempleId)
+      otherwise "Temple delivery receipt does not correlate to an exact retained outbox message."
+    let eventKind = "TemplePeerMessageDeliveryAcknowledged"
+    port record.put { record = $acceptedPayload; key = "acknowledgedMessageId"; value = $row.message_id } → acceptedPayload
+    port record.put { record = $acceptedPayload; key = "acknowledgedEnvelopeHash"; value = $row.envelope_hash } → acceptedPayload
+  let events = if($inbox, list({ id = concat("peer-message-accepted.", $envelopeHash); kind = $eventKind;
+    payload = $acceptedPayload }), list())
+  let retained = $input.receipt
+  let prior = null
+  let priorSignedBytes = null
+  let draft = null
+  let signedBytes = null
+  when $retained:
+    let row = $retained
+    call transit.readMessage
+    let prior = $result
+    assert and(eq($row.direction, "outbox"), eq($prior.protocol, "sourcery/temple-signed-peer-message.v1"),
+      eq($prior.kind, "temple-delivery-receipt"), eq($prior.payload.inReplyTo, $envelope.messageId),
+      eq($prior.payload.acceptedEnvelopeHash, $envelopeHash), eq($prior.fromTempleId, $input.templeId),
+      eq($prior.fromManifestHash, $input.manifestHash), eq($prior.toTempleId, $envelope.fromTempleId))
+      otherwise "The retained Temple acknowledgement does not match this message."
+    assert eq($prior.signature.algorithm, "Ed25519")
+      otherwise "The retained Temple acknowledgement has an invalid signature algorithm."
+    let body = { protocol = $prior.protocol; messageId = $prior.messageId; fromTempleId = $prior.fromTempleId;
+      fromManifestHash = $prior.fromManifestHash; toTempleId = $prior.toTempleId; kind = $prior.kind;
+      createdAt = $prior.createdAt; payload = $prior.payload }
+    port json.canonical { value = $body } → priorSignedBytes
+  when not($prior):
+    let payload = { protocol = "sourcery/temple-delivery-receipt.v1"; inReplyTo = $envelope.messageId;
+      acceptedEnvelopeHash = $envelopeHash; acceptanceStatus = $acceptance; authorityGranted = false }
+    let basis = { fromTempleId = $input.templeId; fromManifestHash = $input.manifestHash; toTempleId = $envelope.fromTempleId;
+      kind = "temple-delivery-receipt"; createdAt = $input.now; payload = $payload }
+    let value = $basis
+    call transit.hash
+    let draft = { protocol = "sourcery/temple-signed-peer-message.v1"; messageId = concat("temple-message.", $result);
+      fromTempleId = $basis.fromTempleId; fromManifestHash = $basis.fromManifestHash; toTempleId = $basis.toTempleId;
+      kind = $basis.kind; createdAt = $basis.createdAt; payload = $basis.payload }
+    port json.canonical { value = $draft } → signedBytes
+  let result = { inbox = $inbox; events = $events; prior = $prior; priorSignedBytes = $priorSignedBytes;
+    draft = $draft; signedBytes = $signedBytes }
+
+process transit.reply:
+  let input = $eventInput
+  let plan = $input.plan
+  let envelope = $plan.prior
+  let events = $plan.events
+  let outbox = null
+  when $plan.draft:
+    let signature = { algorithm = "Ed25519"; value = $input.signature }
+    port record.put { record = $plan.draft; key = "signature"; value = $signature } → envelope
+    let value = $envelope
+    call transit.hash
+    let envelopeHash = $result
+    let outbox = { messageId = $envelope.messageId; direction = "outbox"; status = "signed-not-delivered";
+      envelope = $envelope; hash = $envelopeHash }
+    let payload = { messageId = $envelope.messageId; toTempleId = $envelope.toTempleId;
+      kind = $envelope.kind; envelopeHash = $envelopeHash; authorityGranted = false }
+    let events = append($events, list({ id = concat("peer-message-signed.", $envelopeHash);
+      kind = "TemplePeerMessageSigned"; payload = $payload }))
+  let value = $envelope
+  call transit.hash
+  let carrier = { description = $input.carrier; grantsAuthority = false; containsSecrets = false }
+  let body = { protocol = "sourcery/temple-transit-bundle.v1"; envelope = $envelope;
+    envelopeHash = $result; carrier = $carrier; createdAt = $input.now }
+  let value = $body
+  call transit.hash
+  port record.put { record = $body; key = "bundleHash"; value = $result } → response
+  let result = { messages = filter(list($plan.inbox, $outbox), "message", $message); events = $events; response = $response }
+
+process transit.journal:
+  let input = $eventInput
+  fold $input.events as event; journal starts { sequence = $input.sequence; head = $input.head; rows = list() }:
+    port json.canonical { value = $event.payload } → payloadJson
+    port digest.sha256 { text = $payloadJson } → payloadHash
+    let row = { sequence = add($journal.sequence, 1); event_id = $event.id; kind = $event.kind; actor = $input.actor;
+      occurred_at = $input.now; payload_hash = $payloadHash; previous_hash = $journal.head }
+    call capsule.eventHash
+    let pin = $result
+    let rows = append($journal.rows, list({ event = $row; eventHash = $pin; payloadJson = $payloadJson }))
+    yield { sequence = $row.sequence; head = $pin; rows = $rows } → journal
+  let result = $journal.rows

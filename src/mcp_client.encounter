@@ -1,0 +1,152 @@
+process-module "temple/surface-process-module/1"
+
+process mcpClient.string:
+  let input = $eventInput
+  port value.describe { value = $input.value } → shape
+  let result = false
+  when eq($shape.type, "string"):
+    port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.limit) } → bounded
+    port text.matches { value = $input.value; pattern = "\\A[^\\x00-\\x1f\\x7f]+\\z" } → valid
+    let result = and($bounded, $valid)
+
+process mcpClient.callback:
+  port text.matches { value = $eventInput; pattern = "\\A(?:https://(?:[a-z0-9._-]+|\\[[0-9a-f:]+\\])|http://(?:127\\.0\\.0\\.1|localhost|\\[::1\\]))(?::[0-9]{1,5})?/[!-~]*\\z" } → url
+  port text.matches { value = $eventInput; pattern = "[#\\\\]" } → invalid
+  let result = and($url, not($invalid))
+
+process mcpClient.hosts:
+  let hosts = $eventInput
+  port number.calculate { operation = "lessEqual"; values = list(count($hosts), 16) } → bound
+  assert and(isArray($hosts), count($hosts), $bound, eq(count(distinct($hosts)), count($hosts)))
+    otherwise "Expected between one and sixteen distinct exact MCP metadata DNS hosts."
+  each $hosts as host:
+    port value.describe { value = $host } → shape
+    assert eq($shape.type, "string")
+      otherwise "Invalid hosted MCP metadata host."
+    port text.matches { value = $host; pattern = "\\A[a-z0-9-]+(?:\\.[a-z0-9-]+)*\\z" } → valid
+    assert $valid
+      otherwise "Invalid hosted MCP metadata host."
+  let result = { hosts = $hosts; cacheEntries = 256; cacheTtlMs = 300000 }
+
+process mcpClient.registry:
+  let input = $eventInput
+  let contract = $input.contract
+  assert and(includes($contract.clientRegistrationModes, "preRegisteredClientV1"),
+    includes($contract.clientRegistrationModes, "clientIdMetadataDocumentV1"),
+    eq($contract.modes.clientMetadataResolution, "injectedEgressExactIdentityBoundedCacheV1"))
+    otherwise "The hosted MCP client mechanisms differ from the pinned contract."
+  port kernel.invoke { query = "mcpClient.registeredClients"; input = $input.clients } → clients
+  port kernel.invoke { query = "mcpClient.hosts"; input = $input.hosts } → metadata
+  let result = { clients = $clients; hosts = $metadata.hosts; cacheEntries = $metadata.cacheEntries; cacheTtlMs = $metadata.cacheTtlMs }
+
+process mcpClient.registeredClients:
+  let clients = $eventInput
+  port number.calculate { operation = "lessEqual"; values = list(count($clients), 32) } → clientsBound
+  assert and(isArray($clients), count($clients), $clientsBound)
+    otherwise "Invalid hosted MCP client registry."
+  let ids = map($clients, "client", $client.clientId)
+  assert eq(count(distinct($ids)), count($ids))
+    otherwise "Duplicate hosted MCP client identity."
+  each $clients as client:
+    port record.entries { value = $client } → entries
+    port kernel.invoke { query = "mcpClient.string"; input = { value = $client.clientId; limit = 2048 } } → id
+    port kernel.invoke { query = "mcpClient.string"; input = { value = $client.name; limit = 128 } } → name
+    port number.calculate { operation = "lessEqual"; values = list(count($client.redirectUris), 16) } → redirectsBound
+    assert and(eq(count($entries), 3), $id, $name, isArray($client.redirectUris),
+      count($client.redirectUris), $redirectsBound, eq(count(distinct($client.redirectUris)), count($client.redirectUris)))
+      otherwise "Invalid preregistered hosted MCP client."
+    each $client.redirectUris as uri:
+      port kernel.invoke { query = "mcpClient.callback"; input = $uri } → valid
+      assert $valid
+        otherwise "Invalid preregistered hosted MCP callback."
+  let result = $clients
+
+process mcpClient.lookup:
+  let input = $eventInput
+  let matches = filter($input.clients, "client", eq($client.clientId, $input.clientId))
+  let result = null
+  when eq(count($matches), 1):
+    let found = at($matches, 0)
+    let result = { clientId = $found.clientId; name = $found.name;
+      redirectUris = distinct($found.redirectUris); registrationMode = "preRegisteredClientV1" }
+
+process mcpClient.egress:
+  let input = $eventInput
+  port text.matches { value = $input.clientId; pattern = "\\Ahttps://[a-z0-9.-]+/[!-~]*\\z" } → https
+  port text.matches { value = $input.clientId; pattern = "[#\\\\]" } → invalid
+  let result = and($https, not($invalid), includes($input.hosts, $input.host))
+
+process mcpClient.option:
+  let input = $eventInput
+  let value = $input.value
+  let result = true
+  when not(or(eq($value, null), eq($input.present, false))):
+    let result = false
+    when and(isArray($value), count($value), includes($value, $input.required)):
+      fold $value as item; valid starts true:
+        port value.describe { value = $item } → shape
+        yield and($valid, eq($shape.type, "string"), $item) → result
+
+process mcpClient.metadata:
+  let input = $eventInput
+  let document = $input.document
+  port value.describe { value = $document } → shape
+  assert and($shape.plain, eq($input.status, 200), eq($input.mime, "application/json"))
+    otherwise "Client metadata requires an unredirected JSON document."
+  port value.describe { value = $document.client_id } → identity
+  port value.describe { value = $document.token_endpoint_auth_method } → auth
+  assert and(or($identity.null, eq($identity.type, "undefined"), eq($document.client_id, $input.clientId)),
+    or($auth.null, eq($auth.type, "undefined"), eq($document.token_endpoint_auth_method, "none")))
+    otherwise "Client metadata identity or public authentication differs."
+  port value.describe { value = $document.client_name } → name
+  port number.calculate { operation = "lessEqual"; values = list(count($document.client_name), 200) } → bounded
+  assert and(eq($name.type, "string"), $bounded)
+    otherwise "Invalid client metadata name."
+  port text.trim { value = $document.client_name } → trimmed
+  assert $trimmed
+    otherwise "Invalid client metadata name."
+  port value.describe { value = $document.grant_types } → grant
+  port value.describe { value = $document.response_types } → response
+  port kernel.invoke { query = "mcpClient.option"; input = { value = $document.grant_types; present = not(eq($grant.type, "undefined"));
+    required = "authorization_code" } } → grants
+  port kernel.invoke { query = "mcpClient.option"; input = { value = $document.response_types; present = not(eq($response.type, "undefined"));
+    required = "code" } } → responses
+  assert and($grants, $responses, isArray($document.redirect_uris), count($document.redirect_uris))
+    otherwise "Client metadata does not admit public authorization code."
+  each $document.redirect_uris as uri:
+    port kernel.invoke { query = "mcpClient.callback"; input = $uri } → valid
+    assert $valid
+      otherwise "Invalid client metadata callback."
+  let result = { clientId = $input.clientId; name = $trimmed;
+    redirectUris = distinct($document.redirect_uris); registrationMode = "clientIdMetadataDocumentV1" }
+
+process mcpClient.redirect:
+  let input = $eventInput
+  port kernel.invoke { query = "mcpClient.callback"; input = $input.redirectUri } → valid
+  let matched = and($valid, or(includes($input.client.redirectUris, $input.redirectUri),
+    and(eq($input.client.registrationMode, "clientIdMetadataDocumentV1"), $input.loopbackBase,
+      includes($input.client.redirectUris, $input.loopbackBase))))
+  let result = if($matched, true, false)
+
+process mcpClient.addresses:
+  let addresses = $eventInput
+  let blockedV4 = list(list(0, 16777215), list(167772160, 184549375), list(1681915904, 1686110207),
+    list(2130706432, 2147483647), list(2851995648, 2852061183), list(2886729728, 2887778303),
+    list(3221225472, 3221225727), list(3232235520, 3232301055), list(3221225984, 3221226239),
+    list(3323068416, 3323199487), list(3325256704, 3325256959), list(3405803776, 3405804031),
+    list(3758096384, 4294967295))
+  fold $addresses as address; admitted starts if(count($addresses), true, false):
+    let valid = false
+    when eq($address.family, 4):
+      fold $blockedV4 as range; blocked starts false:
+        port number.calculate { operation = "lessEqual"; values = list(at($range, 0), $address.number) } → above
+        port number.calculate { operation = "lessEqual"; values = list($address.number, at($range, 1)) } → below
+        yield or($blocked, and($above, $below)) → blocked
+      let valid = not($blocked)
+    when eq($address.family, 6):
+      port number.calculate { operation = "lessEqual"; values = list(8192, $address.first) } → above
+      port number.calculate { operation = "lessEqual"; values = list($address.first, 16383) } → below
+      port number.calculate { operation = "less"; values = list($address.second, 512) } → special
+      let valid = and($above, $below, not(includes(list(8194, 16383), $address.first)),
+        not(and(eq($address.first, 8193), or($special, eq($address.second, 3512)))))
+    yield and($admitted, $valid) → result

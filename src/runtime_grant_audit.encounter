@@ -1,0 +1,106 @@
+process-module "temple/surface-process-module/1"
+
+process grantAudit.digest:
+  port json.canonical { value = $eventInput } → canonical
+  port digest.sha256 { text = $canonical } → result
+
+process grantAudit.hash:
+  port text.matches { value = $eventInput; pattern = "\\A[a-f0-9]{64}\\z" } → result
+
+process grantAudit.denial:
+  port value.type { value = $eventInput } → type
+  let result = false
+  when eq($type, "string"):
+    port text.matches { value = $eventInput; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,127}\\z" } → result
+
+process grantAudit.identifierHash:
+  port value.type { value = $eventInput } → type
+  port kernel.invoke { query = "grantAudit.digest"; input = if(and(eq($type, "string"), $eventInput), $eventInput, "unavailable") } → result
+
+process grantAudit.optionalHash:
+  let result = null
+  when $eventInput:
+    port kernel.invoke { query = "grantAudit.digest"; input = $eventInput } → result
+
+process grantAudit.state:
+  port record.entries { value = $eventInput.state } → entries
+  port number.isNatural { value = $eventInput.state.revision } → revision
+  port number.calculate { operation = "lessEqual"; values = list($eventInput.state.revision, 9007199254740991) } → safe
+  port number.calculate { operation = "lessEqual"; values = list(count($eventInput.state.events), 100000) } → bounded
+  assert and(eq(count($entries), 3), eq($eventInput.state.protocol, "sourcery-runtime-grant-audit-state/1"),
+    $revision, $safe, isArray($eventInput.state.events), $bounded, eq($eventInput.state.revision, $eventInput.rowRevision))
+    otherwise "Runtime grant audit state is invalid or has crossed row/document revisions."
+  let entries = null
+  fold $eventInput.state.events as event; chain starts { head = null; count = 0; issued = 0; resolved = 0; denied = 0 }:
+    let next = add($chain.count, 1)
+    port record.entries { value = $event } → fields
+    let allowed = list("eventId", "sequence", "previousHash", "operation", "outcome", "consumerIdHash",
+      "bindingKeyHash", "grantIdHash", "providerHash", "denialCode", "occurredAt", "eventHash")
+    assert and(eq(count($fields), count($allowed)), not(some($fields, "field", not(includes($allowed, at($field, 0))))),
+      eq($event.sequence, $next), eq($event.previousHash, $chain.head),
+      includes(list("issue", "resolve"), $event.operation), includes(list("issued", "resolved", "denied"), $event.outcome))
+      otherwise "Runtime grant audit event or hash chain is invalid."
+    port text.matches { value = $event.eventId; pattern = "\\Aruntime-grant-audit[.][0-9a-f-]{36}\\z" } → id
+    port time.parseRfc3339 { value = $event.occurredAt } → time
+    port kernel.invoke { query = "grantAudit.denial"; input = $event.denialCode } → denial
+    assert and($id, $denial)
+      otherwise "Runtime grant audit event is invalid."
+    each list($event.consumerIdHash, $event.bindingKeyHash) as hash:
+      port kernel.invoke { query = "grantAudit.hash"; input = $hash } → valid
+      assert $valid
+        otherwise "Runtime grant audit event is invalid."
+    each list($event.grantIdHash, $event.providerHash) as hash:
+      when not(eq($hash, null)):
+        port kernel.invoke { query = "grantAudit.hash"; input = $hash } → valid
+        assert $valid
+          otherwise "Runtime grant audit event is invalid."
+    port record.fromEntries { entries = filter($fields, "field", not(eq(at($field, 0), "eventHash"))) } → body
+    port kernel.invoke { query = "grantAudit.digest"; input = $body } → digest
+    assert eq($digest, $event.eventHash)
+      otherwise "Runtime grant audit hash chain is invalid."
+    yield { head = $digest; count = $next;
+      issued = add($chain.issued, if(eq($event.outcome, "issued"), 1, 0));
+      resolved = add($chain.resolved, if(eq($event.outcome, "resolved"), 1, 0));
+      denied = add($chain.denied, if(eq($event.outcome, "denied"), 1, 0)) } → chain
+  let result = $chain
+
+process grantAudit.snapshot:
+  call grantAudit.state
+  let result = { protocol = "sourcery.hosted/runtime-grant-audit.v1"; revision = $eventInput.state.revision;
+    events = $chain.count; headHash = $chain.head;
+    outcomes = { issued = $chain.issued; resolved = $chain.resolved; denied = $chain.denied } }
+
+process grantAudit.retention:
+  let maximumEvents = $eventInput
+  port number.isNatural { value = $maximumEvents } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($maximumEvents, 100) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($maximumEvents, 100000) } → maximum
+  assert and($integer, $minimum, $maximum)
+    otherwise "Runtime grant audit retention is invalid."
+  let result = $maximumEvents
+
+process grantAudit.append:
+  let request = $eventInput.event
+  assert and(includes(list("issue", "resolve"), $request.operation), includes(list("issued", "resolved", "denied"), $request.outcome))
+    otherwise "Runtime grant audit event type is invalid."
+  port kernel.invoke { query = "grantAudit.retention"; input = $eventInput.maximumEvents } → maximumEvents
+  call grantAudit.state
+  port number.calculate { operation = "less"; values = list($chain.count, $maximumEvents) } → space
+  assert $space
+    otherwise "Runtime grant audit retention is full; archive before accepting more grant activity."
+  port number.calculate { operation = "less"; values = list($eventInput.state.revision, 9007199254740991) } → canAdvance
+  assert $canAdvance
+    otherwise "Runtime grant audit revision cannot advance."
+  port time.parseRfc3339 { value = $eventInput.occurredAt } → time
+  port kernel.invoke { query = "grantAudit.identifierHash"; input = $request.consumerId } → consumer
+  port kernel.invoke { query = "grantAudit.identifierHash"; input = $request.bindingKey } → binding
+  port kernel.invoke { query = "grantAudit.optionalHash"; input = $request.grantId } → grant
+  port kernel.invoke { query = "grantAudit.optionalHash"; input = $request.provider } → provider
+  port kernel.invoke { query = "grantAudit.denial"; input = $request.denialCode } → denial
+  let body = { eventId = $eventInput.eventId; sequence = add($chain.count, 1); previousHash = $chain.head;
+    operation = $request.operation; outcome = $request.outcome; consumerIdHash = $consumer; bindingKeyHash = $binding;
+    grantIdHash = $grant; providerHash = $provider; denialCode = if($denial, $request.denialCode, "unavailable"); occurredAt = $eventInput.occurredAt }
+  port kernel.invoke { query = "grantAudit.digest"; input = $body } → hash
+  port record.put { record = $body; key = "eventHash"; value = $hash } → event
+  let state = { protocol = $eventInput.state.protocol; revision = add($eventInput.state.revision, 1); events = append($eventInput.state.events, list($event)) }
+  let result = { state = $state; event = $event }

@@ -1,0 +1,69 @@
+process-module "temple/surface-process-module/1"
+
+process receipt.issue:
+  let request = $eventInput
+  let invocation = $request.invocation
+  let service = "sourcery-dev-front-gate-check.service"
+  let timer = "sourcery-dev-front-gate-check.timer"
+  port text.matches { value = $invocation; pattern = "\\A[0-9a-f]{32}\\z" } → valid
+  assert and($valid, not(eq($invocation, "00000000000000000000000000000000")),
+    eq($request.observedInvocation, $invocation))
+    otherwise "systemd no longer reports a valid matching invocation"
+  port text.matches { value = $request.serviceResult; pattern = "\\A[a-z-]{1,64}\\z" } → resultValid
+  port number.calculate { operation = "greater"; values = list($request.start, 0) } → started
+  port number.calculate { operation = "greaterEqual"; values = list($request.end, $request.start) } → finished
+  assert and($resultValid, $started, $finished, not(eq($request.started, "—")), not(eq($request.finished, "—")))
+    otherwise "Invalid completed execution properties"
+  port number.calculate { operation = "subtract"; values = list($request.end, $request.start) } → duration
+  let fields = list(
+    list("invocation-id", $invocation), list("scope", "user"), list("service", $service),
+    list("started", $request.started), list("finished", $request.finished), list("timezone", "AWST"),
+    list("result", $request.serviceResult), list("exit-code-kind", $request.exitCode),
+    list("exit-status", $request.exitStatus), list("duration-seconds", concat("", $duration)),
+    list("check", "Front Gate directory declaration tests"))
+  let observed = at(filter($request.timers, "row", and(eq(at($row, "unit"), $timer),
+    eq(at($row, "activates"), $service))), 0)
+  let last = at($observed, "last")
+  port number.isNatural { value = $last } → triggered
+  when $triggered:
+    port number.calculate { operation = "divide"; values = list($last, 1000000) } → fractional
+    port number.calculate { operation = "floor"; values = list($fractional) } → triggerSecond
+    when eq($triggerSecond, $request.start):
+      let fields = append($fields, list(list("timer", $timer), list("last-trigger", $request.started)))
+  fold $fields as field; content starts "":
+    let tuple = list("execution", at($field, 0), at($field, 1))
+    call receipt.line
+    yield concat($content, $result) → content
+  port digest.sha256 { text = $content } → pin
+  let result = { name = concat($invocation, ".rel"); content = $content; pin = $pin }
+
+process receipt.extend:
+  let request = $eventInput
+  let header = list("publication", "format", "encounter/scheduled-run-receipts/1")
+  assert eq(at($request.facts, 0), $header)
+    otherwise "Unexpected scheduled receipt publication format"
+  let receipt = list("publication", "receipt", $request.name)
+  let pin = list($request.name, "sha256", $request.pin)
+  let existing = filter($request.facts, "fact", and(eq(at($fact, 0), $request.name), eq(at($fact, 1), "sha256")))
+  let result = null
+  when includes($request.facts, $receipt):
+    assert eq($existing, list($pin))
+      otherwise "Publication already pins different receipt content"
+  when not(includes($request.facts, $receipt)):
+    assert eq(count($existing), 0)
+      otherwise "Publication has an unpaired receipt pin"
+    let tuple = $receipt
+    call receipt.line
+    let entry = $result
+    let tuple = $pin
+    call receipt.line
+    let pinLine = $result
+    port text.replace { value = $request.manifest; pattern = "\\n+\\z"; replacement = "" } → current
+    let result = concat($current, "\n", $entry, $pinLine)
+
+process receipt.line:
+  fold $tuple as field; encoded starts list():
+    port json.stringify { value = $field } → quoted
+    yield append($encoded, list($quoted)) → encoded
+  port text.join { values = $encoded; separator = ", " } → body
+  let result = concat("(", $body, ")\n")

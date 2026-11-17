@@ -1,0 +1,93 @@
+process-module "temple/surface-process-module/1"
+
+process dependency.lock:
+  let input = $eventInput
+  assert and(eq($input.version, 3), $input.matches, eq($input.lockedCount, count($input.dependencies)), $input.flat)
+    otherwise "Expected an exact flat production dependency lockfile."
+  fold $input.dependencies as entry; entries starts list():
+    port text.matches { value = $entry.name; pattern = "\\A(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*\\z" } → name
+    port text.matches { value = $entry.version; pattern = "\\A[0-9]+\\.[0-9]+\\.[0-9]+(?:-[A-Za-z0-9.-]+)?(?:\\+[A-Za-z0-9.-]+)?\\z" } → version
+    port text.matches { value = $entry.integrity; pattern = "\\Asha512-[A-Za-z0-9+/]{86}==\\z" } → integrity
+    let registry = concat("https://registry.npmjs.org/", $entry.name, "/-/", $entry.leaf, "-", $entry.version, ".tgz")
+    assert and($name, $version, $integrity, eq($entry.version, $entry.lockedVersion), eq($entry.resolved, $registry), $entry.fields)
+      otherwise "Production dependency is outside its exact registry and integrity contract."
+    yield append($entries, list({ name = $entry.name; version = $entry.version; url = $registry; integrity = $entry.integrity; bin = $entry.bin })) → entries
+  let result = $entries
+
+process dependency.archive:
+  assert eq($eventInput.expected, $eventInput.observed)
+    otherwise "Production dependency archive failed its SHA-512 identity."
+  let result = true
+
+process dependency.member:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.archivePath"; input = $input } → path
+  port text.matches { value = $path; pattern = "\\Apackage(?:/|\\z)" } → prefix
+  assert and($prefix, or(not(eq($path, "package")), $input.directory))
+    otherwise "Production dependency archive must contain one package tree."
+  port text.replace { value = $path; pattern = "\\Apackage/?"; replacement = "" } → result
+
+process dependency.package:
+  let input = $eventInput
+  assert and(eq($input.name, $input.expectedName), eq($input.version, $input.expectedVersion), eq($input.bin, $input.expectedBin), $input.flat)
+    otherwise "Production dependency package metadata differs from the lockfile."
+  let result = true
+
+process dependency.releasePlan:
+  let input = $eventInput
+  assert eq($input.protocol, "sourcery/platform-runtime-dependencies.v1")
+    otherwise "Unsupported Platform runtime dependency manifest."
+  let admitted = filter($input.dependencies, "dependency", not(eq($dependency.availability, "optional-not-admitted")))
+  let names = map($admitted, "entry", $entry.name)
+  port number.calculate { operation = "lessEqual"; values = list(count($names), 128) } → bounded
+  assert and(count($names), $bounded, eq(count($names), count(distinct($names))))
+    otherwise "Production dependencies must be nonempty, distinct, and bounded."
+  port value.sort { values = $names; mode = "locale" } → ordered
+  fold $ordered as name; planned starts list():
+    let entry = at(filter($admitted, "dependency", eq($dependency.name, $name)), 0)
+    port text.matches { value = $name; pattern = "\\A(?:@[a-z0-9][a-z0-9._-]*/)?[a-z0-9][a-z0-9._-]*\\z" } → safe
+    port text.matches { value = $entry.archiveSha512; pattern = "\\A[a-f0-9]{128}\\z" } → sha
+    assert and($safe, $sha, not(eq($name, "@temple2/platform-sdk")))
+      otherwise "Production dependency must have a safe name and exact SHA-512 archive identity. Temple uses its separately verified archive."
+    yield append($planned, list({ name = $name; version = $entry.version; source = $entry.source;
+      archiveSha512 = $entry.archiveSha512 })) → planned
+  let result = $planned
+
+process dependency.releaseInputs:
+  let input = $eventInput
+  let source = $input.source
+  let entries = $input.entries
+  port record.fromEntries { entries = map($entries, "entry", list($entry.name, $entry.version)) } → dependencies
+  let package = { name = $source.name; version = $source.version; private = true; type = $source.type;
+    engines = $source.engines; dependencies = $dependencies }
+  let base = { name = $source.name; version = $source.version; dependencies = $dependencies; engines = $source.engines }
+  port record.put { record = {}; key = ""; value = $base } → initial
+  fold $entries as entry; packages starts $initial:
+    assert and(eq($entry.name, $entry.installed.name), eq($entry.version, $entry.installed.version))
+      otherwise "Installed dependency differs from its admitted identity."
+    let lock = { version = $entry.version; resolved = $entry.source; integrity = $entry.integrity }
+    when $entry.installed.license:
+      port record.put { record = $lock; key = "license"; value = $entry.installed.license } → lock
+    when $entry.installed.bin:
+      port record.put { record = $lock; key = "bin"; value = $entry.installed.bin } → lock
+    when $entry.installed.engines:
+      port record.put { record = $lock; key = "engines"; value = $entry.installed.engines } → lock
+    port record.put { record = $packages; key = concat("node_modules/", $entry.name); value = $lock } → next
+    yield $next → packages
+  let lockfile = { name = $source.name; version = $source.version; lockfileVersion = 3; requires = true; packages = $packages }
+  port json.stringify { value = $package; space = 2 } → packageJson
+  port json.stringify { value = $lockfile; space = 2 } → lockJson
+  let packageBytes = concat($packageJson, "\n")
+  let lockBytes = concat($lockJson, "\n")
+  port digest.sha256 { text = $packageBytes } → packageHash
+  port digest.sha256 { text = $lockBytes } → lockHash
+  let admitted = map($entries, "entry", { name = $entry.name; version = $entry.version; source = $entry.source;
+    archiveSha512 = $entry.archiveSha512 })
+  let body = { protocol = "sourcery/production-release-input.v1"; sourcePackageSha256 = $input.sourcePackageSha256;
+    productionPackageSha256 = $packageHash; lockfileSha256 = $lockHash; admittedDependencies = $admitted;
+    templeDependencySource = "separately-verified-retained-archive"; repositorySourceAuthority = false }
+  port json.stringify { value = $body } → proofJson
+  port digest.sha256 { text = $proofJson } → proofHash
+  port record.put { record = $body; key = "proofHash"; value = $proofHash } → proof
+  port json.stringify { value = $proof; space = 2 } → proofJson
+  let result = { package = $packageBytes; lockfile = $lockBytes; proof = concat($proofJson, "\n") }

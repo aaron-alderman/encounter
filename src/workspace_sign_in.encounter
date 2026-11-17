@@ -1,0 +1,33 @@
+process-module "temple/surface-process-module/1"
+
+process workspaceSignIn.complete:
+  let destination = $eventInput.destination
+  let title = "Signed in to Workspace"
+  let message = "Continuing to your application…"
+  let action = "Continue"
+  let autoContinue = true
+  call workspaceSignIn.document
+
+process workspaceSignIn.required:
+  let destination = $eventInput.destination
+  let title = "Sign in to Workspace"
+  let message = "Sign in with your AppDev account to continue."
+  let action = "Sign in to Workspace"
+  let autoContinue = false
+  call workspaceSignIn.document
+
+process workspaceSignIn.document:
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width, initial-scale=1" } },
+      if($autoContinue, { tag = "meta"; attrs = { "http-equiv" = "refresh"; content = concat("2;url=", $destination) } }, null),
+      { tag = "title"; children = list($title) },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/workspace/vm-manager/style.css" } }) },
+    { tag = "body"; children = list(
+      { tag = "main"; attrs = { class = "vm-access-page" }; children = list(
+        { tag = "h1"; children = list($title) },
+        { tag = "p"; attrs = { role = "status" }; children = list($message) },
+        { tag = "a"; attrs = { href = $destination; target = if($autoContinue, null, "_top") }; children = list($action) }) }) }) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)

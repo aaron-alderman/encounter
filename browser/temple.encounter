@@ -1,0 +1,245 @@
+process-module "temple/surface-process-module/1"
+
+process temple.originInput:
+  port number.calculate { operation = "lessEqual"; values = list($length, 240) } → bounded
+  let result = and($text, $bounded)
+
+process temple.connectionCoordinates:
+  let result = { path = "/workspace/temple/connection"; protocol = if($secure, "wss:", "ws:") }
+
+process temple.originAllowed:
+  let loopback = and(eq($protocol, "http:"), $loopbackHost, $explicitPort)
+  let transport = if(eq($protocol, "https:"), true, $loopback)
+  let result = and($transport, $rootPath, not($credentials), not($decorated))
+
+# 0 launcher, 1 Platform Inbox, 2 Work items.
+process temple.platformViewCode:
+  let result = if(eq($view, "platform-inbox"), 1, if(eq($view, "work-items"), 2, 0))
+
+process temple.workspaceLocation:
+  call temple.platformViewCode
+  let platformAlias = if(eq($view, "platform"), true, not(eq($result, 0)))
+  let homePath = eq($path, "/workspace/home")
+  let aliasPath = if($homePath, true, eq($path, "/"))
+  let useAlias = and($aliasPath, $uniqueView, $platformAlias)
+  let result = if($useAlias, "platform", if($homePath, "home", if(eq($path, "/workspace/work"), "work",
+    if(eq($path, "/workspace/platform"), "platform", if(eq($path, "/workspace/mobile"), "mobile", "")))))
+
+process temple.workspacePath:
+  let result = if(eq($workspace, "home"), "/workspace/home", if(eq($workspace, "work"), "/workspace/work",
+    if(eq($workspace, "platform"), "/workspace/platform", if(eq($workspace, "mobile"), "/workspace/mobile", ""))))
+
+process temple.historyRestore:
+  call temple.workspaceLocation
+  let workspace = $result
+  let result = { workspace = $workspace; mode = if(eq($workspace, ""), "", "none") }
+
+process temple.workspaceName:
+  let result = if(eq($workspace, "home"), "Home", if(eq($workspace, "work"), "Work",
+    if(eq($workspace, "platform"), "Platform", if(eq($workspace, "mobile"), "Mobile", ""))))
+
+process temple.navigationItem:
+  call temple.workspaceName
+  let label = $result
+  let current = if(and(not(eq($label, "")), eq($workspace, $selected)), "page", "")
+  let result = { label = $label; current = $current }
+
+process temple.workspaceNotice:
+  call temple.subscriptionTimeoutNotice
+  let timeoutNotice = $result
+  let prefix = if(eq($phase, "opening"), "Opening ", "")
+  let suffix = if(eq($phase, "opening"), "…", if(eq($phase, "subscription-timeout"), $timeoutNotice,
+    if(eq($phase, "unavailable"), " is unavailable for this Temple session.",
+    if(eq($phase, "slow"), " is taking longer to open.", if(eq($phase, "empty"), "This Temple has no available workspaces.", "")))))
+  let result = { prefix = $prefix; suffix = $suffix }
+
+# The record declares the canonical query order. Empty fields are unavailable.
+process temple.launchFields:
+  let view = if($local, "view", if(eq($workspace, "platform"), "view", ""))
+  let result = { open = if($local, "open", ""); view = $view; item = if($local, "item", "");
+    setup = if($local, "setup", ""); play = if($local, "play", ""); pilot = if($local, "pilot", "");
+    comment = if($local, "comment", ""); signIn = if($local, "sign-in", "") }
+
+# Local fields come from launchFields. Remote forwarding accepts only an explicit Platform app.
+process temple.launchValueAllowed:
+  let view = $value
+  call temple.platformViewCode
+  let remoteView = and(eq($workspace, "platform"), eq($name, "view"), not(eq($result, 0)))
+  let result = and(eq($count, 1), if($local, true, $remoteView))
+
+process temple.platformTarget:
+  port text.matches { value = $item; pattern = "\\A[a-f0-9]{32}\\z" } → validItem
+  call temple.platformViewCode
+  let unspecified = if(eq($view, ""), true, eq($view, "platform"))
+  let code = if(and(eq($result, 0), $unspecified, $validItem), 2, $result)
+  let view = if(eq($code, 1), "platform-inbox", if(eq($code, 2), "work-items", ""))
+  let project = eq($workspace, "platform")
+  let result = { project = $project; view = if($project, $view, "");
+    includeItem = and($project, not(eq($code, 0)), $validItem) }
+
+process temple.catalogueLimit:
+  let result = 20
+
+process temple.savedCatalogue:
+  let result = and(eq($version, 1), $hasList)
+
+process temple.savedTempleAdmission:
+  let result = and($validIdentity, $canonicalOrigin)
+
+process temple.savedOriginMatch:
+  let result = and(eq($currentLength, $savedLength), eq($current, $saved))
+
+# The freshly connected Temple owns the first slot and replaces older entries for its origin.
+process temple.retainSavedTemple:
+  call temple.catalogueLimit
+  port number.calculate { operation = "less"; values = list($count, $result) } → room
+  let result = and($room, not($sameOrigin))
+
+process temple.identityAdmission:
+  port text.matches { value = $id; pattern = "\\A[A-Za-z0-9._-]{1,80}\\z" } → matched
+  let result = $matched
+
+process temple.greetingWorkspaceCount:
+  port number.calculate { operation = "lessEqual"; values = list($count, 4) } → bounded
+  let result = and($hasList, $bounded)
+
+process temple.greetingPlan:
+  let workspace = $selected
+  call temple.workspacePath
+  let canonicalPath = $result
+  let result = { subscriptions = eq($subscriptionVersion, 1);
+    refreshLaunch = and($reconnecting, not(eq($canonicalPath, "")), eq($path, $canonicalPath)) }
+
+process temple.greetingAccepted:
+  let identityMatches = if($knownTemple, eq($savedTemple, $observedTemple), true)
+  let result = and(eq($protocol, "sourcery/temple-connection/1"), $validTemple, $validWorkspaces, $identityMatches)
+
+# 0 empty workspace list, 1 requested workspace unavailable, 2 open workspace.
+process temple.selection:
+  let explicit = not(eq($selected, ""))
+  let fallback = if($preferredAvailable, $preferred, $first)
+  let workspace = if($explicit, $selected, $fallback)
+  let action = if($explicit, if($available, 2, 1), if(eq($fallback, ""), 0, 2))
+  let result = { action = $action; workspace = $workspace }
+
+# 0 retain current or pending surface, 1 open a direct frame, 2 subscribe.
+process temple.subscription:
+  let keep = and(not($resubscribe), if($mounted, true, $pending))
+  let result = if($keep, 0, if($subscriptions, 2, 1))
+
+process temple.timing:
+  let result = { initialRetry = 1000; connectionDeadline = 8000; workspaceDeadline = 12000; assurancePoll = 30000 }
+
+process temple.nextRetry:
+  let doubled = add($delay, $delay)
+  port number.calculate { operation = "less"; values = list($doubled, 30000) } → belowLimit
+  let result = if($belowLimit, $doubled, 30000)
+
+# 0 unavailable, 1 show an admitted frame, 2 show the Platform launcher.
+process temple.workspaceReply:
+  let action = 0
+  when eq($type, "workspace.ready"):
+    let launcher = and(eq($workspace, "platform"), not($hasView))
+    let launcherReady = and(eq($kind, "platform-launcher"), $validApps)
+    let frameReady = and(eq($kind, "frame"), $entryMatches)
+    let action = if($launcher, if($launcherReady, 2, 0), if($frameReady, 1, 0))
+  let result = $action
+
+# 0 ignore stale load, 1 observe the document, 2 request Work sign-in, 3 reveal the external document.
+process temple.frameLoadAction:
+  let signIn = and($local, eq($workspace, "work"), $connected)
+  let result = if($active, if($targetDocument, 1, if($signIn, 2, 3)), 0)
+
+process temple.frameMount:
+  let result = { sandbox = if($local, "", "allow-scripts allow-forms allow-same-origin allow-popups");
+    homeConnection = if(eq($workspace, "home"), "[data-home-connection]", "");
+    preferenceForm = if($local, "form.workspace-preference[action=\"/workspace/default\"]", "");
+    referrer = "no-referrer" }
+
+process temple.frameObservation:
+  let result = { attribute = if($hasHomeConnection, "data-state", "data-encounter");
+    bridge = "script[src*=\"_encounter/browser\"]" }
+
+process temple.frameSignIn:
+  let result = { path = "/workspace/temple/work-sign-in"; message = "Work requires sign-in. "; label = "Sign in to Work" }
+
+process temple.frameReady:
+  let ready = if($hasHomeConnection, $homeReady, $bridgeReady)
+  let result = if($waitForBridge, $ready, true)
+
+process temple.showFrame:
+  let result = and($connected, not($pending), $ready)
+
+process temple.frameTimedOut:
+  let result = and($active, $connected)
+
+process temple.followWorkspaceLink:
+  let sameFrame = if(eq($target, ""), true, eq($target, "_self"))
+  let result = and($hasLink, $primary, not($prevented), not($modified), $sameFrame)
+
+process temple.workspaceDestination:
+  let result = and($sameOrigin, $available)
+
+process temple.workspaceOpen:
+  let result = and($connected, $available)
+
+process temple.workspaceHistory:
+  let unchanged = and($samePath, $sameQuery)
+  let method = if(eq($mode, "replace"), "replaceState", if(eq($mode, "push"), "pushState", ""))
+  let result = if($unchanged, "", $method)
+
+# 0 reuse the surface, 1 mount a frame, 2 render the launcher.
+process temple.surfacePlan:
+  let reuseLoadingHidden = if($hasFrame, $frameReady, true)
+  let result = { action = if($mounted, 0, if($launcher, 2, 1));
+    loadingHidden = if($mounted, $reuseLoadingHidden, $launcher); frameHidden = not($frameReady) }
+
+# 0 leave the active workspace alone, 1 open the saved workspace, 2 report refusal.
+process temple.preferenceReply:
+  let action = if($ok, if(and($current, $connected, $available), 1, 0), 2)
+  let saved = "Default environment saved."
+  let failed = "Could not save the default environment. Try again."
+  let message = if(eq($action, 1), $saved, if(eq($action, 2), $failed, ""))
+  let result = { action = $action; message = $message }
+
+process temple.connectionNotice:
+  let result = if($reconnecting, "Reconnecting to Temple…", "Connecting to Temple…")
+
+process temple.connectionTimedOut:
+  let result = and($active, not($greeted))
+
+process temple.messageBody:
+  port number.calculate { operation = "lessEqual"; values = list($length, 4096) } → bounded
+  let result = and($text, $bounded)
+
+process temple.subscriptionRequest:
+  let result = { type = "workspace.subscribe"; id = add($previous, 1) }
+
+process temple.subscriptionReply:
+  let result = and(not(eq($pendingId, 0)), eq($pendingId, $observedId), eq($pendingWorkspace, $observedWorkspace))
+
+process temple.subscriptionTimedOut:
+  call temple.subscriptionReply
+  let expire = $result
+  call temple.subscriptionTimeoutNotice
+  let result = { expire = $expire; suffix = if($expire, $result, "") }
+
+process temple.subscriptionTimeoutNotice:
+  let result = " did not respond. Select it again to retry."
+
+process temple.retryConnection:
+  let retry = if($greeted, true, $reconnecting)
+  call temple.nextRetry
+  let notice = if($retry, "Reconnecting to Temple…", "Could not connect to that Temple. Check its address and setup, then try again.")
+  let result = { retry = $retry; wait = if($retry, $delay, 0); nextDelay = if($retry, $result, $delay); notice = $notice }
+
+process temple.platformAppCount:
+  port number.calculate { operation = "lessEqual"; values = list($count, 2) } → bounded
+  let result = and($array, $bounded, eq($distinct, $count))
+
+process temple.platformApp:
+  call temple.platformViewCode
+  let knownView = not(eq($result, 0))
+  port number.calculate { operation = "lessEqual"; values = list($titleLength, 80) } → boundedTitle
+  port number.calculate { operation = "lessEqual"; values = list($detailLength, 160) } → boundedDetail
+  let result = and($knownView, $titleText, $boundedTitle, $detailText, $boundedDetail)

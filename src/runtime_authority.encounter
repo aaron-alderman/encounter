@@ -1,0 +1,129 @@
+process-module "temple/surface-process-module/1"
+
+process authority.protocol:
+  let result = "sourcery.hosted/self-hosted-runtime-authority.v1"
+
+process authority.field:
+  let value = $eventInput
+  port value.describe { value = $value } → shape
+  let result = false
+  when eq($shape.type, "string"):
+    port text.matches { value = $value; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → result
+
+process authority.hash:
+  let value = $eventInput
+  port value.describe { value = $value } → shape
+  let result = false
+  when eq($shape.type, "string"):
+    port text.matches { value = $value; pattern = "\\A[a-f0-9]{64}\\z" } → result
+
+process authority.scope:
+  let scope = $eventInput
+  port value.describe { value = $scope } → shape
+  let result = null
+  when $shape.plain:
+    port record.entries { value = $scope } → entries
+    when count($entries):
+      port json.canonical { value = $scope } → encoded
+      port digest.sha256 { text = $encoded } → result
+
+process authority.registry:
+  let registry = $eventInput.registry
+  port kernel.invoke { query = "authority.field"; input = $eventInput.keyId } → key
+  assert $key
+    otherwise "Runtime authority key identity is invalid."
+  port value.describe { value = $registry } → shape
+  assert and($shape.plain, eq($registry.protocol, "sourcery.hosted/self-hosted-workload-registry.v1"), isArray($registry.workloads))
+    otherwise "Runtime authority workload registry is invalid."
+  port record.entries { value = $registry } → fields
+  assert eq(count($fields), 2)
+    otherwise "Unexpected runtime authority registry field."
+  let count = count($registry.workloads)
+  port number.calculate { operation = "less"; values = list($count, 257) } → bounded
+  assert and($count, $bounded)
+    otherwise "Expected 1 to 256 registered workloads."
+  fold $registry.workloads as entry; projected starts list():
+    port kernel.invoke { query = "authority.field"; input = $entry.consumerId } → valid
+    port kernel.invoke { query = "authority.scope"; input = $entry.scope } → scope
+    assert and($valid, $scope, isArray($entry.operations), count($entry.operations))
+      otherwise "Invalid registered workload."
+    each $entry.operations as operation:
+      assert includes(list("issue", "resolve"), $operation)
+        otherwise "Invalid registered workload operation."
+    let operations = filter(list("issue", "resolve"), "operation", includes($entry.operations, $operation))
+    let duplicate = filter($projected, "other", and(eq($other.consumerId, $entry.consumerId), eq($other.scopeHash, $scope)))
+    assert not(count($duplicate))
+      otherwise "Runtime authority workload identity and scope must be unique."
+    yield append($projected, list({ consumerId = $entry.consumerId; scopeHash = $scope; operations = $operations })) → result
+
+process authority.claims:
+  let signing = $eventInput
+  let claims = $signing.claims
+  let result = { code = "self-hosted-signing-payload" }
+  port value.describe { value = $claims } → shape
+  when and($shape.plain, eq($claims.protocol, "sourcery.hosted/runtime-resource-grant.v1"), eq($claims.keyId, $signing.keyId)):
+    let names = list("audience", "bindingKey", "consumerId", "expiresAt", "grantId", "identityEvidenceHash", "issuedAt",
+      "issuer", "keyId", "protocol", "provider", "receiptHash", "resourceRef", "scopeHash")
+    port record.entries { value = $claims } → fields
+    let fields = filter($fields, "field", includes($names, at($field, 0)))
+    port kernel.invoke { query = "authority.hash"; input = $claims.receiptHash } → receipt
+    port kernel.invoke { query = "authority.hash"; input = $claims.scopeHash } → scope
+    port kernel.invoke { query = "authority.hash"; input = $claims.identityEvidenceHash } → identity
+    when and(eq(count($fields), count($names)), eq(count($fields), $signing.fieldCount),
+      $receipt, $scope, or($identity, eq($claims.identityEvidenceHash, null))):
+      port json.canonical { value = $claims } → canonical
+      when eq($canonical, $signing.wire):
+        fold list("audience", "bindingKey", "consumerId", "grantId", "issuer", "provider", "resourceRef") as name; fieldsValid starts true:
+          port kernel.invoke { query = "authority.field"; input = at($claims, $name) } → valid
+          yield and($fieldsValid, $valid) → fieldsValid
+        when not($fieldsValid):
+          let result = { code = "self-hosted-runtime-authority-invalid" }
+        when and($fieldsValid, $signing.timestamps):
+          port number.calculate { operation = "subtract"; values = list($signing.expiresAt, $signing.issuedAt) } → lifetime
+          port number.calculate { operation = "less"; values = list(999, $lifetime) } → minimum
+          port number.calculate { operation = "less"; values = list($lifetime, 300001) } → maximum
+          when and($minimum, $maximum):
+            let result = { kind = "sign" }
+
+process authority.authenticate:
+  let request = $eventInput.message
+  let result = { code = "self-hosted-workload-operation" }
+  when includes(list("issue", "resolve"), $request.grantOperation):
+    port kernel.invoke { query = "authority.scope"; input = $request.scope } → scope
+    let result = { code = "self-hosted-workload-scope" }
+    when $scope:
+      let candidates = filter($eventInput.registry, "entry", and(eq($entry.scopeHash, $scope),
+        includes($entry.operations, $request.grantOperation),
+        or(and($eventInput.hasConsumer, eq($request.presentedConsumerId, null)), eq($request.presentedConsumerId, $entry.consumerId))))
+      let result = { code = "self-hosted-workload-unregistered" }
+      when eq(count($candidates), 1):
+        let selected = at($candidates, 0)
+        call authority.protocol
+        port json.canonical { value = {
+          protocol = $result; consumerId = $selected.consumerId; scopeHash = $selected.scopeHash; operations = $selected.operations
+        } } → evidence
+        port digest.sha256 { text = $evidence } → evidenceHash
+        let result = { kind = "identity"; consumerId = $selected.consumerId; evidenceHash = $evidenceHash }
+
+process authority.dispatch:
+  let message = $eventInput.message
+  call authority.protocol
+  let protocol = $result
+  port value.describe { value = $message.requestId } → id
+  let validId = false
+  when eq($id.type, "string"):
+    port text.matches { value = $message.requestId; pattern = "\\Arequest[.][a-f0-9-]{36}\\z" } → validId
+  let result = { code = "self-hosted-runtime-authority-invalid" }
+  when and($validId, eq($message.protocol, $protocol)):
+    let operation = $message.operation
+    let result = { code = "self-hosted-runtime-authority-operation" }
+    when includes(list("inspect-readiness", "sign-runtime-grant"), $operation):
+      let result = { code = "self-hosted-runtime-authority-key" }
+      when eq($message.keyId, $eventInput.keyId):
+        let result = { kind = "ready"; keyId = $eventInput.keyId; workloadCount = count($eventInput.registry) }
+        when eq($operation, "sign-runtime-grant"):
+          let result = { code = "self-hosted-signing-payload" }
+          when $eventInput.hasSigning:
+            port kernel.invoke { query = "authority.claims"; input = $eventInput.signing } → result
+    when eq($operation, "authenticate-workload"):
+      port kernel.invoke { query = "authority.authenticate"; input = $eventInput } → result

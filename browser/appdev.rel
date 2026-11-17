@@ -1,0 +1,7 @@
+("wasm", "contract", "encounter/appdev-browser-wasm-build/3")
+("wasm", "module", "aster-frame")
+("wasm", "module", "assurance")
+("wasm", "module", "countdown")
+("wasm", "module", "interaction")
+("wasm", "module", "mobile")
+("wasm", "module", "temple")

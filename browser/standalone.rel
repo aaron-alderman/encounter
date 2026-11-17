@@ -1,0 +1,4 @@
+("wasm", "contract", "encounter/standalone-browser-wasm-build/1")
+("wasm", "module", "canvas")
+("wasm", "module", "live-events")
+("wasm", "module", "preview")

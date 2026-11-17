@@ -1,0 +1,120 @@
+process-module "temple/surface-process-module/1"
+
+process templePublication.configure:
+  let input = $eventInput
+  port value.describe { value = $input.config } → shape
+  assert $shape.plain
+    otherwise "Expected a Server Temple publication configuration."
+  port value.type { value = $input.config.port } → portType
+  let port = if(eq($portType, "undefined"), 0, $input.config.port)
+  port number.isNatural { value = $port } → integer
+  port number.calculate { operation = "lessEqual"; values = list($port, 65535) } → bounded
+  assert and($integer, $bounded)
+    otherwise "Invalid Server Temple publication port."
+  let origin = $input.config.publicOrigin
+  when $origin:
+    port text.matches { value = $origin; pattern = "\\A(?:https://(?:[a-z0-9-]+(?:[.][a-z0-9-]+)*[.]?|\\[[a-f0-9:]+\\])|http://127[.]0[.]0[.]1)(?::[1-9][0-9]{0,4})?\\z" } → allowed
+    assert $allowed
+      otherwise "Expected a credential-free HTTPS or local trial publication origin."
+  when $input.config.publication:
+    port number.calculate { operation = "lessEqual"; values = list($input.pendingExpiresMs, $input.nowMs) } → expired
+    assert and($input.validPendingTime, $expired)
+      otherwise "Active plugin publication authoring requires the existing signed catalogue producer."
+  let result = { port = $port; origin = if($origin, $origin, null) }
+
+process templePublication.route:
+  let input = $eventInput
+  let result = { kind = "error"; status = 404; error = "not-published" }
+  when not(includes(list($input.publicHost, $input.localHost), $input.host)):
+    let result = { kind = "error"; status = 421; error = "host-mismatch" }
+  when includes(list($input.publicHost, $input.localHost), $input.host):
+    when not(eq($input.method, "GET")):
+      let result = { kind = "error"; status = 405; error = "public-read-only" }
+    when eq($input.method, "GET"):
+      when eq($input.path, "/.well-known/temple.json"):
+        let result = { kind = "identity" }
+      when eq($input.path, "/health"):
+        let result = { kind = "health" }
+      let available = false
+      when $input.published:
+        port number.calculate { operation = "greater"; values = list($input.expiresMs, $input.nowMs) } → available
+      when eq($input.path, "/temple/plugins/catalogue.json"):
+        let result = if($available, { kind = "catalogue" },
+          { kind = "error"; status = 503; error = "catalogue-not-published-or-expired" })
+      when $available:
+        port text.match { value = $input.path; pattern = "\\A/temple/plugins/([a-f0-9]{64}[.]sourcery-plugin[.]json)\\z" } → artifact
+        when $artifact:
+          let result = { kind = "artifact"; name = at($artifact.groups, 0) }
+
+process templePublication.identity:
+  let input = $eventInput
+  let identifier = $input.manifest.templeId
+  call templePublication.identifier
+  port text.matches { value = $input.manifest.name; pattern = "\\S" } → name
+  port number.calculate { operation = "lessEqual"; values = list(count($input.manifest.name), 160) } → nameBound
+  port text.matches { value = $input.manifest.manifestHash; pattern = "\\A[a-f0-9]{64}\\z" } → digest
+  assert and($name, $nameBound, $digest)
+    otherwise "Invalid Server Temple public identity."
+  let expiresMs = add($input.nowMs, 300000)
+  port time.formatUtc { milliseconds = $input.nowMs; fractional = true } → issued
+  port time.formatUtc { milliseconds = $expiresMs; fractional = true } → expires
+  let result = { protocol = "sourcery/temple-server-identity.v1"; kind = "ServerTemple";
+    templeId = $input.manifest.templeId; name = $input.manifest.name; origin = $input.origin;
+    publicKey = $input.manifest.identityPublicKey; keyFingerprint = $input.keyFingerprint;
+    manifestHash = $input.manifest.manifestHash; catalogueUrl = concat($input.origin, "/temple/plugins/catalogue.json");
+    issuedAt = $issued; expiresAt = $expires }
+
+process templePublication.catalogue:
+  let input = $eventInput
+  let catalogue = $input.catalogue
+  assert and(eq($input.protocol, "sourcery/server-plugin-publication.v1"),
+    eq($catalogue.protocol, "sourcery/temple-plugin-catalogue.v1"), eq($catalogue.templeId, $input.templeId),
+    eq($catalogue.sequence, $input.revision), $input.validExpiry)
+    otherwise "Retained plugin catalogue identity, sequence, or expiry differs."
+  port number.isNatural { value = $catalogue.sequence } → integer
+  port number.calculate { operation = "greater"; values = list($catalogue.sequence, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($catalogue.sequence, 9007199254740991) } → bounded
+  port number.calculate { operation = "lessEqual"; values = list($input.expiresMs, add($input.nowMs, 2678400000)) } → lifetime
+  port value.describe { value = $catalogue.plugins } → plugins
+  port number.calculate { operation = "lessEqual"; values = list(count($catalogue.plugins), 200) } → pluginCount
+  assert and($integer, $positive, $bounded, $lifetime, $plugins.array, $pluginCount)
+    otherwise "Invalid retained plugin catalogue sequence, lifetime, or inventory."
+  let ids = map($catalogue.plugins, "plugin", $plugin.id)
+  let names = map($catalogue.plugins, "plugin", concat($plugin.bundleHash, ".sourcery-plugin.json"))
+  assert and(eq(count(distinct($ids)), count($ids)), eq(count(distinct($names)), count($names)),
+    eq(count($input.artifacts), count($names)))
+    otherwise "Retained plugin publication has duplicate or mismatched artifacts."
+  each $catalogue.plugins as plugin:
+    let identifier = $plugin.id
+    call templePublication.identifier
+    port value.type { value = $plugin.name } → nameType
+    port value.type { value = $plugin.version } → versionType
+    port number.calculate { operation = "lessEqual"; values = list(count($plugin.name), 200) } → name
+    port number.calculate { operation = "lessEqual"; values = list(count($plugin.version), 100) } → version
+    port text.matches { value = $plugin.bundleHash; pattern = "\\A[a-f0-9]{64}\\z" } → bundleHash
+    port text.matches { value = $plugin.sha256; pattern = "\\A[a-f0-9]{64}\\z" } → digest
+    port number.isNatural { value = $plugin.bytes } → byteInteger
+    port number.calculate { operation = "greater"; values = list($plugin.bytes, 0) } → hasBytes
+    port number.calculate { operation = "lessEqual"; values = list($plugin.bytes, 50331648) } → byteLimit
+    port value.describe { value = $plugin.dependencies } → dependencies
+    port number.calculate { operation = "lessEqual"; values = list(count($plugin.dependencies), 100) } → dependencyLimit
+    assert and(eq($nameType, "string"), eq($versionType, "string"), $name, $version, $bundleHash,
+      $digest, $byteInteger, $hasBytes, $byteLimit, $dependencies.array, $dependencyLimit)
+      otherwise "Invalid signed plugin catalogue listing."
+    each $plugin.dependencies as identifier:
+      call templePublication.identifier
+    let name = concat($plugin.bundleHash, ".sourcery-plugin.json")
+    assert eq($plugin.url, concat($input.origin, "/temple/plugins/", $name))
+      otherwise "Plugin artifact URL differs from its registered Temple origin and digest path."
+    let artifacts = filter($input.artifacts, "artifact", eq($artifact.name, $name))
+    let artifact = at($artifacts, 0)
+    assert and(eq(count($artifacts), 1), eq($artifact.sha256, $plugin.sha256), eq($artifact.bytes, $plugin.bytes),
+      eq($artifact.bundleHash, $plugin.bundleHash), eq($artifact.id, $plugin.id),
+      eq($artifact.pluginName, $plugin.name), eq($artifact.dependencies, $plugin.dependencies))
+      otherwise "Retained plugin bytes or identity differ from the signed catalogue."
+  let result = true
+
+process templePublication.identifier:
+  port text.matches { value = $identifier; pattern = "\\A[A-Za-z0-9._-]{1,160}\\z" } → valid
+  assert $valid
+    otherwise "Invalid plugin or dependency identifier."

@@ -1,0 +1,229 @@
+process-module "temple/surface-process-module/1"
+
+process package.temple3Inputs:
+  port text.split { value = $eventInput; pattern = "\\n" } → lines
+  fold $lines as line; files starts list():
+    let next = $files
+    port text.matches { value = $line; pattern = "\\A#" } → comment
+    when and(not($comment), not(eq($line, ""))):
+      port text.match { value = $line; pattern = "\\A([a-f0-9]{64})  ([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)\\z" } → row
+      assert $row
+        otherwise "Invalid Temple3 source pin"
+      let path = at($row.groups, 1)
+      port text.matches { value = $path; pattern = "(?:\\A|/)\\.{1,2}(?:/|\\z)" } → traversal
+      assert and(not($traversal), not(some($files, "file", eq($file.path, $path))))
+        otherwise "Invalid or duplicate Temple3 source path"
+      let next = append($files, list({ path = $path; sha256 = at($row.groups, 0) }))
+    yield $next → files
+  assert not(eq(count($files), 0))
+    otherwise "Missing Temple3 source pins"
+  let result = { files = $files }
+
+process package.guardedApplications:
+  let result = list(
+    { name = "harborboard"; compiler = "platform"; layout = "platform"; app = "harborboard"; root = "encounter-work-boards";
+      directory = "encounter-platform/applications/encounter-work-boards"; declaration = "products/harborboard/application.rel";
+      guards = list("dependency-guard.encounter") },
+    { name = "claimipedia"; compiler = "claimipedia"; layout = "aggregate"; app = "claimipedia"; root = "encounter-claimipedia";
+      directory = "applications/encounter-claimipedia"; declaration = "products/claimipedia/application.rel";
+      guards = list("review-guard.encounter") },
+    { name = "authoring"; compiler = "authoring"; layout = "aggregate"; app = "encounter"; root = "encounter";
+      directory = "applications/encounter"; declaration = "bootstrap/application.rel";
+      guards = list("dependency-guard.encounter", "occurrence-guard.encounter") },
+    { name = "super-crm"; compiler = "platform"; layout = "platform"; app = "super-crm"; root = "encounter-portfolio";
+      directory = "encounter-platform/applications/encounter-portfolio"; declaration = "products/super-crm/application.rel";
+      guards = list("occurrence-guard.encounter", "review-guard.encounter") })
+
+process package.guardPromotion:
+  port text.matches { value = $eventInput; pattern = "\\A(?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*)){2}\\z" } → valid
+  assert $valid
+    otherwise "Expected a numeric guard release version"
+  call package.guardedApplications
+  let apps = $result
+  let copies = list("applications/encounter-libraries/guards", "encounter-platform/shared",
+    "applications/encounter-work-boards", "applications/encounter-portfolio",
+    "encounter-platform/applications/encounter", "encounter-platform/applications/front-gate",
+    "encounter-platform/applications/encounter-runtime", "applications/encounter-runtime")
+  let archives = list(
+    { kind = "archive"; layout = "platform"; runtime = "encounter-platform/applications/encounter-runtime";
+      compiler = "platform"; applications = list("harborboard", "super-crm") },
+    { kind = "archive"; layout = "aggregate"; runtime = "applications/encounter-runtime";
+      compiler = "claimipedia"; applications = list("claimipedia", "authoring") })
+  fold $apps as app; upgrades starts list({ kind = "baseline" }):
+    let next = append($upgrades, list({ kind = "upgrade"; application = $app.name }))
+    when eq($app.name, "claimipedia"):
+      let next = append($next, $archives)
+    yield $next → upgrades
+  fold $apps as app; rollbacks starts list():
+    yield append(list({ kind = "rollback"; application = $app.name }), $rollbacks) → rollbacks
+  let result = { apps = $apps; copies = $copies; steps = append($upgrades, $rollbacks) }
+
+process package.guardImageReady:
+  let result = eq($eventInput, 200)
+
+process package.plan:
+  let request = $eventInput
+  port text.matches { value = $request.version; pattern = "\\A[0-9]+\\.[0-9]+\\.[0-9]+\\z" } → version
+  let platformOnly = eq($request.layout, "platform")
+  assert and($version, eq($request.platform, "linux-x86_64"), includes(list("aggregate", "platform"), $request.layout))
+    otherwise "Expected an x86-64 Linux release version"
+  let name = concat("encounter-", $request.version, "-", $request.platform)
+  call package.guardedApplications
+  let required = filter($result, "guarded", eq($guarded.layout, $request.layout))
+  fold $request.catalogue as row; images starts list():
+    let app = at($row, 0)
+    let root = at($row, 1)
+    let declaration = at($row, 2)
+    port text.matches { value = $app; pattern = "\\A[a-z0-9-]+\\z" } → appValid
+    port text.matches { value = $root; pattern = "\\A[a-z0-9-]+\\z" } → rootValid
+    port text.matches { value = $declaration; pattern = "\\A(?:[a-z0-9-]+/)*[a-z0-9.-]+\\.rel\\z" } → pathValid
+    assert and($appValid, $rootValid, $pathValid, not(some($images, "image", eq($image.app, $app))))
+      otherwise "Invalid or duplicate release application"
+    let guards = list()
+    let matched = filter($required, "guarded", eq($guarded.app, $app))
+    when eq(count($matched), 1):
+      let guarded = at($matched, 0)
+      assert and(eq($root, $guarded.root), eq($declaration, $guarded.declaration))
+        otherwise "Unexpected release guard coordinates"
+      let guards = $guarded.guards
+    yield append($images, list({ app = $app; root = $root; declaration = $declaration;
+      image = concat("images/", $app, ".rel"); guards = $guards })) → images
+  assert every($required, "guarded", some($images, "image", eq($image.app, $guarded.app)))
+    otherwise "Release catalogue is missing a required guarded application"
+  let specs = if(includes(list("0.1.0", "0.1.1", "0.1.2"), $request.version),
+    list(), list("spec/platform.rel", "spec/application-ports.rel"))
+  let loaders = list(
+    "encounter-runtime/profiles/claimipedia-web.rel", "encounter-runtime/profiles/workgarden.rel",
+    "encounter-runtime/profiles/workgarden-web.rel", "encounter-runtime/profiles/workgarden-covenant.rel",
+    "encounter-runtime/release-applications.rel", "encounter/bootstrap/application.rel",
+    "encounter-work-boards/bootstrap/application.rel", "encounter-portfolio/bootstrap/application.rel")
+  let sharedLoaders = list()
+  when $platformOnly:
+    let loaders = list("front-gate/directory.rel", "front-gate/pilot.rel", "encounter-runtime/release-applications-platform.rel")
+    let sharedLoaders = list("encounter/bootstrap/application.rel", "encounter-work-boards/bootstrap/application.rel",
+      "encounter-portfolio/bootstrap/application.rel")
+  let result = { name = $name; images = $images; specs = $specs; loaders = $loaders; sharedLoaders = $sharedLoaders;
+    allProfiles = $platformOnly;
+    productRoots = list("encounter-work-boards/products", "encounter-portfolio/products") }
+
+process package.runtime:
+  let request = $eventInput
+  let result = if($request.reported,
+    eq($request.versionLine, concat("encounter ", $request.version)),
+    and(eq($request.version, "0.1.0"),
+      eq($request.pin, "b579cfd6af3ad721efebda41a63f48308d747879ce1bbee4585d7bd588240be6")))
+
+process package.executable:
+  let request = $eventInput
+  let supplied = $request.supplied
+  let result = or(eq($request.pin, $request.running),
+    and(eq($request.version, "0.1.0"),
+      eq($request.pin, "b579cfd6af3ad721efebda41a63f48308d747879ce1bbee4585d7bd588240be6")))
+  when not(eq($supplied, null)):
+    port text.matches { value = $supplied; pattern = "\\A[a-f0-9]{64}\\z" } → digest
+    let result = and($digest, eq($request.pin, $supplied))
+
+process package.loader:
+  let declaration = $eventInput
+  port record.entries { value = $declaration } → fields
+  assert every($fields, "field", includes(list("notes", "sections"), at($field, 0)))
+    otherwise "Unknown loader declaration field"
+  let notes = or(at($declaration, "notes"), list())
+  let sections = at($declaration, "sections")
+  assert and(isArray($notes), isArray($sections), count($sections))
+    otherwise "Invalid loader declaration"
+  fold $notes as note; header starts "":
+    port value.type { value = $note } → kind
+    port text.matches { value = $note; pattern = "[\\r\\n]" } → multiline
+    assert and(eq($kind, "string"), not($multiline))
+      otherwise "Invalid loader note"
+    yield concat($header, "// ", $note, "\n") → header
+  fold $sections as section; body starts $header:
+    let subject = $section.subject
+    port value.type { value = $subject } → kind
+    port record.entries { value = $section } → fields
+    let properties = filter($fields, "field", not(eq(at($field, 0), "subject")))
+    assert and(eq($kind, "string"), count($subject), count($properties))
+      otherwise "Invalid loader section"
+    fold $properties as property; text starts $body:
+      let predicate = at($property, 0)
+      let field = at($property, 1)
+      let values = if(isArray($field), $field, list($field))
+      assert count($values)
+        otherwise "Empty loader field"
+      fold $values as atom; lines starts $text:
+        let tuple = list($subject, $predicate, $atom)
+        call package.line
+        yield concat($lines, $result) → lines
+      yield $lines → text
+    yield $text → body
+  let result = $body
+
+process package.guardVersion:
+  port text.match { value = $eventInput; pattern = "\\A# encounter-guards ((?:0|[1-9][0-9]*)(?:\\.(?:0|[1-9][0-9]*)){2})\\n" } → header
+  assert $header
+    otherwise "Invalid guard release pin"
+  let result = at($header.groups, 0)
+
+process package.guardRelease:
+  let request = $eventInput
+  let guardNames = list("dependency-guard.encounter", "occurrence-guard.encounter", "review-guard.encounter")
+  fold $guardNames as guard; manifest starts "":
+    yield concat($manifest, at($request.canonical, $guard), "  ", $guard, "\n") → manifest
+  assert eq($manifest, $request.manifest)
+    otherwise "Canonical guard release differs from its manifest"
+  let result = $guardNames
+
+process package.guards:
+  let request = $eventInput
+  call package.guardRelease
+  let guardNames = $result
+  let paths = map($request.guards, "guard", concat("source/", $guard))
+  fold $request.modules as module; selected starts list():
+    port text.split { value = $module; pattern = "/" } → segments
+    let file = at($segments, add(count($segments), -1))
+    yield if(includes($guardNames, $file), append($selected, list($module)), $selected) → selected
+  port value.sort { values = $selected } → selected
+  assert eq($paths, $selected)
+    otherwise "Application guard modules differ from the required paths"
+  fold $request.guards as guard; admitted starts true:
+    let path = concat("source/", $guard)
+    let pin = at($request.canonical, $guard)
+    assert eq(at($request.vendored, $path), $pin)
+      otherwise "Vendored guard differs from release"
+    yield $admitted → admitted
+  call package.guardLock
+  assert eq($result, $request.lock)
+    otherwise "Guard pin differs from the declared release and module set"
+  let result = $request.vendored
+
+process package.guardLock:
+  let request = $eventInput
+  fold $request.guards as guard; lock starts concat("# encounter-guards ", $request.version, "\n"):
+    let path = concat("source/", $guard)
+    let pin = at($request.canonical, $guard)
+    yield concat($lock, $pin, "  ", $path, "\n") → lock
+  let result = $lock
+
+process package.manifest:
+  let request = $eventInput
+  let header = list(list("release", "format", "encounter/release/1"),
+    list("release", "version", $request.version), list("release", "platform", $request.platform),
+    list("release", "runtime", "bin/encounter"), list("bin/encounter", "sha256", $request.runtimePin))
+  fold $request.images as image; rows starts $header:
+    yield append($rows, list(list($image.app, "image", $image.path), list($image.app, "sha256", $image.pin))) → rows
+  let rows = append($rows, map($request.specs, "spec", list($spec.path, "sha256", $spec.pin)))
+  fold $rows as tuple; manifest starts "":
+    call package.line
+    yield concat($manifest, $result) → manifest
+  let result = $manifest
+
+process package.line:
+  fold $tuple as atom; encoded starts list():
+    port value.type { value = $atom } → kind
+    assert eq($kind, "string")
+      otherwise "Expected a text REL atom"
+    port scalar.quoteValue { value = $atom } → quoted
+    yield append($encoded, list($quoted)) → encoded
+  port text.join { values = $encoded; separator = ", " } → text
+  let result = concat("(", $text, ")\n")

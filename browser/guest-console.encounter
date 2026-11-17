@@ -1,0 +1,78 @@
+process-module "temple/surface-process-module/1"
+
+process guestConsole.connect:
+  let result = and(not($connected), not($hidden))
+
+process guestConsole.applyStatus:
+  let enabled = and($connected, not($paused))
+  let requestDisplay = and($startDisplay, $enabled, not($hasMode))
+  let result = { enabled = $enabled; requestDisplay = $requestDisplay }
+
+process guestConsole.frame:
+  let result = if(eq($opcode, 1), if($hasDisplay, 1, -1), if(eq($opcode, 0), 0, -1))
+
+process guestConsole.displayReady:
+  let result = and(not($paused), $display, $open, not(eq($width, 0)), not(eq($height, 0)))
+
+process guestConsole.bufferReady:
+  port number.calculate { operation = "less"; values = list($buffered, $limit) } → ready
+  let result = $ready
+
+process guestConsole.pointer:
+  port number.calculate { operation = "divide"; values = list($width, $guestWidth) } → scaleX
+  port number.calculate { operation = "divide"; values = list($height, $guestHeight) } → scaleY
+  port number.calculate { operation = "min"; values = list($scaleX, $scaleY) } → scale
+  let usable = not(eq($scale, 0))
+  let divisor = if($usable, $scale, 1)
+  port number.calculate { operation = "multiply"; values = list($guestWidth, $scale) } → contentWidth
+  port number.calculate { operation = "multiply"; values = list($guestHeight, $scale) } → contentHeight
+  port number.calculate { operation = "subtract"; values = list($width, $contentWidth) } → padWidth
+  port number.calculate { operation = "subtract"; values = list($height, $contentHeight) } → padHeight
+  port number.calculate { operation = "divide"; values = list($padWidth, 2) } → leftPad
+  port number.calculate { operation = "divide"; values = list($padHeight, 2) } → topPad
+  port number.calculate { operation = "subtract"; values = list($clientX, $leftPad) } → contentX
+  port number.calculate { operation = "subtract"; values = list($clientY, $topPad) } → contentY
+  port number.calculate { operation = "divide"; values = list($contentX, $divisor) } → projectedX
+  port number.calculate { operation = "divide"; values = list($contentY, $divisor) } → projectedY
+  port number.calculate { operation = "floor"; values = list($projectedX) } → rawX
+  port number.calculate { operation = "floor"; values = list($projectedY) } → rawY
+  port number.calculate { operation = "lessEqual"; values = list(0, $rawX) } → afterLeft
+  port number.calculate { operation = "lessEqual"; values = list(0, $rawY) } → afterTop
+  port number.calculate { operation = "less"; values = list($rawX, $guestWidth) } → beforeRight
+  port number.calculate { operation = "less"; values = list($rawY, $guestHeight) } → beforeBottom
+  let inside = and($afterLeft, $afterTop, $beforeRight, $beforeBottom)
+  port number.calculate { operation = "subtract"; values = list($guestWidth, 1) } → rightEdge
+  port number.calculate { operation = "subtract"; values = list($guestHeight, 1) } → bottomEdge
+  port number.calculate { operation = "max"; values = list(0, $rawX) } → positiveX
+  port number.calculate { operation = "max"; values = list(0, $rawY) } → positiveY
+  port number.calculate { operation = "min"; values = list($rightEdge, $positiveX) } → x
+  port number.calculate { operation = "min"; values = list($bottomEdge, $positiveY) } → y
+  let accepted = and($usable, not(and(not($clamp), not($inside))))
+  let result = { accepted = $accepted; x = $x; y = $y }
+
+process guestConsole.pointerPress:
+  let result = and($primary, $ready, not(eq($buttons, 0)))
+
+process guestConsole.key:
+  port text.matches { value = $code; pattern = "\\AKey[A-Z]{1,1}\\z" } → letter
+  port text.matches { value = $code; pattern = "\\ADigit[0-9]{1,1}\\z" } → digit
+  port text.matches { value = $code; pattern = "\\AF[1-9]{1,1}\\z" } → fnKey
+  let function = not(and(not($fnKey), not(eq($code, "F10")), not(eq($code, "F11")), not(eq($code, "F12"))))
+  let navigation = not(and(not(eq($code, "ArrowUp")), not(eq($code, "ArrowDown")), not(eq($code, "ArrowLeft")), not(eq($code, "ArrowRight")), not(eq($code, "Home")), not(eq($code, "End"))))
+  let editing = not(and(not(eq($code, "Backspace")), not(eq($code, "Delete")), not(eq($code, "Enter")), not(eq($code, "Escape")), not(eq($code, "Space"))))
+  let punctuation = not(and(not(eq($code, "Minus")), not(eq($code, "Equal")), not(eq($code, "BracketLeft")), not(eq($code, "BracketRight")), not(eq($code, "Backslash")), not(eq($code, "Semicolon")), not(eq($code, "Quote")), not(eq($code, "Backquote")), not(eq($code, "Comma")), not(eq($code, "Period")), not(eq($code, "Slash"))))
+  let supported = not(and(not($letter), not($digit), not($function), not($navigation), not($editing), not($punctuation)))
+  let result = and(not($paused), $display, $open, not($modified), $supported)
+
+process guestConsole.command:
+  port number.calculate { operation = "lessEqual"; values = list($length, 254) } → fits
+  let result = if(and(not($disabled), $open, $hasText), if($fits, 1, -1), 0)
+
+process guestConsole.protocol:
+  let result = { endpoint = "/workspace/vm-manager/console"; selector = "vm";
+    commandPrefix = "\u0000"; display = "display"; serial = "serial"; key = "key "; shift = "Shift+";
+    mouse = "mouse " }
+
+process guestConsole.options:
+  let result = { reset = "mouse reset"; pointerInterval = 40; displayBuffer = 1024;
+    terminalChunk = 4096; terminalBuffer = 65536; approvalHistory = 2048; serialHistory = 131072 }

@@ -1,0 +1,136 @@
+process-module "temple/surface-process-module/1"
+
+process assurance.factValues:
+  let matches = filter($facts, "row", and(eq(at($row, 0), $subject), eq(at($row, 1), $property)))
+  let result = map($matches, "row", at($row, 2))
+
+process assurance.fact:
+  call assurance.factValues
+  assert eq(count($result), 1)
+    otherwise "Expected one value for the required AppDev Assurance fact."
+  let result = at($result, 0)
+
+process assurance.requireRows:
+  each $expected as row:
+    let subject = at($row, 0)
+    let property = at($row, 1)
+    call assurance.fact
+    assert eq($result, at($row, 2))
+      otherwise "AppDev Assurance receipt differs from the recomputed evidence."
+
+process assurance.contract:
+  let result = "encounter/appdev-interaction-assurance/1"
+
+process assurance.metrics:
+  let result = list(
+    list("desktop-switch-mutations", 2),
+    list("desktop-repeat-mutations", 0),
+    list("desktop-activation-dispatches", 0),
+    list("system-catalogue-sections", 5, "legacy-optional"),
+    list("front-gate-between-dispatches", 0),
+    list("front-gate-due-dispatches", 1),
+    list("front-gate-minimized-dispatches", 0),
+    list("front-gate-restore-dispatches", 1),
+    list("front-gate-paused-dispatches", 0),
+    list("front-gate-identical-mutations", 0),
+    list("front-gate-timestamp-mutations", 1),
+    list("front-gate-filtered-mutations", 0),
+    list("front-gate-visible-mutations", 1))
+
+process assurance.header:
+  call assurance.contract
+  let result = list(list("assurance", "contract", $result),
+    list("assurance", "releaseSha256", $eventInput.releaseSha256))
+
+process assurance.author:
+  let observations = $eventInput.observations
+  call assurance.metrics
+  let expected = $result
+  port record.entries { value = $observations } → entries
+  assert eq(count($entries), count($expected))
+    otherwise "Unexpected interaction Assurance observations."
+  call assurance.header
+  fold $expected as observation; rows starts $result:
+    let metric = at($observation, 0)
+    let count = at($observation, 1)
+    assert eq(at($observations, $metric), $count)
+      otherwise "An interaction Assurance observation differs from the expected count."
+    port json.stringify { value = $count } → value
+    yield append($rows, list(list($metric, "observed", $value))) → result
+
+process assurance.require:
+  let facts = $eventInput.receipt
+  call assurance.header
+  let expected = $result
+  call assurance.requireRows
+  call assurance.metrics
+  each $result as observation:
+    let subject = at($observation, 0)
+    let property = "observed"
+    call assurance.factValues
+    let values = $result
+    when or(not(eq(at($observation, 2), "legacy-optional")), count($values)):
+      port json.stringify { value = at($observation, 1) } → expectedCount
+      assert eq($values, list($expectedCount))
+        otherwise "An AppDev interaction Assurance receipt has a missing or changed observation."
+  when $eventInput.system:
+    let input = { policy = $eventInput.policy; saved = $facts; releaseSha256 = $eventInput.releaseSha256 }
+    call performance.require
+    assert $result
+      otherwise "The system release has no valid performance Assurance."
+  let result = true
+
+process assurance.identityReport:
+  let facts = $eventInput.receipt
+  let subject = "identity-management"
+  let property = "report"
+  call assurance.factValues
+  let reports = $result
+  let result = null
+  when count($reports):
+    call assurance.contract
+    let contract = $result
+    let subject = "assurance"
+    let property = "contract"
+    call assurance.fact
+    let actualContract = $result
+    let result = null
+    when eq($actualContract, $contract):
+      let property = "releaseSha256"
+      call assurance.fact
+      let pin = $result
+      let result = null
+      when eq($pin, $eventInput.releaseSha256):
+        assert eq(count($reports), 1)
+          otherwise "Expected one AppDev Identity Assurance report."
+        port json.parse { text = at($reports, 0) } → result
+
+process assurance.verificationBinding:
+  let facts = $eventInput.receipt
+  let subject = "deployment-verification"
+  let property = "source"
+  call assurance.factValues
+  assert eq(count($result), 1)
+    otherwise "AppDev release has no bound verification suite. Run check-system on a staged copy first."
+  let source = at($result, 0)
+  let property = "sha256"
+  call assurance.fact
+  let digest = $result
+  let observed = $eventInput.observed
+  when $observed:
+    assert and(eq($observed.source, $source), eq($observed.sha256, $digest))
+      otherwise "AppDev verification suite differs from the suite that passed check-system."
+  let result = { source = $source; sha256 = $digest }
+
+process assurance.assemble:
+  let input = $eventInput
+  let receipt = $input.rows
+  when $input.verification:
+    let verification = $input.verification
+    let receipt = append($receipt, list(list("deployment-verification", "source", $verification.source),
+      list("deployment-verification", "sha256", $verification.sha256)))
+  when not(eq($input.identity, null)):
+    let receipt = filter($receipt, "row", not(and(eq(at($row, 0), "identity-management"), eq(at($row, 1), "report"))))
+    port json.stringify { value = $input.identity } → report
+    let receipt = append($receipt, list(list("identity-management", "report", $report)))
+  let result = $receipt

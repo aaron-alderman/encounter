@@ -1,0 +1,174 @@
+process-module "temple/surface-process-module/1"
+
+process catalogueBuild.text:
+  let input = $eventInput
+  port value.type { value = $input.value } → type
+  assert eq($type, "string")
+    otherwise "Catalogue field must be a bounded non-empty string."
+  port text.trim { value = $input.value } → trimmed
+  port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.maximum) } → bounded
+  assert and($trimmed, $bounded)
+    otherwise "Catalogue field must be a bounded non-empty string."
+  let result = $trimmed
+
+process catalogueBuild.identifier:
+  port kernel.invoke { query = "catalogueBuild.text"; input = { value = $eventInput; maximum = 256 } } → id
+  port text.matches { value = $id; pattern = "\\A[a-z][a-z0-9._:/-]{0,255}\\z" } → valid
+  assert $valid
+    otherwise "Catalogue field must be a stable lower-case identifier."
+  let result = $id
+
+process catalogueBuild.fields:
+  let input = $eventInput
+  port value.describe { value = $input.record } → shape
+  assert $shape.plain
+    otherwise "Catalogue field must be an object."
+  port record.entries { value = $input.record } → fields
+  assert every($fields, "field", includes($input.allowed, at($field, 0)))
+    otherwise "Catalogue record contains unsupported fields."
+  let result = true
+
+process catalogueBuild.strings:
+  let input = $eventInput
+  assert and(isArray($input.values), or(not($input.required), count($input.values)))
+    otherwise "Catalogue field must supply its required string array."
+  fold $input.values as value; strings starts list():
+    port kernel.invoke { query = "catalogueBuild.text"; input = { value = $value; maximum = 4096 } } → trimmed
+    yield append($strings, list($trimmed)) → strings
+  port value.sort { values = distinct($strings) } → result
+
+process catalogueBuild.textFields:
+  let input = $eventInput
+  fold $input.keys as key; pairs starts list():
+    port kernel.invoke { query = "catalogueBuild.text"; input = { value = at($input.record, $key); maximum = 4096 } } → value
+    yield append($pairs, list(list($key, $value))) → pairs
+  port record.fromEntries { entries = $pairs } → result
+
+process catalogueBuild.stringFields:
+  let input = $eventInput
+  fold $input.keys as key; pairs starts list():
+    port kernel.invoke { query = "catalogueBuild.strings"; input = { values = at($input.record, $key); required = includes($input.required, $key) } } → value
+    yield append($pairs, list(list($key, $value))) → pairs
+  port record.fromEntries { entries = $pairs } → result
+
+process catalogueBuild.authority:
+  let fields = list("inspect", "propose", "execute", "steward")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $eventInput; allowed = $fields } } → checked
+  port kernel.invoke { query = "catalogueBuild.textFields"; input = { record = $eventInput; keys = $fields } } → result
+
+process catalogueBuild.entry:
+  let entry = $eventInput
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry; allowed = list("id", "kind",
+    "title", "summary", "aliases", "audiences", "tags", "relations", "projection", "mechanisms", "authority", "admissibility", "provenance") } } → checked
+  port kernel.invoke { query = "catalogueBuild.identifier"; input = $entry.id } → id
+  port kernel.invoke { query = "catalogueBuild.textFields"; input = { record = $entry; keys = list("kind", "title", "summary") } } → header
+  port kernel.invoke { query = "knowledgeCatalogue.kinds"; input = null } → kinds
+  assert includes($kinds, $header.kind)
+    otherwise "Catalogue entry kind is unsupported."
+  port kernel.invoke { query = "catalogueBuild.stringFields"; input = { record = $entry; keys = list("aliases", "audiences", "tags"); required = list("audiences") } } → lists
+  let relationFields = list("dependsOn", "implements", "related", "alternateProjections")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry.relations; allowed = $relationFields } } → checked
+  port kernel.invoke { query = "catalogueBuild.stringFields"; input = { record = $entry.relations; keys = $relationFields; required = list() } } → relations
+  let projectionFields = list("coordinate", "format", "title")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry.projection; allowed = $projectionFields } } → checked
+  port kernel.invoke { query = "catalogueBuild.textFields"; input = { record = $entry.projection; keys = $projectionFields } } → projection
+  let mechanismFields = list("standard", "underlying")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry.mechanisms; allowed = $mechanismFields } } → checked
+  port kernel.invoke { query = "catalogueBuild.stringFields"; input = { record = $entry.mechanisms; keys = $mechanismFields; required = $mechanismFields } } → mechanisms
+  port kernel.invoke { query = "catalogueBuild.authority"; input = $entry.authority } → authority
+  let admissionFields = list("criteria", "evidenceRefs", "limitations")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry.admissibility; allowed = append(list("state"), $admissionFields) } } → checked
+  port kernel.invoke { query = "catalogueBuild.text"; input = { value = $entry.admissibility.state; maximum = 4096 } } → state
+  assert includes(list("admitted", "candidate", "deprecated", "experimental", "proposed"), $state)
+    otherwise "Catalogue admissibility state is unsupported."
+  port kernel.invoke { query = "catalogueBuild.stringFields"; input = { record = $entry.admissibility; keys = $admissionFields; required = list("criteria") } } → admission
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $entry.provenance; allowed = list("source", "sourceHash", "observedAt") } } → checked
+  port kernel.invoke { query = "catalogueBuild.textFields"; input = { record = $entry.provenance; keys = list("source", "observedAt") } } → provenance
+  port value.type { value = $entry.provenance.sourceHash } → hashType
+  assert eq($hashType, "string")
+    otherwise "Catalogue provenance sourceHash must be sha256 hex."
+  port text.matches { value = $entry.provenance.sourceHash; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+  assert $hash
+    otherwise "Catalogue provenance sourceHash must be sha256 hex."
+  let result = { id = $id; kind = $header.kind; title = $header.title; summary = $header.summary;
+    aliases = $lists.aliases; audiences = $lists.audiences; tags = $lists.tags; relations = $relations;
+    projection = $projection; mechanisms = $mechanisms; authority = $authority;
+    admissibility = { state = $state; criteria = $admission.criteria; evidenceRefs = $admission.evidenceRefs; limitations = $admission.limitations };
+    provenance = { source = $provenance.source; sourceHash = $entry.provenance.sourceHash; observedAt = $provenance.observedAt } }
+
+process catalogueBuild.pathway:
+  let pathway = $eventInput
+  let fields = list("entryIds", "prerequisiteIds", "outcomes", "audiences")
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $pathway; allowed = append(list("id", "stage", "title", "summary"), $fields) } } → checked
+  port kernel.invoke { query = "catalogueBuild.identifier"; input = $pathway.id } → id
+  port kernel.invoke { query = "catalogueBuild.textFields"; input = { record = $pathway; keys = list("stage", "title", "summary") } } → header
+  port kernel.invoke { query = "knowledgeCatalogue.stages"; input = null } → stages
+  assert includes($stages, $header.stage)
+    otherwise "Catalogue pathway stage is unsupported."
+  port kernel.invoke { query = "catalogueBuild.stringFields"; input = { record = $pathway; keys = $fields; required = list("entryIds", "outcomes", "audiences") } } → lists
+  let result = { id = $id; stage = $header.stage; title = $header.title; summary = $header.summary; entryIds = $lists.entryIds;
+    prerequisiteIds = $lists.prerequisiteIds; outcomes = $lists.outcomes; audiences = $lists.audiences }
+
+process catalogueBuild.create:
+  let input = $eventInput
+  assert and(isArray($input.entries), isArray($input.pathways))
+    otherwise "Catalogue requires explicit entry and pathway arrays."
+  fold $input.entries as entry; entries starts list():
+    port kernel.invoke { query = "catalogueBuild.entry"; input = $entry } → normalized
+    yield append($entries, list($normalized)) → entries
+  fold $input.pathways as pathway; pathways starts list():
+    port kernel.invoke { query = "catalogueBuild.pathway"; input = $pathway } → normalized
+    yield append($pathways, list($normalized)) → pathways
+  let entryIds = map($entries, "entry", $entry.id)
+  let pathwayIds = map($pathways, "pathway", $pathway.id)
+  assert eq(count($entryIds), count(distinct($entryIds)))
+    otherwise "Catalogue entry ids must be unique."
+  assert eq(count($pathwayIds), count(distinct($pathwayIds)))
+    otherwise "Learning pathway ids must be unique."
+  port record.fromEntries { entries = map($entries, "entry", list($entry.id, $entry)) } → byId
+  port record.fromEntries { entries = map($pathways, "pathway", list($pathway.id, $pathway)) } → pathwaysById
+  each $entries as entry:
+    port record.entries { value = $entry.relations } → relations
+    assert every($relations, "relation", every(at($relation, 1), "target", at($byId, $target)))
+      otherwise "Catalogue relation points to an unknown catalogue entry."
+  each $pathways as pathway:
+    assert every($pathway.entryIds, "id", at($byId, $id))
+      otherwise "Learning pathway includes an unknown entry."
+    assert every($pathway.prerequisiteIds, "id", at($pathwaysById, $id))
+      otherwise "Learning pathway has an unknown prerequisite."
+  port value.sort { values = $entryIds; mode = "locale" } → orderedEntries
+  port value.sort { values = $pathwayIds; mode = "locale" } → orderedPathways
+  port kernel.invoke { query = "catalogueBuild.identifier"; input = $input.catalogueId } → id
+  port kernel.invoke { query = "catalogueBuild.text"; input = { value = $input.sourceRevision; maximum = 4096 } } → revision
+  port kernel.invoke { query = "catalogueBuild.authority"; input = $input.authority } → authority
+  let body = { protocol = "sourcery-knowledge-catalogue/1"; catalogueId = $id; sourceRevision = $revision; authority = $authority;
+    entries = map($orderedEntries, "id", at($byId, $id)); pathways = map($orderedPathways, "id", at($pathwaysById, $id)) }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → hash
+  port record.put { record = $body; key = "catalogueHash"; value = $hash } → result
+
+process catalogueBuild.coverage:
+  let input = $eventInput
+  let catalogue = $input.catalogue
+  let expected = $input.expectedByKind
+  port kernel.invoke { query = "knowledgeCatalogue.verify"; input = $catalogue } → hash
+  port kernel.invoke { query = "knowledgeCatalogue.kinds"; input = null } → kinds
+  port kernel.invoke { query = "catalogueBuild.fields"; input = { record = $expected; allowed = $kinds } } → checked
+  fold $kinds as kind; report starts { findings = list(); counts = {} }:
+    let ids = at($expected, $kind)
+    assert isArray($ids)
+      otherwise "Expected an explicit inventory array for each catalogue kind."
+    port kernel.invoke { query = "catalogueBuild.strings"; input = { values = $ids; required = false } } → normalized
+    let entries = filter($catalogue.entries, "entry", eq($entry.kind, $kind))
+    let observed = fold($entries, "entry", "seen", list(), append(append($seen, list($entry.id)), $entry.aliases))
+    let missing = filter($normalized, "id", not(includes($observed, $id)))
+    let findings = append($report.findings, map($missing, "id", { code = "unprojected-first-class-thing"; kind = $kind; subject = $id }))
+    port record.put { record = $report.counts; key = $kind; value = count($ids) } → counts
+    yield { findings = $findings; counts = $counts } → report
+  let keys = map($report.findings, "finding", concat($finding.kind, ":", $finding.subject))
+  port record.fromEntries { entries = map($report.findings, "finding", list(concat($finding.kind, ":", $finding.subject), $finding)) } → byKey
+  port value.sort { values = $keys; mode = "locale" } → ordered
+  let body = { protocol = "sourcery-knowledge-catalogue-coverage/1"; catalogueHash = $hash;
+    status = if(count($ordered), "incomplete", "complete"); expectedCounts = $report.counts;
+    findings = map($ordered, "key", at($byKey, $key)) }
+  port kernel.invoke { query = "knowledgeCatalogue.digest"; input = $body } → reportHash
+  port record.put { record = $body; key = "reportHash"; value = $reportHash } → result

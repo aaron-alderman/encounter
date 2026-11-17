@@ -1,0 +1,268 @@
+process-module "temple/surface-process-module/1"
+
+process admissionAuthoring.snapshot:
+  let snapshot = $eventInput.snapshot
+  when $snapshot:
+    assert eq($snapshot.protocol, "sourcery-admitted-authoring-snapshot/1")
+      otherwise "Invalid hosted authoring snapshot protocol."
+    port record.entries { value = $snapshot } → fields
+    let committed = filter($fields, "field", not(eq(at($field, 0), "hash")))
+    port record.fromEntries { entries = $committed } → body
+    port json.canonical { value = $body } → encoded
+    port digest.sha256 { text = $encoded } → digest
+    assert eq($digest, $snapshot.hash)
+      otherwise "Hosted authoring snapshot hash does not verify."
+    let source = at($snapshot, "semanticSource")
+    port value.type { value = $source } → sourceType
+    assert not(eq($sourceType, "undefined"))
+      otherwise "Hosted authoring snapshot lacks its semantic source."
+    port json.canonical { value = $source } → encodedSource
+    port digest.sha256 { text = $encodedSource } → sourceDigest
+    assert eq($sourceDigest, $snapshot.semanticSourceHash)
+      otherwise "Hosted authoring snapshot semantic source hash does not verify."
+    when $snapshot.applicationActorProvenance:
+      let application = at($source, "application")
+      let actualActors = or(at($application, "actors"), list())
+      let declaredActors = at($snapshot.applicationActorProvenance, "actors")
+      port value.type { value = $application } → applicationType
+      port value.type { value = $declaredActors } → actorsType
+      assert and(not(eq($applicationType, "undefined")), not(eq($application, null)), not(eq($actorsType, "undefined")))
+        otherwise "Hosted authoring snapshot lacks its actor provenance."
+      port json.canonical { value = $actualActors } → actual
+      port json.canonical { value = $declaredActors } → declared
+      assert eq($actual, $declared)
+        otherwise "Hosted authoring snapshot actor provenance does not match the semantic source."
+    let intent = at($snapshot, "authoringIntent")
+    when $intent:
+      assert eq($intent.protocol, "sourcery-admitted-authoring-intent/1")
+        otherwise "Invalid hosted authoring intent protocol."
+      assert and($intent.application, or(not($eventInput.application), eq($intent.application, $eventInput.application)))
+        otherwise "Hosted authoring intent belongs to another application."
+      port record.entries { value = $intent } → intentFields
+      let committedIntent = filter($intentFields, "field", not(eq(at($field, 0), "hash")))
+      port record.fromEntries { entries = $committedIntent } → intentBody
+      port json.canonical { value = $intentBody } → encodedIntent
+      port digest.sha256 { text = $encodedIntent } → intentDigest
+      assert eq($intentDigest, $intent.hash)
+        otherwise "Hosted authoring intent hash does not verify."
+      port kernel.invoke { query = "admissionAuthoring.semantics"; input = $intent } → semantics
+  let result = true
+
+process admissionAuthoring.requireHash:
+  port text.matches { value = concat($eventInput); pattern = "\\A[a-f0-9]{64}\\z" } → valid
+  assert $valid
+    otherwise "Hosted authoring evidence requires a SHA-256 hash."
+  let result = true
+
+process admissionAuthoring.intentText:
+  let input = $eventInput
+  let text = at($input, "text")
+  assert $text
+    otherwise "Hosted authoring intent requires text."
+  port digest.sha256 { text = concat($text) } → hash
+  assert eq($hash, at($input, "hash"))
+    otherwise "Hosted authoring intent text does not match its hash."
+  let result = true
+
+process admissionAuthoring.merge:
+  let generation = $eventInput
+  assert isArray($generation.contributors)
+    otherwise "Hosted authoring merge requires contributors."
+  port number.calculate { operation = "greaterEqual"; values = list(count($generation.contributors), 2) } → enough
+  assert $enough
+    otherwise "Hosted authoring merge requires at least two contributors."
+  fold $generation.contributors as item; entries starts list():
+    assert $item.contributionId
+      otherwise "Hosted authoring merge requires an identified contributor."
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $item.evidenceHash } → evidence
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $item.intentHash } → intent
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $item.desireHash } → desire
+    port kernel.invoke { query = "admissionAuthoring.intentText"; input = $item.intent } → text
+    let identity = { contributionId = $item.contributionId; evidenceHash = $item.evidenceHash; intentHash = $item.intentHash }
+    port json.canonical { value = $identity } → key
+    yield append($entries, list(list($key, $identity))) → entries
+  let identities = map($entries, "entry", at($entry, 1))
+  let keys = map($entries, "entry", at($entry, 0))
+  let ids = map($identities, "item", $item.contributionId)
+  port value.sort { values = $keys; mode = "locale" } → sorted
+  assert and(eq(count(distinct($ids)), count($ids)), eq($keys, $sorted))
+    otherwise "Hosted authoring merge contributor identities are duplicated or out of order."
+  port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $generation.mergePlanHash } → plan
+  port json.canonical { value = { mergePlanHash = $generation.mergePlanHash; contributors = $identities } } → encoded
+  port digest.sha256 { text = $encoded } → desire
+  assert eq($desire, $generation.desireHash)
+    otherwise "Hosted authoring merge desire does not bind its plan and contributors."
+  let semanticConflicts = or($generation.semanticDecisionConflicts, list())
+  assert and(isArray($generation.decisionConflicts), isArray($generation.authorityConflicts), isArray($semanticConflicts))
+    otherwise "Hosted authoring merge requires conflict projections."
+  let sets = list(
+    { conflicts = $generation.decisionConflicts; selected = $generation.decisions; key = "lens" },
+    { conflicts = $generation.authorityConflicts; selected = $generation.authorityClaims; key = "claim" },
+    { conflicts = $semanticConflicts; selected = or($generation.semanticDecisions, list()); key = "key" })
+  each $sets as set:
+    assert every($set.conflicts, "item", not(eq($item, null)))
+      otherwise "Hosted authoring merge contains an invalid conflict."
+    let keys = map($set.conflicts, "item", at($item, $set.key))
+    let selected = map($set.selected, "item", at($item, $set.key))
+    assert and(eq(count(distinct($keys)), count($keys)), not(some($keys, "key", includes($selected, $key))))
+      otherwise "Hosted authoring merge conflicts are duplicated or also selected."
+  let result = true
+
+process admissionAuthoring.semanticDecisions:
+  let items = or($eventInput, list())
+  assert isArray($items)
+    otherwise "Hosted authoring semantic decisions require a list."
+  each $items as item:
+    let requirements = at($item, "requirements")
+    assert and(isArray($requirements), count($requirements), eq(count(distinct($requirements)), count($requirements)))
+      otherwise "Hosted authoring semantic decision requires unique requirements."
+    let fields = append(list(at($item, "key"), at($item, "title"), at($item, "option")), $requirements)
+    each $fields as field:
+      port value.type { value = $field } → type
+      assert and(eq($type, "string"), $field)
+        otherwise "Hosted authoring semantic decision requires nonempty text."
+    each list("consumerUse", "intentLens") as field:
+      let value = at($item, $field)
+      port value.type { value = $value } → type
+      assert or(eq($type, "undefined"), and(eq($type, "string"), $value))
+        otherwise "Hosted authoring semantic decision has an invalid optional reference."
+  let keys = map($items, "item", $item.key)
+  assert eq(count(distinct($keys)), count($keys))
+    otherwise "Hosted authoring semantic decision keys must be unique."
+  let result = true
+
+process admissionAuthoring.uniqueIdentities:
+  let items = $eventInput.items
+  assert every($items, "item", not(eq($item, null)))
+    otherwise "Hosted authoring evidence contains a null record."
+  let identities = map($items, "item", at($item, $eventInput.key))
+  assert eq(count(distinct($identities)), count($identities))
+    otherwise "Hosted authoring evidence contains duplicate identities."
+  let result = true
+
+process admissionAuthoring.effective:
+  let effective = $eventInput
+  each list("requirements", "decisions", "constraints", "authorityClaims", "requirementClaims") as field:
+    assert isArray(at($effective, $field))
+      otherwise "Hosted effective authoring intent requires complete evidence lists."
+  port value.sort { values = distinct($effective.requirements) } → ordered
+  port json.canonical { value = $ordered } → canonical
+  port json.canonical { value = $effective.requirements } → retained
+  assert eq($canonical, $retained)
+    otherwise "Hosted effective authoring requirements must be unique and sorted."
+  port kernel.invoke { query = "admissionAuthoring.uniqueIdentities";
+    input = { items = $effective.decisions; key = "lens" } } → decisions
+  port kernel.invoke { query = "admissionAuthoring.uniqueIdentities";
+    input = { items = $effective.authorityClaims; key = "claim" } } → authority
+  fold $effective.constraints as item; constraints starts list():
+    port json.canonical { value = $item } → key
+    yield append($constraints, list($key)) → constraints
+  fold $effective.requirementClaims as item; claims starts list():
+    assert not(eq($item, null))
+      otherwise "Hosted effective authoring requirement claim is invalid."
+    let claim = { component = or(at($item, "component"), null); bindings = or(at($item, "bindings"), list()) }
+    let text = at($item, "text")
+    let targets = at($item, "targets")
+    port value.type { value = $text } → textType
+    port value.type { value = $targets } → targetsType
+    when not(eq($textType, "undefined")):
+      port record.put { record = $claim; key = "text"; value = $text } → claim
+    when not(eq($targetsType, "undefined")):
+      port record.put { record = $claim; key = "targets"; value = $targets } → claim
+    port json.canonical { value = $claim } → key
+    yield append($claims, list($key)) → claims
+  assert and(eq(count(distinct($constraints)), count($constraints)), eq(count(distinct($claims)), count($claims)))
+    otherwise "Hosted effective authoring constraints and claims must be unique."
+  port kernel.invoke { query = "admissionAuthoring.semanticDecisions"; input = $effective.semanticDecisions } → semantics
+  let result = true
+
+process admissionAuthoring.visualReferences:
+  let input = $eventInput
+  assert isArray($input.references)
+    otherwise "Hosted authoring visual references require a list."
+  when not($input.carried):
+    port kernel.invoke { query = "admissionAuthoring.uniqueIdentities";
+      input = { items = $input.references; key = "componentId" } } → ids
+  each $input.references as item:
+    assert and($item.componentId, $item.componentName, isArray($item.productStates), count($item.productStates),
+      isArray($item.assetHashes), count($item.assetHashes))
+      otherwise "Hosted authoring visual reference is incomplete."
+    when not(and($input.carried, eq($item.route, null))):
+      port text.startsWith { value = concat($item.route); search = "/" } → route
+      assert $route
+        otherwise "Hosted authoring visual reference has an invalid route."
+    when not($input.carried):
+      assert and(eq(count(distinct($item.productStates)), count($item.productStates)),
+        eq(count(distinct($item.assetHashes)), count($item.assetHashes)))
+        otherwise "Hosted programme visual reference has duplicate states or assets."
+    each $item.assetHashes as hash:
+      port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $hash } → valid
+      let matches = filter($input.assets, "asset", eq($asset.assetHash, $hash))
+      assert count($matches)
+        otherwise "Hosted authoring visual reference has no retained asset."
+      port number.calculate { operation = "subtract"; values = list(count($matches), 1) } → last
+      let asset = at($matches, $last)
+      assert and(eq($asset.kind, "image"), includes($item.productStates, $asset.productState))
+        otherwise "Hosted authoring visual reference does not bind an image in its product states."
+  let result = true
+
+process admissionAuthoring.programme:
+  let intent = $eventInput
+  let generation = $intent.generation
+  let programme = $generation.programDesign
+  let carried = $generation.visualReferenceCarryForward
+  port value.type { value = $programme } → programmeType
+  port value.type { value = $carried } → carriedType
+  when not(eq($programmeType, "undefined")):
+    assert and(eq(at($programme, "protocol"), "sourcery-semantic-program-design-generation/1"),
+      eq($programme.desireHash, $generation.desireHash))
+      otherwise "Hosted authoring programme does not bind the generation desire."
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $programme.generationHash } → generationHash
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $programme.realizationHash } → realizationHash
+    port value.type { value = $programme.componentCount } → countType
+    port number.calculate { operation = "multiply"; values = list($programme.componentCount, 1) } → components
+    port number.isNatural { value = $components } → whole
+    port number.calculate { operation = "lessEqual"; values = list($components, 9007199254740991) } → safe
+    assert and(eq($countType, "number"), $whole, $components, $safe)
+      otherwise "Hosted authoring programme requires a positive safe component count."
+    port value.type { value = $programme.visualReferences } → referencesType
+    when not(eq($referencesType, "undefined")):
+      port kernel.invoke { query = "admissionAuthoring.visualReferences";
+        input = { references = $programme.visualReferences; assets = or($generation.contextAssets, list()); carried = false } } → references
+  when not(eq($carriedType, "undefined")):
+    assert and(eq(at($carried, "protocol"), "sourcery-admitted-visual-reference-carry-forward/1"),
+      eq($carried.sourceIntentHash, at($intent.parent, "intentHash")),
+      isArray($carried.visualReferences), count($carried.visualReferences))
+      otherwise "Hosted authoring carry-forward does not bind the retained parent intent."
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $carried.sourceIntentHash } → sourceIntent
+    port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $carried.sourceProgramDesignHash } → sourceDesign
+    port kernel.invoke { query = "admissionAuthoring.visualReferences";
+      input = { references = $carried.visualReferences; assets = or($generation.contextAssets, list()); carried = true } } → references
+  let result = true
+
+process admissionAuthoring.semantics:
+  let intent = $eventInput
+  let generation = $intent.generation
+  let kind = at($generation, "kind")
+  assert includes(list("change", "merge"), $kind)
+    otherwise "Hosted authoring generation kind is invalid."
+  each list("decisions", "deltaRequirements", "constraints", "authorityClaims", "componentEvolutions", "requestCoverage") as field:
+    assert isArray(at($generation, $field))
+      otherwise "Hosted authoring generation requires complete evidence lists."
+  when eq($kind, "change"):
+    port kernel.invoke { query = "admissionAuthoring.intentText"; input = $generation.intent } → intentText
+    assert eq($intent.rule, "This contract records admitted intent evidence. Prior decisions describe inherited meaning but never select an option for a new change; new consequential choices remain explicit and reversible.")
+      otherwise "Hosted authoring change rule does not match."
+  when eq($kind, "merge"):
+    port kernel.invoke { query = "admissionAuthoring.merge"; input = $generation } → merge
+    assert eq($intent.rule, "Merge contributions remain individually attributable. Conflicting lens or authority intent is exposed and is never resolved by contributor order.")
+      otherwise "Hosted authoring merge rule does not match."
+  port kernel.invoke { query = "admissionAuthoring.requireHash"; input = $generation.desireHash } → desire
+  port kernel.invoke { query = "admissionAuthoring.uniqueIdentities";
+    input = { items = $generation.decisions; key = "lens" } } → decisions
+  port kernel.invoke { query = "admissionAuthoring.uniqueIdentities";
+    input = { items = $generation.authorityClaims; key = "claim" } } → authority
+  port kernel.invoke { query = "admissionAuthoring.semanticDecisions"; input = $generation.semanticDecisions } → semantics
+  port kernel.invoke { query = "admissionAuthoring.effective"; input = $intent.effective } → effective
+  port kernel.invoke { query = "admissionAuthoring.programme"; input = $intent } → programme
+  let result = true

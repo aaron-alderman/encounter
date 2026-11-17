@@ -1,0 +1,51 @@
+process-module "temple/surface-process-module/1"
+
+# The response is already observed. Choose retain, replace, or clear.
+process assurance.response:
+  let action = if(eq($status, 204), 0, if(eq($status, 200), 1, 2))
+  let result = { action = $action; dropUnread = and($warnings, eq($action, 2)) }
+
+process assurance.rowLimit:
+  let result = if($warnings, 4, 40)
+
+process assurance.presentation:
+  let visible = and($open, if($warnings, $hasRows, true))
+  let result = { visible = $visible; showEmptyHistory = and(not($warnings), not($hasRows)); refreshAges = $warnings }
+
+process assurance.updateEnvelope:
+  call assurance.rowLimit
+  port number.calculate { operation = "lessEqual"; values = list(0, $length) } → hasOrder
+  port number.calculate { operation = "lessEqual"; values = list($length, $result) } → bounded
+  port number.calculate { operation = "lessEqual"; values = list(0, $unread) } → unreadValid
+  port number.calculate { operation = "lessEqual"; values = list(0, $openLimit) } → openValid
+  port number.calculate { operation = "lessEqual"; values = list(0, $exchangeLimit) } → exchangeValid
+  let metadata = if($warnings, and($unreadValid, $openValid, $exchangeValid), true)
+  let result = and($hasOrder, $bounded, $rowsObject, $metadata)
+
+process assurance.warningHeader:
+  let unreadSuffix = if(eq($unread, 1), " unread warning", " unread warnings")
+  let result = { unreadSuffix = $unreadSuffix; budgetPrefix = "Budget: under ";
+    budgetDivider = " ms · up to "; budgetSuffix = " exchanges" }
+
+# 0 reject, 1 reuse the retained DOM row, 2 render the supplied row.
+process assurance.rowAction:
+  port text.matches { value = $key; pattern = "\\A[a-f0-9]{20}\\z" } → validKey
+  let result = if(and($validKey, $unique), if($retained, 1, if($hasMarkup, 2, 0)), 0)
+
+process assurance.warningAge:
+  port number.calculate { operation = "subtract"; values = list($now, $timestamp) } → elapsed
+  port number.calculate { operation = "divide"; values = list($elapsed, 60000) } → fractionalMinutes
+  port number.calculate { operation = "floor"; values = list($fractionalMinutes) } → totalMinutes
+  port number.calculate { operation = "max"; values = list(0, $totalMinutes) } → minutes
+  port number.calculate { operation = "divide"; values = list($minutes, 60) } → fractionalHours
+  port number.calculate { operation = "floor"; values = list($fractionalHours) } → hours
+  port number.calculate { operation = "multiply"; values = list($hours, 60) } → completedMinutes
+  port number.calculate { operation = "subtract"; values = list($minutes, $completedMinutes) } → remaining
+  let hasHours = not(eq($hours, 0))
+  let hasMinutes = not(eq($remaining, 0))
+  let elapsedTime = not(eq($minutes, 0))
+  let hourSuffix = if($hasHours, if(eq($hours, 1), " hour", " hours"), "")
+  let minuteSuffix = if($hasMinutes, if(eq($remaining, 1), " minute", " minutes"), "")
+  let result = { hours = $hours; minutes = $remaining; hourSuffix = $hourSuffix; minuteSuffix = $minuteSuffix;
+    separator = if(and($hasHours, $hasMinutes), " ", ""); prefix = if($elapsedTime, " · ", " · Just now");
+    ending = if($elapsedTime, " ago", "") }

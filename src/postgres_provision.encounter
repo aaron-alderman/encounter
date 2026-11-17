@@ -1,0 +1,45 @@
+process-module "temple/surface-process-module/1"
+
+process postgres.provisionPlan:
+  let observed = $eventInput
+  port number.calculate { operation = "greaterEqual"; values = list($observed.version, 140000) } → supported
+  assert $supported
+    otherwise "PostgreSQL 14 or newer is required."
+  assert and($observed.checksums, $observed.primary)
+    otherwise "PostgreSQL must be primary with data checksums enabled."
+  assert and(eq($observed.currentUser, "postgres"), or(not($observed.authReported), $observed.peerAuthenticated))
+    otherwise "PostgreSQL administrative Unix-peer identity is not ready."
+  when not(eq($observed.database, null)):
+    assert and(eq($observed.database.encoding, "UTF8"), $observed.database.acceptsConnections)
+      otherwise "Existing Sourcery database encoding or availability is invalid."
+  let creation = if(eq($observed.database, null), list("create-database"), list())
+  let result = append(append(list("bound-role"), $creation), list("bound-database", "bound-schema"))
+
+process postgres.role:
+  let role = $eventInput
+  assert and($role.login, eq($role.superuser, false), eq($role.createDatabase, false), eq($role.createRole, false),
+    eq($role.inherit, false), eq($role.replication, false), eq($role.bypassRls, false))
+    otherwise "Sourcery PostgreSQL role privileges are not bounded as required."
+  let result = true
+
+process postgres.database:
+  let db = $eventInput
+  assert and(eq($db.owner, "sourcery"), eq($db.encoding, "UTF8"), $db.acceptsConnections, $db.connect, $db.temporary, eq($db.publicAccess, false))
+    otherwise "Sourcery PostgreSQL database ownership, encoding, or privileges are invalid."
+  let result = true
+
+process postgres.schema:
+  assert and(eq($eventInput.owner, "sourcery"), eq($eventInput.publicCreate, false))
+    otherwise "Sourcery PostgreSQL public schema privileges are invalid."
+  let result = true
+
+process postgres.receipt:
+  let admin = $eventInput.admin
+  let peer = $eventInput.peer
+  let authenticated = if($peer.authReported, $peer.peerAuthenticated, $admin.wrongAccountRejected)
+  assert and(eq($admin.status, "provisioned"), eq($admin.version, $peer.version), eq($peer.database, "sourcery"),
+    eq($peer.currentUser, "sourcery"), $peer.checksums, $peer.primary, $authenticated)
+    otherwise "Sourcery Unix-peer database identity is not ready."
+  let result = { protocol = "sourcery.hosted/self-hosted-postgres-provision.v1"; status = "ready";
+    database = "sourcery"; role = "sourcery"; authentication = "unix-peer"; serverVersionNumber = $admin.version;
+    dataChecksums = true; primary = true; superuser = false; createDatabase = false; createRole = false; replication = false; bypassRls = false }

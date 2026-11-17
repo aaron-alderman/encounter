@@ -1,0 +1,70 @@
+process-module "temple/surface-process-module/1"
+
+process asterFrame.protocolName:
+  let result = "sourcery/aster-frame/1"
+
+process asterFrame.messageTypes:
+  call asterFrame.protocolName
+  let result = { protocol = $result; request = "request"; snapshot = "snapshot"; changed = "changed" }
+
+# 0 inactive child, 1 participating child, 2 direct markers, 3 markers and hosted frames.
+process asterFrame.bridgeRole:
+  let result = if($nested, if($parentDeclared, 1, 0), if($hostDeclared, 3, 2))
+
+process asterFrame.adapterAllowed:
+  port text.matches { value = $adapter; pattern = "\\A[a-z0-9-]{1,64}\\z" } → allowed
+  port text.startsWith { value = $adapter; search = "-" } → leadingDash
+  let result = and($allowed, not($leadingDash))
+
+process asterFrame.nonceAllowed:
+  port text.matches { value = $nonce; pattern = "\\A[a-f0-9]{32}\\z" } → allowed
+  let result = $allowed
+
+# A marker contributes a labelled field or its explicit summary within the remaining budget.
+process asterFrame.markerPlan:
+  port text.matches { value = $label; pattern = "\\A[A-Za-z ]{1,32}\\z" } → validLabel
+  port text.matches { value = $value; pattern = "\\A[A-Za-z0-9 .,:&·()_/-]{1,96}\\z" } → validValue
+  let labelled = and($validLabel, $validValue)
+  let partLength = if($labelled, add(add($labelLength, $valueLength), 3), $providedLength)
+  port number.calculate { operation = "less"; values = list(0, $length) } → hasParts
+  let total = add(add($length, $partLength), if($hasParts, 1, 0))
+  port number.calculate { operation = "lessEqual"; values = list($total, 280) } → fits
+  port number.calculate { operation = "lessEqual"; values = list(1, $partLength) } → nonempty
+  let include = and($adapterMatches, $nonempty, $fits)
+  let result = { length = if($include, $total, 0); labelled = $labelled;
+    divider = if($labelled, ": ", ""); ending = if($labelled, ".", ""); separator = if($hasParts, " ", "") }
+
+process asterFrame.childRequest:
+  call asterFrame.protocolName
+  let result = and($parentMatches, $originMatches, eq($protocol, $result),
+    eq($kind, "request"), $adapterValid, $nonceValid)
+
+process asterFrame.childChanged:
+  let result = and($hasRequest, not($summaryMatches))
+
+# 0 no context, 1 use the reported snapshot, 2 read the admitted local document.
+process asterFrame.summarySource:
+  let canRead = and($childReadable, $targetIsLocal, $directoryPath, $documentOriginMatches, $documentWithinTarget)
+  let result = if($preferLocal, if($canRead, 2, 0), if($currentBinding, 1, 0))
+
+process asterFrame.summaryChanged:
+  let result = not(and(eq($currentLength, $savedLength), eq($current, $saved)))
+
+# 0 ignore, 1 retain, 2 unbind, 3 bind.
+process asterFrame.frameAction:
+  let present = and($connected, $hasAdapter)
+  let result = if($tracked, if($present, 1, 2), if($present, 3, 0))
+
+process asterFrame.requestChild:
+  let web = if(eq($protocol, "https:"), true, eq($protocol, "http:"))
+  let result = and($adapterValid, not($targetIsLocal), $web, $hasWindow)
+
+# 0 unrelated, 1 request a refresh, 2 accept a snapshot, 3 reject a matched message.
+process asterFrame.hostMessage:
+  call asterFrame.protocolName
+  let addressed = and($frameConnected, $currentBinding, $windowMatches, $originMatches, $adapterMatches,
+    eq($protocol, $result))
+  port number.calculate { operation = "lessEqual"; values = list(1, $summaryLength) } → nonempty
+  port number.calculate { operation = "lessEqual"; values = list($summaryLength, 280) } → fits
+  let snapshot = and(eq($kind, "snapshot"), $nonceMatches, $summaryText, $nonempty, $fits)
+  let result = if($addressed, if(eq($kind, "changed"), 1, if($snapshot, 2, 3)), 0)

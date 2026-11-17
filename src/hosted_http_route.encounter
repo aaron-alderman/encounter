@@ -1,0 +1,259 @@
+process-module "temple/surface-process-module/1"
+
+process hostedHttp.edgeClient:
+  let input = $eventInput
+  assert $input.peer
+    otherwise "Edge peer address is unavailable."
+  assert not($input.repeated)
+    otherwise "Trusted x-forwarded-for header must be singular."
+  let result = concat("ip:", $input.peer)
+  when and($input.trustProxy, $input.forwardedPresent):
+    assert includes(list("127.0.0.1", "::1"), $input.peer)
+      otherwise "Forwarded client identity is accepted only from the loopback proxy."
+    assert not($input.forwardedList)
+      otherwise "Forwarded client identity must be replaced by the trusted proxy, not extended."
+    assert $input.forwarded
+      otherwise "Forwarded client identity is invalid."
+    let result = concat("ip:", $input.forwarded)
+
+process hostedHttp.localBootEnvelope:
+  let input = $eventInput
+  let request = eq($input.protocol, "sourcery.hosted/local-development-boot-context-request.v1")
+  let endpoint = eq($input.protocol, "sourcery.hosted/local-development-child-endpoint.v1")
+  let response = eq($input.protocol, "sourcery.hosted/local-development-boot-context.v1")
+  let expected = if($request, list("protocol", "requestId"), if($endpoint, list("protocol", "host", "port"),
+    list("protocol", "requestId", "runtimeRecordAuthorityBinding", "runtimeRecordCaptureBinding")))
+  let known = filter($input.keys, "key", includes($expected, $key))
+  assert and(eq($input.dataOnly, true), eq(count($input.keys), count($expected)), eq(count(distinct($known)), count($expected)))
+    otherwise "Local generation boot-context envelope fields are invalid."
+  let result = null
+  when or($request, $response):
+    port text.matches { value = $input.requestId; pattern = "\\A[A-Za-z0-9_-]{32,128}\\z" } → valid
+    assert $valid
+      otherwise "Local generation boot-context request ID is invalid."
+  when $request:
+    assert eq($input.phase, "request")
+      otherwise "Local generation crossed its boot protocol."
+    let result = "resolving"
+  when $endpoint:
+    assert eq($input.phase, "endpoint")
+      otherwise "Local generation crossed its boot protocol."
+    port kernel.invoke { query = "hostedHttp.localReadinessPlan"; input = $input } → admitted
+    let result = "ready"
+  when $response:
+    assert and(eq($input.phase, "response"), eq($input.requestId, $input.expectedRequestId))
+      otherwise "Local generation boot-context request is crossed."
+    let result = "accepted"
+  assert $result
+    otherwise "Local generation boot-context protocol is invalid."
+
+process hostedHttp.localReadinessPlan:
+  let input = $eventInput
+  port number.isNatural { value = $input.port } → port
+  port number.calculate { operation = "greater"; values = list($input.port, 0) } → positive
+  port number.calculate { operation = "lessEqual"; values = list($input.port, 65535) } → bounded
+  assert and(eq($input.host, "127.0.0.1"), $port, $positive, $bounded)
+    otherwise "Local development generation reported an invalid endpoint."
+  let result = { port = $input.port; target = "/healthz"; maximumBytes = 1048576 }
+
+process hostedHttp.localReadinessResult:
+  let result = eq($eventInput.status, 200)
+
+process hostedHttp.localProxyHeaders:
+  let input = $eventInput
+  assert and(isArray($input.names), includes(list("request", "response"), $input.direction))
+    otherwise "Invalid local proxy header observation."
+  port kernel.invoke { query = "hostedRelease.proxyHeaders"; input = null } → policy
+  port text.split { value = $input.connection; pattern = "," } → options
+  fold $options as option; names starts list():
+    port text.trim { value = $option } → option
+    port text.lowerCase { value = $option } → option
+    yield append($names, list($option)) → nominated
+  when eq($input.direction, "request"):
+    let credentials = filter(list("authorization", "cookie", "host", "x-sourcery-ssh-assertion"),
+      "name", includes($nominated, $name))
+    assert and(not(count($credentials)), not(includes($input.names, "forwarded")))
+      otherwise "Local proxy request has ambiguous forwarding or authentication headers."
+  let stripped = append($policy.strip, $nominated)
+  let retained = filter($input.names, "name", not(includes($stripped, $name)))
+  let fixed = if(eq($input.direction, "request"), { x-forwarded-proto = "http" }, {})
+  let result = { retained = $retained; fixed = $fixed }
+
+process hostedHttp.directLoopback:
+  let input = $eventInput
+  let hosts = list("127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1", "::ffff:localhost", "::ffff:::1")
+  port text.lowerCase { value = $input.host } → host
+  port text.lowerCase { value = $input.expectedHost } → expected
+  let forwarded = filter(list("forwarded", "x-forwarded-for", "x-forwarded-host"), "name",
+    includes($input.headerNames, $name))
+  let allowed = and($expected, eq($host, $expected), includes($hosts, $input.remoteAddress),
+    includes($hosts, $input.localAddress), not(count($forwarded)),
+    or(not(includes($input.headerNames, "x-forwarded-proto")), eq($input.forwardedProto, "http")))
+  let result = if($allowed, true, false)
+
+process hostedHttp.directLoopbackScopes:
+  let input = $eventInput
+  port value.type { value = $input.authority } → authority
+  port value.type { value = $input.capture } → capture
+  assert and(eq($authority, "boolean"), eq($capture, "boolean"))
+    otherwise "Direct-loopback MCP scope projection requires explicit boolean bridge availability."
+  let scopes = append(list("authoring.read", "authoring.write", "operations.observe"),
+    if($input.authority, list("governance.decide"), list()))
+  let result = append($scopes,
+    if($input.capture, list("runtime.records.inspect", "runtime.records.capture"), list()))
+
+process hostedHttp.surface:
+  let path = $eventInput.path
+  port text.startsWith { value = $path; search = "/oauth/" } → oauth
+  port text.startsWith { value = $path; search = "/.well-known/oauth-protected-resource" } → protectedResource
+  let result = "control"
+  when or(eq($path, "/mcp"), $protectedResource):
+    let result = "authoring-mcp"
+  when or(eq($path, "/.well-known/oauth-authorization-server"), $oauth):
+    let result = "authorization"
+
+process hostedHttp.controlEntry:
+  let input = $eventInput
+  let read = eq($input.method, "GET")
+  let health = and($read, eq($input.path, "/healthz"))
+  let secure = or(eq($input.allowInsecureHttp, true), eq($input.encrypted, true))
+  when and(not($secure), eq($input.trustProxy, true)):
+    port text.lowerCase { value = $input.remoteAddress } → remote
+    port text.startsWith { value = $remote; search = "127." } → loopback
+    port text.startsWith { value = $remote; search = "::ffff:127." } → mapped
+    port text.split { value = $input.forwardedProto; pattern = "," } → forwarded
+    port text.trim { value = at($forwarded, 0) } → protocol
+    port text.lowerCase { value = $protocol } → protocol
+    let secure = and(or(eq($remote, "::1"), $loopback, $mapped), eq($protocol, "https"))
+  port text.startsWith { value = $input.path; search = "/v1/portal/" } → portal
+  let cookieEligible = and(not($input.hasAuthorization),
+    or($portal, and($read, includes(list("/v1/me", "/v1/sessions"), $input.path))))
+  let portalMutationAllowed = or($read, $input.portalMarker)
+  port kernel.invoke { query = "hostedHttp.endpoint"; input = $input } → endpoint
+  let selected = at($endpoint, "decision")
+  let governedCreation = and(eq($input.lifecycleMcpOnly, true), eq($input.method, "POST"),
+    includes(list("tenants", "memberships", "apps", "projects", "project-memberships", "workspaces"), at($selected, "name")))
+  let public = if(eq(at($endpoint, "stage"), "public"), at($endpoint, "decision"), null)
+  let api = if(eq(at($endpoint, "stage"), "api"), at($endpoint, "decision"), null)
+  let result = { public = $public; api = $api; health = $health; secure = $secure; cookieEligible = $cookieEligible;
+    portalMutationAllowed = $portalMutationAllowed; governedCreation = $governedCreation }
+
+process hostedHttp.routes:
+  let result = list(
+    list("current-release", "public", "always", list("portal", "operations", "current-release"), list("GET")),
+    list("portal", "public", "always", list("portal"), list("GET")),
+    list("portal-client", "public", "always", list("portal", "client.mjs"), list("GET")),
+    list("operations-client", "public", "always", list("portal", "operations-client.mjs"), list("GET")),
+    list("claimipedia", "public", "always", list("portal", "claimipedia"), list("GET")),
+    list("readiness", "public", "always", list("readyz"), list("GET")),
+    list("oidc", "public", "always", list("v1", "auth", "oidc"), list("POST")),
+    list("room-client", "public", "always", list("control-room", "client.mjs"), list("GET")),
+    list("room-opener", "public", "always", list("control-room", "request-opener.mjs"), list("GET")),
+    list("room-style", "public", "always", list("control-room", "control-room.css"), list("GET")),
+    list("room-recovery-client", "public", "always", list("control-room", "recovery-client.mjs"), list("GET")),
+    list("signout", "api", "always", list("v1", "portal", "signout"), list("POST")),
+    list("me", "api", "always", list("v1", "me"), list("GET")),
+    list("sessions", "api", "always", list("v1", "sessions"), list("GET")),
+    list("session-revoke", "api", "always", list("v1", "sessions", "revoke"), list("POST")),
+    list("portal-workspaces", "api", "always", list("v1", "portal", "workspaces"), list("GET")),
+    list("portal-portfolios", "api", "always", list("v1", "portal", "mcp-portfolios"), list("GET")),
+    list("tenants", "api", "always", list("v1", "tenants"), list("GET", "POST")),
+    list("workspace-route", "api", "always", list("v1", "workspace-route"), list("GET")),
+    list("authoring-requests", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests"), list("GET", "POST")),
+    list("apps", "api", "always", list("v1", "tenants", ":tenantId", "apps"), list("GET", "POST")),
+    list("environment-activations", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "environment-activations"), list("GET", "POST")),
+    list("environment-executions", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "environment-executions"), list("GET")),
+    list("environment-cleanups", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "environment-cleanups"), list("GET")),
+    list("memberships", "api", "always", list("v1", "tenants", ":tenantId", "memberships"), list("GET", "POST")),
+    list("membership", "api", "always", list("v1", "tenants", ":tenantId", "memberships", ":userId"), list("PATCH", "DELETE")),
+    list("projects", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects"), list("GET", "POST")),
+    list("project-memberships", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "memberships"), list("GET", "POST")),
+    list("project-membership", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "memberships", ":userId"), list("PATCH", "DELETE")),
+    list("project-extension-context", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "project-extension-context"), list("GET")),
+    list("environment-resolutions", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "environment-resolutions"), list("GET", "POST")),
+    list("workspaces", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces"), list("GET", "POST")),
+    list("credentials", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "credentials"), list("GET", "POST")),
+    list("portal-app-credentials", "api", "always", list("v1", "portal", "tenants", ":tenantId", "apps", ":appId", "credentials"), list("GET", "POST")),
+    list("portal-project-credentials", "api", "always", list("v1", "portal", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "credentials"), list("GET", "POST")),
+    list("credential", "api", "always", list("v1", "tenants", ":tenantId", "credentials", ":credentialId"), list("DELETE")),
+    list("portal-credential", "api", "always", list("v1", "portal", "tenants", ":tenantId", "credentials", ":credentialId"), list("DELETE")),
+    list("secrets", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "secrets"), list("GET")),
+    list("secret", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "secrets", ":secretName"), list("GET", "DELETE", "PUT")),
+    list("audit", "api", "always", list("v1", "tenants", ":tenantId", "audit"), list("GET")),
+    list("portal-audit", "api", "always", list("v1", "portal", "tenants", ":tenantId", "audit"), list("GET")),
+    list("authoring-message", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests", ":requestId", "human-messages"), list("POST")),
+    list("authoring-request", "api", "always", list("v1", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests", ":requestId"), list("GET")),
+    list("room-recovery", "public", "room", list("control-room", "recovery", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests", ":requestId"), list("GET", "POST")),
+    list("room-collection", "public", "room", list("control-room", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests"), list("GET", "POST")),
+    list("room-events", "public", "room", list("control-room", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests", ":requestId", "events"), list("GET")),
+    list("room-request", "public", "room", list("control-room", "tenants", ":tenantId", "apps", ":appId", "projects", ":projectId", "workspaces", ":workspaceId", "authoring-requests", ":requestId"), list("GET")),
+    list("operations-page", "public", "operations", list("portal", "operations", ":operationId"), list("GET")),
+    list("operations-approve", "api", "operations", list("v1", "portal", "operations", ":operationId", "approve"), list("POST")))
+
+process hostedHttp.matches:
+  let input = $eventInput
+  let result = false
+  when eq(count($input.parts), add(count($input.pattern), 1)):
+    fold $input.pattern as expected; match starts { index = 1; valid = true }:
+      let actual = at($input.parts, $match.index)
+      port text.startsWith { value = $expected; search = ":" } → variable
+      yield { index = add($match.index, 1);
+        valid = and($match.valid, if($variable, $actual, eq($expected, $actual))) } → match
+    let result = $match.valid
+
+process hostedHttp.parameters:
+  let input = $eventInput
+  fold $input.pattern as expected; state starts { index = 1; parameters = {}; denial = null }:
+    let parameters = $state.parameters
+    let denial = $state.denial
+    port text.startsWith { value = $expected; search = ":" } → variable
+    when $variable:
+      port text.slice { value = $expected; start = 1 } → name
+      let ordinaryDenial = "API route was not found."
+      when eq($name, "operationId"):
+        let ordinaryDenial = "Operations approval route was not found."
+      let decoded = ""
+      let decodedOk = true
+      try:
+        port http.decodePathSegment { value = at($input.parts, $state.index) } → decoded
+      catch invalid:
+        let decodedOk = false
+      let pattern = "\\A[a-z]+_[a-z0-9_-]+\\z"
+      when eq($name, "requestId"):
+        let pattern = "\\Arequest-[a-z0-9]{4}(?:-[a-z0-9]{4}){2}\\z"
+        when and(eq($input.name, "room-recovery"), $decodedOk):
+          let ordinaryDenial = "Protected recovery route was not found."
+        when and(includes(list("room-events", "room-request"), $input.name), $decodedOk):
+          let ordinaryDenial = "Control-room route was not found."
+      when eq($name, "operationId"):
+        let pattern = "\\A[A-Za-z][A-Za-z0-9._:@/-]{0,159}\\z"
+      when eq($name, "secretName"):
+        let pattern = "\\A[^/\\\\]+\\z"
+      port text.matches { value = $decoded; pattern = $pattern } → valid
+      when not(and($decodedOk, $valid)):
+        let requestDenial = eq($name, "requestId")
+        when or(not($denial), $requestDenial):
+          let denial = $ordinaryDenial
+      port record.put { record = $parameters; key = $name; value = $decoded } → parameters
+    yield { index = add($state.index, 1); parameters = $parameters; denial = $denial } → state
+  let result = { name = $input.name; parameters = $state.parameters; denial = $state.denial }
+
+process hostedHttp.endpoint:
+  let input = $eventInput
+  port text.split { value = $input.path; pattern = "/" } → split
+  let result = null
+  when eq(at($split, 0), ""):
+    port kernel.invoke { query = "hostedHttp.routes"; input = null } → routes
+    fold $routes as route; selected starts null:
+      let feature = at($route, 2)
+      let methods = at($route, 4)
+      when and(not($selected), or(eq($feature, "always"), eq(at($input, $feature), true))):
+        let pattern = at($route, 3)
+        port kernel.invoke { query = "hostedHttp.matches"; input = { parts = $split; pattern = $pattern } } → matches
+        when $matches:
+          port kernel.invoke { query = "hostedHttp.parameters";
+            input = { parts = $split; pattern = $pattern; name = at($route, 0) } } → decision
+          let method = if(includes($methods, $input.method), $input.method, null)
+          port record.put { record = $decision; key = "method"; value = $method } → decision
+          let selected = { stage = at($route, 1); decision = $decision }
+      yield $selected → result

@@ -1,0 +1,406 @@
+process-module "temple/surface-process-module/1"
+
+process capacity.digest:
+  port json.canonical { value = $eventInput } → canonical
+  port digest.sha256 { text = $canonical } → result
+
+process capacity.integer:
+  port number.isNatural { value = $eventInput.value } → integer
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput.value, $eventInput.min) } → lower
+  port number.calculate { operation = "lessEqual"; values = list($eventInput.value, $eventInput.max) } → upper
+  let result = and($integer, $lower, $upper)
+
+process capacity.options:
+  port kernel.invoke { query = "capacity.integer"; input = { value = $eventInput.reservationTtlMs; min = 30000; max = 3600000 } } → lifetime
+  assert $lifetime
+    otherwise "type|Hosted capacity reservation lifetime is invalid."
+  port kernel.invoke { query = "capacity.integer"; input = { value = $eventInput.maximumSettledReservations; min = 100; max = 100000 } } → retention
+  assert $retention
+    otherwise "type|Hosted capacity settled-reservation retention is invalid."
+  let result = true
+
+process capacity.money:
+  port value.type { value = $eventInput } → kind
+  port number.calculate { operation = "greaterEqual"; values = list($eventInput, 0) } → lower
+  port number.calculate { operation = "lessEqual"; values = list($eventInput, 100000000) } → upper
+  let result = false
+  when and(eq($kind, "number"), $lower, $upper):
+    port number.calculate { operation = "multiply"; values = list($eventInput, 100) } → cents
+    port number.calculate { operation = "round"; values = list($cents) } → rounded
+    let result = eq($cents, $rounded)
+
+process capacity.policy:
+  port value.describe { value = $eventInput } → shape
+  assert $shape.plain
+    otherwise "type|Hosted capacity policy is invalid."
+  port value.type { value = $eventInput.policyId } → kind
+  assert eq($kind, "string")
+    otherwise "type|Hosted capacity policy is invalid."
+  port text.matches { value = $eventInput.policyId; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → id
+  port value.string { value = $eventInput.currency } → currency
+  port text.matches { value = $currency; pattern = "\\A[A-Z]{3}\\z" } → currencyValid
+  port kernel.invoke { query = "capacity.integer"; input = { value = $eventInput.maxActiveBindings; min = 1; max = 100000 } } → maximum
+  assert and($id, $currencyValid, $maximum)
+    otherwise "type|Hosted capacity policy is invalid."
+  port record.entries { value = $eventInput } → fields
+  let allowed = list("policyId", "currency", "monthlyLimit", "maxActiveBindings")
+  assert not(some($fields, "field", not(includes($allowed, at($field, 0)))))
+    otherwise "type|Hosted capacity policy has unsupported fields."
+  port kernel.invoke { query = "capacity.money"; input = $eventInput.monthlyLimit } → limit
+  assert $limit
+    otherwise "hosted-capacity-money|Capacity monthly limit must be a non-negative amount with at most two decimal places."
+  let result = $eventInput
+
+process capacity.scope:
+  port value.describe { value = $eventInput } → shape
+  assert $shape.plain
+    otherwise "hosted-capacity-scope|Capacity governance requires protected host scope."
+  port record.entries { value = $eventInput } → fields
+  assert count($fields)
+    otherwise "hosted-capacity-scope|Capacity governance requires protected host scope."
+  port kernel.invoke { query = "capacity.digest"; input = $eventInput } → result
+
+process capacity.plan:
+  let plan = $eventInput.plan
+  port value.string { value = if(at($plan, "planHash"), at($plan, "planHash"), "") } → hash
+  port value.string { value = if(at($plan, "activationId"), at($plan, "activationId"), "") } → activation
+  port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → planHash
+  port text.matches { value = $activation; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → activationId
+  port value.type { value = at($plan, "bindingKey") } → binding
+  port number.calculate { operation = "lessEqual"; values = list(count(at($plan, "bindingKey")), 512) } → length
+  assert and(includes(list("bind", "migrate", "rollback", "unbind"), at($plan, "action")), $planHash, $activationId, eq($binding, "string"), $length)
+    otherwise "hosted-capacity-plan|Capacity reservation requires one executable binding plan."
+  port kernel.invoke { query = "capacity.scope"; input = $eventInput.scope } → scopeHash
+  assert eq(at($plan, "scopeHash"), $scopeHash)
+    otherwise "hosted-capacity-scope|Capacity reservation crossed its protected host scope."
+  let result = $scopeHash
+
+process capacity.reserveAdmission:
+  call capacity.plan
+  let plan = $eventInput.plan
+  port kernel.invoke { query = "capacity.policy"; input = $eventInput.policy } → policy
+  assert eq(at(at($plan, "consequences"), "currency"), $policy.currency)
+    otherwise "hosted-capacity-currency|Capability offer currency is not governed by this tenant policy."
+  let targetActive = not(eq(at($plan, "action"), "unbind"))
+  let targetMonthlyCost = if($targetActive, at(at($plan, "consequences"), "monthlyCost"), 0)
+  port kernel.invoke { query = "capacity.money"; input = $targetMonthlyCost } → cost
+  assert $cost
+    otherwise "hosted-capacity-money|Capability target monthly cost must be a non-negative amount with at most two decimal places."
+  port kernel.invoke { query = "capacity.digest"; input = { activationId = at($plan, "activationId"); scopeHash = $scopeHash } } → identity
+  let result = { scopeHash = $scopeHash; policy = $policy; currency = $policy.currency;
+    targetActive = $targetActive; targetMonthlyCost = $targetMonthlyCost; reservationId = concat("capacity-reservation.", $identity) }
+
+process capacity.quota:
+  let allocation = $eventInput.allocation
+  let adopted = null
+  let allAllocations = $eventInput.allocations
+  let current = $eventInput.current
+  when and(not($allocation), eq(at($current, "status"), "active"), eq(at($current, "scopeHash"), $eventInput.scopeHash)):
+    port kernel.invoke { query = "capacity.money"; input = at(at($current, "offer"), "monthlyCost") } → inheritedCost
+    assert $inheritedCost
+      otherwise "hosted-capacity-money|Current capability monthly cost must be a non-negative amount with at most two decimal places."
+    port kernel.invoke { query = "capacity.digest"; input = $current.resourceRef } → resourceRefHash
+    let adopted = { bindingKey = $eventInput.bindingKey; scopeHash = $eventInput.scopeHash; policyId = $eventInput.policyId;
+      currency = $eventInput.currency; monthlyCost = at(at($current, "offer"), "monthlyCost"); planHash = $current.planHash;
+      resourceRefHash = $resourceRefHash; settledAt = $current.activatedAt; adopted = true }
+    let allocation = $adopted
+    let allAllocations = append($allAllocations, list($adopted))
+  let baseMonthlyCost = if($allocation, at($allocation, "monthlyCost"), 0)
+  let allocations = filter($allAllocations, "item", and(eq($item.scopeHash, $eventInput.scopeHash), eq($item.currency, $eventInput.currency)))
+  let pending = filter($eventInput.reservations, "item", and(eq($item.status, "reserved"), eq($item.scopeHash, $eventInput.scopeHash), eq($item.currency, $eventInput.currency)))
+  let allocatedTotal = fold($allocations, "item", "sum", 0, add($sum, $item.monthlyCost))
+  let pendingTotal = fold($pending, "item", "sum", 0, add($sum, $item.reservedIncrement))
+  port number.calculate { operation = "subtract"; values = list($eventInput.targetMonthlyCost, $baseMonthlyCost) } → delta
+  port number.calculate { operation = "max"; values = list(0, $delta) } → reservedIncrement
+  port number.calculate { operation = "lessEqual"; values = list(add(add($allocatedTotal, $pendingTotal), $reservedIncrement), $eventInput.monthlyLimit) } → underMonthly
+  assert $underMonthly
+    otherwise "hosted-capacity-monthly-limit|Capability activation would exceed the protected tenant monthly capacity limit."
+  let livePending = filter($pending, "item", if(eq($item.targetActive, false), false, not(eq($item.action, "unbind"))))
+  let keys = append(map($allocations, "item", list($item.bindingKey, true)), map($livePending, "item", list($item.bindingKey, true)))
+  port value.groupTextPairs { entries = $keys } → distinctKeys
+  let activeKeys = filter($distinctKeys, "pair", not(eq(at($pair, 0), $eventInput.bindingKey)))
+  let activeCount = add(count($activeKeys), if($eventInput.targetActive, 1, 0))
+  port number.calculate { operation = "lessEqual"; values = list($activeCount, $eventInput.maxActiveBindings) } → underActive
+  assert $underActive
+    otherwise "hosted-capacity-binding-limit|Capability activation would exceed the protected tenant active-binding limit."
+  let result = { reservedIncrement = $reservedIncrement; baseMonthlyCost = $baseMonthlyCost; adopted = $adopted }
+
+process capacity.settleAdmission:
+  let input = $eventInput
+  port value.type { value = $input.resourceRef } → resource
+  port number.calculate { operation = "lessEqual"; values = list(count($input.resourceRef), 512) } → length
+  port value.type { value = at($input.reservation, "reservationId") } → reservationId
+  port value.type { value = at($input.plan, "planHash") } → planHash
+  assert and(eq(at($input.reservation, "protocol"), "sourcery.hosted/capacity-reservation.v1"),
+    not(eq($reservationId, "undefined")), not(eq($planHash, "undefined")), eq($resource, "string"), $input.resourceRef, $length)
+    otherwise "hosted-capacity-settlement|Capacity settlement input is invalid."
+  port kernel.invoke { query = "capacity.scope"; input = $input.scope } → scopeHash
+  port kernel.invoke { query = "capacity.digest"; input = $input.resourceRef } → resourceRefHash
+  let result = { scopeHash = $scopeHash; resourceRefHash = $resourceRefHash }
+
+process capacity.state:
+  port value.describe { value = at($eventInput.state, "allocations") } → allocationsShape
+  port value.describe { value = at($eventInput.state, "reservations") } → reservationsShape
+  port kernel.invoke { query = "capacity.integer"; input = { value = at($eventInput.state, "revision"); min = 0; max = 9007199254740991 } } → revision
+  assert and(eq(at($eventInput.state, "protocol"), "sourcery-hosted-capacity-state/1"), $allocationsShape.plain, $reservationsShape.plain,
+    $revision, eq($eventInput.state.revision, $eventInput.rowRevision))
+    otherwise "type|Hosted capacity state is invalid or has crossed row/document revisions."
+  port record.entries { value = $eventInput.state } → stateFields
+  assert eq(count($stateFields), 4)
+    otherwise "type|Hosted capacity state has unsupported fields."
+  let stateFields = null
+  port record.entries { value = $eventInput.state.allocations } → allocations
+  port record.entries { value = $eventInput.state.reservations } → reservations
+  port number.calculate { operation = "lessEqual"; values = list(count($allocations), 100000) } → allocationsBounded
+  port number.calculate { operation = "lessEqual"; values = list(count($reservations), 100000) } → reservationsBounded
+  assert and($allocationsBounded, $reservationsBounded)
+    otherwise "type|Hosted capacity state is invalid."
+  each $allocations as pair:
+    port kernel.invoke { query = "capacity.allocation"; input = $pair } → valid
+  let allocations = null
+  fold $reservations as pair; normalized starts list():
+    port kernel.invoke { query = "capacity.reservation"; input = $pair } → entry
+    yield append($normalized, list($entry)) → normalized
+  let reservations = null
+  port record.fromEntries { entries = $normalized } → normalizedReservations
+  let normalized = null
+  let result = { protocol = $eventInput.state.protocol; revision = $eventInput.state.revision; allocations = $eventInput.state.allocations; reservations = $normalizedReservations }
+  let normalizedReservations = null
+
+process capacity.identity:
+  port value.string { value = at($eventInput, "scopeHash") } → scope
+  port value.string { value = at($eventInput, "planHash") } → hash
+  port value.string { value = at($eventInput, "policyId") } → policy
+  port value.string { value = at($eventInput, "currency") } → currency
+  port text.matches { value = $scope; pattern = "\\A[a-f0-9]{64}\\z" } → scopeValid
+  port text.matches { value = $hash; pattern = "\\A[a-f0-9]{64}\\z" } → hashValid
+  port text.matches { value = $policy; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → policyValid
+  port text.matches { value = $currency; pattern = "\\A[A-Z]{3}\\z" } → currencyValid
+  let result = and($scopeValid, $hashValid, $policyValid, $currencyValid)
+
+process capacity.allocation:
+  let key = at($eventInput, 0)
+  let item = at($eventInput, 1)
+  port value.describe { value = $item } → shape
+  assert $shape.plain
+    otherwise "type|Hosted capacity allocation is invalid."
+  port record.entries { value = $item } → fields
+  let allowed = list("bindingKey", "scopeHash", "policyId", "currency", "monthlyCost", "planHash", "resourceRefHash", "settledAt", "adopted")
+  assert not(some($fields, "field", not(includes($allowed, at($field, 0)))))
+    otherwise "type|Hosted capacity allocation has unsupported fields."
+  port number.calculate { operation = "lessEqual"; values = list(count($key), 512) } → bounded
+  port kernel.invoke { query = "capacity.identity"; input = $item } → identity
+  port value.string { value = $item.resourceRefHash } → resource
+  port text.matches { value = $resource; pattern = "\\A[a-f0-9]{64}\\z" } → reference
+  port value.type { value = $item.adopted } → adopted
+  assert and($key, $bounded, eq($item.bindingKey, $key), $identity, $reference, eq($adopted, "boolean"))
+    otherwise "type|Hosted capacity allocation is invalid."
+  port time.parseRfc3339 { value = $item.settledAt } → settled
+  port kernel.invoke { query = "capacity.money"; input = $item.monthlyCost } → cost
+  assert $cost
+    otherwise "hosted-capacity-money|Capacity allocation must be a non-negative amount with at most two decimal places."
+  let result = true
+
+process capacity.reservation:
+  let key = at($eventInput, 0)
+  let item = at($eventInput, 1)
+  port value.describe { value = $item } → shape
+  assert $shape.plain
+    otherwise "type|Hosted capacity reservation is invalid."
+  port record.entries { value = $item } → fields
+  let allowed = list("reservationId", "status", "operationId", "planHash", "bindingKey", "scopeHash", "policyId", "currency",
+    "action", "baseMonthlyCost", "targetMonthlyCost", "targetActive", "reservedAt", "expiresAt", "settledAt", "reservedIncrement")
+  assert not(some($fields, "field", not(includes($allowed, at($field, 0)))))
+    otherwise "type|Hosted capacity reservation has unsupported fields."
+  port text.startsWith { value = $key; search = "capacity-reservation." } → prefix
+  port kernel.invoke { query = "capacity.identity"; input = $item } → identity
+  port value.string { value = $item.operationId } → operation
+  port text.matches { value = $operation; pattern = "\\A[A-Za-z][A-Za-z0-9._:/-]{0,255}\\z" } → operationValid
+  port value.type { value = $item.bindingKey } → keyType
+  port number.calculate { operation = "lessEqual"; values = list(count($item.bindingKey), 512) } → bounded
+  assert and(eq($item.reservationId, $key), $prefix, includes(list("reserved", "settled"), $item.status), $identity,
+    $operationValid, includes(list("bind", "migrate", "rollback", "unbind"), $item.action), eq($keyType, "string"), $bounded)
+    otherwise "type|Hosted capacity reservation is invalid."
+  port time.parseRfc3339 { value = $item.reservedAt } → reserved
+  port time.parseRfc3339 { value = $item.expiresAt } → expires
+  when eq($item.status, "reserved"):
+    assert eq($item.settledAt, null)
+      otherwise "type|Hosted capacity reservation is invalid."
+  when eq($item.status, "settled"):
+    port time.parseRfc3339 { value = $item.settledAt } → settled
+  each list($item.baseMonthlyCost, $item.targetMonthlyCost, $item.reservedIncrement) as amount:
+    port kernel.invoke { query = "capacity.money"; input = $amount } → cost
+    assert $cost
+      otherwise "hosted-capacity-money|Capacity reservation costs must be non-negative amounts with at most two decimal places."
+  let target = not(eq($item.action, "unbind"))
+  port value.type { value = $item.targetActive } → targetType
+  assert or(eq($targetType, "undefined"), eq($item.targetActive, $target))
+    otherwise "type|Hosted capacity reservation active intent is invalid."
+  port record.put { record = $item; key = "targetActive"; value = $target } → normalized
+  let result = list($key, $normalized)
+
+process capacity.publicReservation:
+  let item = $eventInput
+  port kernel.invoke { query = "capacity.digest"; input = $item.operationId } → operationIdHash
+  let result = { protocol = "sourcery.hosted/capacity-reservation.v1"; reservationId = $item.reservationId;
+    status = $item.status; policyId = $item.policyId; operationIdHash = $operationIdHash; currency = $item.currency;
+    reservedIncrement = $item.reservedIncrement; targetMonthlyCost = $item.targetMonthlyCost; expiresAt = $item.expiresAt }
+
+process capacity.snapshot:
+  call capacity.state
+  let state = $result
+  let result = null
+  port record.entries { value = $state.allocations } → allocations
+  port record.entries { value = $state.reservations } → reservations
+  let pending = filter($reservations, "pair", eq(at(at($pair, 1), "status"), "reserved"))
+  port number.calculate { operation = "subtract"; values = list(count($reservations), count($pending)) } → settled
+  let result = { protocol = "sourcery.hosted/capacity-governor.v1"; revision = $state.revision;
+    activeAllocations = count($allocations); pendingReservations = count($pending); settledReservations = $settled }
+
+process capacity.order:
+  port value.groupTextPairs { entries = $eventInput } → groups
+  fold $groups as group; ordered starts list():
+    yield append($ordered, at($group, 1)) → ordered
+  let result = $ordered
+
+process capacity.maintain:
+  port record.entries { value = $eventInput.reservations } → entries
+  let reserved = filter($entries, "pair", eq(at(at($pair, 1), "status"), "reserved"))
+  fold $reserved as pair; candidates starts list():
+    let item = at($pair, 1)
+    port time.parseRfc3339 { value = $item.expiresAt } → expires
+    port number.calculate { operation = "lessEqual"; values = list($expires, $eventInput.now) } → expired
+    yield append($candidates, if($expired, list(list($item.expiresAt, $item.reservationId)), list())) → expired
+  let reserved = null
+  port kernel.invoke { query = "capacity.order"; input = $expired } → expiredOrdered
+  port list.take { values = $expiredOrdered; limit = $eventInput.limit } → expiredRemoved
+  let settled = filter($entries, "pair", eq(at(at($pair, 1), "status"), "settled"))
+  let settlements = map($settled, "pair", list(at(at($pair, 1), "settledAt"), at($pair, 0)))
+  let settled = null
+  port number.calculate { operation = "subtract"; values = list(count($settlements), $eventInput.maximumSettledReservations) } → excess
+  port number.calculate { operation = "subtract"; values = list($eventInput.limit, count($expiredRemoved)) } → remaining
+  port number.calculate { operation = "min"; values = list($remaining, $excess) } → compact
+  port number.calculate { operation = "max"; values = list($compact, 0) } → compact
+  port kernel.invoke { query = "capacity.order"; input = $settlements } → settledOrdered
+  port list.take { values = $settledOrdered; limit = $compact } → settledRemoved
+  port record.fromEntries { entries = map(append($expiredRemoved, $settledRemoved), "key", list($key, true)) } → removed
+  port record.fromEntries { entries = filter($entries, "pair", not(at($removed, at($pair, 0)))) } → reservations
+  let result = { reservations = $reservations; expiredReservations = count($expiredRemoved); compactedSettlements = count($settledRemoved) }
+
+process capacity.successor:
+  port number.calculate { operation = "less"; values = list($state.revision, 9007199254740991) } → advance
+  assert $advance
+    otherwise "type|Hosted capacity revision cannot advance."
+  let next = { protocol = "sourcery-hosted-capacity-state/1"; revision = add($state.revision, 1);
+    allocations = $nextAllocations; reservations = $nextReservations }
+
+process capacity.reserve:
+  port kernel.invoke { query = "capacity.options"; input = { reservationTtlMs = $eventInput.reservationTtlMs;
+    maximumSettledReservations = $eventInput.maximumSettledReservations } } → options
+  port kernel.invoke { query = "capacity.reserveAdmission"; input = { plan = $eventInput.plan; scope = $eventInput.scope;
+    policy = $eventInput.policy } } → admitted
+  call capacity.state
+  let state = $result
+  let result = null
+  let plan = $eventInput.plan
+  port kernel.invoke { query = "capacity.maintain"; input = { reservations = $state.reservations; now = $eventInput.now;
+    limit = 100000; maximumSettledReservations = $eventInput.maximumSettledReservations } } → maintenance
+  let retained = $maintenance.reservations
+  let exact = at($retained, $admitted.reservationId)
+  when $exact:
+    assert and(eq($exact.planHash, $plan.planHash), eq($exact.scopeHash, $admitted.scopeHash))
+      otherwise "hosted-capacity-conflict|Capacity reservation identity conflicts with another plan."
+    port kernel.invoke { query = "capacity.publicReservation"; input = $exact } → value
+    let result = { value = $value }
+  when not($exact):
+    port record.entries { value = $retained } → entries
+    let reservations = map($entries, "pair", at($pair, 1))
+    assert not(some($reservations, "item", and(eq($item.status, "reserved"), eq($item.bindingKey, $plan.bindingKey))))
+      otherwise "hosted-capacity-binding-busy|Another capacity-governed operation is pending for this binding."
+    port record.entries { value = $state.allocations } → allocations
+    port kernel.invoke { query = "capacity.quota"; input = { allocation = at($state.allocations, $plan.bindingKey);
+      allocations = map($allocations, "pair", at($pair, 1)); reservations = $reservations; current = $eventInput.current;
+      bindingKey = $plan.bindingKey; scopeHash = $admitted.scopeHash; currency = $admitted.currency;
+      targetActive = $admitted.targetActive; targetMonthlyCost = $admitted.targetMonthlyCost; policyId = $admitted.policy.policyId;
+      monthlyLimit = $admitted.policy.monthlyLimit; maxActiveBindings = $admitted.policy.maxActiveBindings } } → quota
+    let nextAllocations = $state.allocations
+    when $quota.adopted:
+      assert or(at($nextAllocations, $plan.bindingKey), not(eq(count($allocations), 100000)))
+        otherwise "type|Hosted capacity state is invalid."
+      port kernel.invoke { query = "capacity.allocation"; input = list($plan.bindingKey, $quota.adopted) } → valid
+      port record.put { record = $nextAllocations; key = $plan.bindingKey; value = $quota.adopted } → nextAllocations
+    assert not(eq(count($entries), 100000))
+      otherwise "type|Hosted capacity state is invalid."
+    port time.formatUtc { milliseconds = $eventInput.now; fractional = true } → reservedAt
+    port time.formatUtc { milliseconds = add($eventInput.now, $eventInput.reservationTtlMs); fractional = true } → expiresAt
+    let reservation = { reservationId = $admitted.reservationId; status = "reserved"; operationId = $plan.activationId;
+      planHash = $plan.planHash; bindingKey = $plan.bindingKey; scopeHash = $admitted.scopeHash; policyId = $admitted.policy.policyId;
+      currency = $admitted.currency; action = $plan.action; baseMonthlyCost = $quota.baseMonthlyCost;
+      targetMonthlyCost = $admitted.targetMonthlyCost; targetActive = $admitted.targetActive; reservedIncrement = $quota.reservedIncrement;
+      reservedAt = $reservedAt; expiresAt = $expiresAt; settledAt = null }
+    port kernel.invoke { query = "capacity.reservation"; input = list($admitted.reservationId, $reservation) } → checked
+    port record.put { record = $retained; key = $admitted.reservationId; value = at($checked, 1) } → nextReservations
+    call capacity.successor
+    port kernel.invoke { query = "capacity.publicReservation"; input = $reservation } → value
+    let result = { state = $next; value = $value }
+
+process capacity.settle:
+  port kernel.invoke { query = "capacity.settleAdmission"; input = { reservation = $eventInput.reservation; plan = $eventInput.plan;
+    resourceRef = $eventInput.resourceRef; scope = $eventInput.scope } } → admitted
+  call capacity.state
+  let state = $result
+  let result = null
+  port value.string { value = $eventInput.reservation.reservationId } → id
+  let retained = at($state.reservations, $id)
+  assert and($retained, eq($retained.planHash, $eventInput.plan.planHash), eq($retained.scopeHash, $admitted.scopeHash))
+    otherwise "hosted-capacity-settlement|Capacity reservation is unavailable for this plan and scope."
+  when eq($retained.status, "settled"):
+    port kernel.invoke { query = "capacity.publicReservation"; input = $retained } → value
+    let result = { value = $value }
+  when eq($retained.status, "reserved"):
+    port time.parseRfc3339 { value = $retained.expiresAt } → expires
+    port number.calculate { operation = "greater"; values = list($expires, $eventInput.now) } → timely
+    assert $timely
+      otherwise "hosted-capacity-expired|Capacity reservation expired before provider settlement."
+    port time.formatUtc { milliseconds = $eventInput.now; fractional = true } → now
+    port record.entries { value = $state.allocations } → allocations
+    let kept = filter($allocations, "pair", not(eq(at($pair, 0), $retained.bindingKey)))
+    when $retained.targetActive:
+      assert not(eq(count($kept), 100000))
+        otherwise "type|Hosted capacity state is invalid."
+      let allocation = { bindingKey = $retained.bindingKey; scopeHash = $retained.scopeHash; policyId = $retained.policyId;
+        currency = $retained.currency; monthlyCost = $retained.targetMonthlyCost; planHash = $retained.planHash;
+        resourceRefHash = $admitted.resourceRefHash; settledAt = $now; adopted = false }
+      port kernel.invoke { query = "capacity.allocation"; input = list($retained.bindingKey, $allocation) } → valid
+      let kept = append($kept, list(list($retained.bindingKey, $allocation)))
+    port record.fromEntries { entries = $kept } → nextAllocations
+    port record.put { record = $retained; key = "status"; value = "settled" } → record
+    port record.put { record = $record; key = "settledAt"; value = $now } → record
+    port record.put { record = $state.reservations; key = $id; value = $record } → nextReservations
+    call capacity.successor
+    port kernel.invoke { query = "capacity.publicReservation"; input = $record } → value
+    let result = { state = $next; value = $value }
+
+process capacity.reconcile:
+  port kernel.invoke { query = "capacity.integer"; input = { value = $eventInput.limit; min = 1; max = 10000 } } → limit
+  assert $limit
+    otherwise "type|Hosted capacity reconciliation limit is invalid."
+  port kernel.invoke { query = "capacity.integer"; input = { value = $eventInput.maximumSettledReservations; min = 100; max = 100000 } } → maximum
+  assert $maximum
+    otherwise "type|Hosted capacity settled-reservation retention is invalid."
+  call capacity.state
+  let state = $result
+  let result = null
+  port kernel.invoke { query = "capacity.maintain"; input = { reservations = $state.reservations; now = $eventInput.now;
+    limit = $eventInput.limit; maximumSettledReservations = $eventInput.maximumSettledReservations } } → report
+  let changed = add($report.expiredReservations, $report.compactedSettlements)
+  port time.formatUtc { milliseconds = $eventInput.now; fractional = true } → observedAt
+  let value = { protocol = "sourcery.hosted/capacity-governor.v1"; status = if($changed, "reconciled", "current");
+    expiredReservations = $report.expiredReservations; compactedSettlements = $report.compactedSettlements; observedAt = $observedAt }
+  let result = { value = $value }
+  when $changed:
+    let nextAllocations = $state.allocations
+    let nextReservations = $report.reservations
+    let report = null
+    call capacity.successor
+    let result = { state = $next; value = $value }

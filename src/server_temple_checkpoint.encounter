@@ -1,0 +1,151 @@
+process-module "temple/surface-process-module/1"
+
+process checkpoint.plan:
+  let config = $eventInput.config
+  let source = $eventInput.source
+  assert eq($config.protocol, "sourcery/server-temple-process-host-config.v1")
+    otherwise "Invalid Server Temple host configuration protocol."
+  assert eq($source.protocol, "sourcery/server-temple-migration-source.v1")
+    otherwise "Invalid Server Temple source manifest protocol."
+  port value.describe { value = $source.sources } → shape
+  assert and($shape.array, or($eventInput.hosted, count($source.sources)))
+    otherwise "The checkpoint requires declared Server Temple state sources."
+  each list($config.capsuleFile, $config.identityFile) as path:
+    call checkpoint.absolutePath
+  when $config.stateSourceFile:
+    let path = $config.stateSourceFile
+    call checkpoint.absolutePath
+  each list($config.templeId, $config.writerId) as text:
+    port text.matches { value = $text; pattern = "\\S" } → present
+    assert $present
+      otherwise "The checkpoint requires a Temple and writer identity."
+  let names = map($source.sources, "source", $source.name)
+  assert eq(count($names), count(distinct($names)))
+    otherwise "Duplicate Server Temple source name."
+  each $source.sources as item:
+    let path = $item.path
+    call checkpoint.absolutePath
+    assert not(includes(list($eventInput.configPath, $config.identityFile, $config.capsuleFile, $config.stateSourceFile), $path))
+      otherwise "Checkpoint sources may not include their capsule, identity key, or configuration."
+    port text.matches { value = $item.name; pattern = "\\S" } → named
+    port text.matches { value = $item.authorityRole; pattern = "\\S" } → role
+    assert and($named, $role, eq($item.containsSecrets, false),
+      includes(list("retained-authority", "operational-state", "derived-read-model"), $item.classification))
+      otherwise "Every checkpoint source must be named, classified, and explicitly secret-free."
+  let result = $source.sources
+
+process checkpoint.absolutePath:
+  port text.matches { value = $path; pattern = "\\A/(?!/)[^\\x00-\\x1f\\x7f]+\\z" } → absolute
+  assert $absolute
+    otherwise "Expected an absolute Server Temple file path."
+
+process checkpoint.admit:
+  let input = $eventInput
+  assert and(eq($input.protocol.value, "sourcery-core/temple-capsule.v1"), eq($input.metadataIdentity.value, $input.templeId),
+    eq($input.migration.name, "initial-temple-capsule"),
+    eq($input.migration.checksum, "8ce78bc0680539ea1f19897e30944a5e7465469d7fa4baf8958dbcba3b64dd83"))
+    otherwise "Server Temple capsule metadata or schema migration differs from its checkpoint contract."
+  assert and(eq($input.inspection.valid, true), eq($input.templeId, $input.inspection.templeId),
+    eq($input.manifestKey, $input.identityKey))
+    otherwise "Server Temple capsule and private identity do not match."
+  let result = true
+
+process checkpoint.offline:
+  assert eq($eventInput, null)
+    otherwise "Server Temple checkpoint requires a capsule without a writer lease."
+  let result = true
+
+process checkpoint.leaseSettings:
+  let config = $eventInput
+  port value.type { value = $config.leaseMs } → leaseType
+  port value.type { value = $config.renewIntervalMs } → renewType
+  port value.type { value = $config.checkpointIntervalMs } → checkpointType
+  let leaseMs = if(eq($leaseType, "undefined"), 30000, $config.leaseMs)
+  let renewMs = if(eq($renewType, "undefined"), 10000, $config.renewIntervalMs)
+  let checkpointMs = if(eq($checkpointType, "undefined"), 10000, $config.checkpointIntervalMs)
+  each list($leaseMs, $renewMs, $checkpointMs) as duration:
+    port number.isNatural { value = $duration } → integer
+    port number.calculate { operation = "greaterEqual"; values = list($duration, 1) } → positive
+    port number.calculate { operation = "lessEqual"; values = list($duration, 600000) } → bounded
+    assert and($integer, $positive, $bounded)
+      otherwise "Invalid Server Temple writer interval."
+  port number.calculate { operation = "less"; values = list($renewMs, $leaseMs) } → renewsInTime
+  assert $renewsInTime
+    otherwise "Server Temple writer renewal must be shorter than its lease."
+  let result = { leaseMs = $leaseMs; renewMs = $renewMs; checkpointMs = $checkpointMs }
+
+process checkpoint.acquire:
+  let input = $eventInput
+  let current = $input.current
+  let generation = 0
+  when $current:
+    port text.compare { left = $current.expires_at; right = $current.acquired_at } → interval
+    assert eq($interval, 1)
+      otherwise "Invalid retained Server Temple writer lease interval."
+    port text.compare { left = $current.expires_at; right = $input.now } → order
+    assert not(eq($order, 1))
+      otherwise "Server Temple capsule already has an active writer."
+    let generation = $current.generation
+  port number.isNatural { value = $generation } → integer
+  port number.calculate { operation = "less"; values = list($generation, 9007199254740991) } → bounded
+  assert and($integer, $bounded)
+    otherwise "Invalid Server Temple writer generation."
+  let result = { holder = $input.holder; acquired_at = $input.now; expires_at = $input.expires;
+    generation = add($generation, 1) }
+
+process checkpoint.fence:
+  let current = $eventInput.current
+  let token = $eventInput.token
+  let result = and($current, eq($current.holder, $token.holder), eq($current.acquired_at, $token.acquired_at),
+    eq($current.expires_at, $token.expires_at), eq($current.generation, $token.generation))
+
+process checkpoint.held:
+  call checkpoint.fence
+  let fenced = $result
+  port text.compare { left = $eventInput.token.expires_at; right = $eventInput.now } → order
+  assert and($fenced, eq($order, 1))
+    otherwise "Server Temple writer lease is no longer current."
+  let result = true
+
+process checkpoint.renew:
+  call checkpoint.held
+  let token = $eventInput.token
+  port text.compare { left = $eventInput.expires; right = $token.acquired_at } → interval
+  assert eq($interval, 1)
+    otherwise "Invalid Server Temple writer renewal interval."
+  let result = { holder = $token.holder; acquired_at = $token.acquired_at;
+    expires_at = $eventInput.expires; generation = $token.generation }
+
+process checkpoint.author:
+  let input = $eventInput
+  let retained = map($input.observations, "object", { name = $object.source.name;
+    classification = $object.source.classification; authorityRole = $object.source.authorityRole;
+    objectHash = $object.digest; bytes = $object.bytes })
+  let vector = map($retained, "object", { name = $object.name; objectHash = $object.objectHash })
+  port json.canonical { value = $vector } → vectorJson
+  port digest.sha256 { text = $vectorJson } → sourceVectorHash
+  let revision = 0
+  let priorVector = null
+  when $input.previous:
+    port json.parse { text = $input.previous.content_json } → previous
+    assert eq($previous.protocol, "sourcery/server-temple-live-state.v1")
+      otherwise "Unsupported retained Server Temple checkpoint format."
+    let revision = $input.previous.revision
+    let priorVector = $previous.sourceVectorHash
+  let result = null
+  when not(eq($priorVector, $sourceVectorHash)):
+    let revision = add($revision, 1)
+    let content = { protocol = "sourcery/server-temple-live-state.v1";
+      sourceVectorHash = $sourceVectorHash; retained = $retained }
+    port json.canonical { value = $content } → contentJson
+    port digest.sha256 { text = $contentJson } → contentHash
+    let projection = { name = "server-live-state"; revision = $revision; contentHash = $contentHash }
+    let payload = { projection = $projection; sourceVectorHash = $sourceVectorHash; sourceCount = count($retained) }
+    port json.canonical { value = $payload } → payloadJson
+    port digest.sha256 { text = $payloadJson } → payloadHash
+    let row = { sequence = add($input.journal.eventCount, 1); event_id = concat("state-checkpoint.", $contentHash);
+      kind = "ServerTempleStateCheckpointed"; actor = $input.writerId; occurred_at = $input.timestamp;
+      payload_hash = $payloadHash; previous_hash = $input.journal.headHash }
+    call capsule.eventHash
+    let result = { projection = $projection; contentJson = $contentJson; payloadJson = $payloadJson;
+      event = $row; eventHash = $result }

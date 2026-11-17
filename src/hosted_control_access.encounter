@@ -1,0 +1,253 @@
+process-module "temple/surface-process-module/1"
+
+process controlAccess.refuse:
+  port json.stringify { value = $eventInput } → diagnostic
+  let result = raise($diagnostic)
+
+process controlAccess.portfolioReadiness:
+  let input = $eventInput
+  let state = $input.state
+  let entry = $input.entry
+  let target = or($entry.metadata.target, {})
+  let owner = at(filter($state.identities, "item", eq($item.id, $entry.resourceId)), 0)
+  let tenant = at(filter($state.tenants, "item", and(eq($item.slug, at($target, "tenantSlug")), not($item.deletedAt))), 0)
+  let membership = null
+  let app = null
+  let project = null
+  let workspace = null
+  when and($tenant, $owner):
+    let membership = at(filter($state.memberships, "item", and(eq($item.tenantId, $tenant.id),
+      eq($item.userId, $owner.id), not($item.revokedAt))), 0)
+  when $tenant:
+    let app = at(filter($state.apps, "item", and(eq($item.tenantId, $tenant.id),
+      eq($item.slug, at($target, "applicationSlug")), not($item.deletedAt))), 0)
+  when $app:
+    let project = at(filter($state.projects, "item", and(eq($item.appId, $app.id),
+      eq($item.slug, at($target, "projectSlug")), not($item.deletedAt))), 0)
+  when $project:
+    let workspace = at(filter($state.workspaces, "item", and(eq($item.projectId, $project.id),
+      eq($item.slug, at($target, "workspaceSlug")), not($item.deletedAt))), 0)
+  let checks = list(list($owner, "owner-identity-missing"), list($tenant, "tenant-missing"),
+    list(eq(at($membership, "role"), "owner"), "owner-membership-missing"), list($app, "application-missing"),
+    list($project, "project-missing"), list($workspace, "workspace-missing"))
+  let failures = map(filter($checks, "check", not(at($check, 0))), "check", at($check, 1))
+  let result = { operationId = $entry.metadata.operationId; ownerEmail = or(at($owner, "email"), null);
+    tenantSlug = or(at($target, "tenantSlug"), null); applicationSlug = or(at($target, "applicationSlug"), null);
+    projectSlug = or(at($target, "projectSlug"), null); workspaceSlug = or(at($target, "workspaceSlug"), null);
+    status = if(count($failures), "degraded", "resolved"); failures = $failures }
+  port value.type { value = $entry.metadata.authorizationEvidenceHash } → evidenceType
+  when not(eq($evidenceType, "undefined")):
+    port record.put { record = $result; key = "authorizationEvidenceHash"; value = $entry.metadata.authorizationEvidenceHash } → result
+
+process controlAccess.readiness:
+  let input = $eventInput
+  let state = $input.state
+  let tenants = $state.tenants
+  let domains = map($input.managedDomains, "item", { issuer = $item.issuer; hostedDomain = $item.hostedDomain;
+    tenantSlug = $item.tenantSlug; status = if(some($tenants, "tenant",
+      and(eq($tenant.slug, $item.tenantSlug), not($tenant.deletedAt))), "resolved", "tenant-missing") })
+  fold $state.audit as entry; entries starts list():
+    let next = $entries
+    when includes(list("membership.operatorOwnerGranted", "membership.operatorOwnerPromoted"), $entry.action):
+      let operation = at(at($entry, "metadata"), "operationId")
+      port value.type { value = $operation } → type
+      when eq($type, "string"):
+        let next = append($entries, list($entry))
+    yield $next → entries
+  let ids = distinct(map($entries, "entry", $entry.metadata.operationId))
+  port record.fromEntries { entries = map($entries, "entry", list($entry.metadata.operationId, $entry)) } → latest
+  fold $ids as id; portfolios starts list():
+    port kernel.invoke { query = "controlAccess.portfolioReadiness"; input = { state = $state; entry = at($latest, $id) } } → portfolio
+    yield append($portfolios, list($portfolio)) → portfolios
+  let ready = and(every($domains, "item", eq($item.status, "resolved")), every($portfolios, "item", eq($item.status, "resolved")))
+  let result = { ready = $ready; schemaVersion = $state.schemaVersion; revision = $state.revision;
+    authorityDiagnostics = { managedDomainAdmissions = $domains; operatorOwnerPortfolios = $portfolios };
+    applicationEnvironmentResolution = if($input.resolver, "configured", "unavailable");
+    applicationEnvironmentActivation = if($input.queue, "configured", "unavailable");
+    applicationEnvironmentExecution = if($input.journal, "configured", "unavailable");
+    applicationEnvironmentCleanup = if($input.journal, "configured", "unavailable") }
+
+process controlAccess.authorize:
+  let input = $eventInput
+  let principal = $input.principal
+  let permission = $input.permission
+  let implications = { app.read = "app.write"; project.read = "project.write";
+    workspace.read = "workspace.write"; authoring.read = "authoring.write" }
+  let implied = at($implications, $permission)
+  when eq($principal.kind, "user"):
+    let membership = $input.membership
+    when not(and($membership, eq($membership.tenantId, $input.tenantId),
+      eq($membership.userId, $principal.userId), not($membership.revokedAt))):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = "The resource is outside this identity's tenant scope." } } → denied
+    let writers = list("app.write", "project.write", "workspace.write", "credential.manage", "secret.read", "secret.write")
+    let permissions = if(includes(list("owner", "admin"), $membership.role), append($writers, list("tenant.manage")),
+      if(eq($membership.role, "developer"), $writers, list()))
+    when not(or(includes(list("app.read", "project.read", "workspace.read"), $permission),
+      includes($permissions, $permission), and($implied, includes($permissions, $implied)))):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = concat("Role ", $membership.role, " does not grant ", $permission, ".") } } → denied
+  when eq($principal.kind, "developerCredential"):
+    when not(eq($principal.tenantId, $input.tenantId)):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = "The resource is outside this credential's tenant scope." } } → denied
+    when and($principal.projectId, not(eq($principal.projectId, $input.scope.projectId))):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = "The resource is outside this credential's project scope." } } → denied
+    when and($principal.workspaceId, not(eq($principal.workspaceId, $input.scope.workspaceId))):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = "The resource is outside this credential's workspace scope." } } → denied
+    let permissions = if(isArray($principal.permissions), $principal.permissions, list())
+    when not(or(includes($permissions, $permission), and($implied, includes($permissions, $implied)))):
+      port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "forbidden";
+        message = concat("The developer credential does not grant ", $permission, ".") } } → denied
+  when not(includes(list("user", "developerCredential"), $principal.kind)):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 401; code = "authentication-required";
+      message = "Authentication is required." } } → denied
+  let result = true
+
+process workspaceRoute.notFound:
+  port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "route-not-found";
+    message = "No hosted workspace route matches this request." } } → result
+
+process controlAccess.boundedText:
+  let input = $eventInput
+  port value.type { value = $input.value } → kind
+  let normalized = null
+  when eq($kind, "string"):
+    port number.calculate { operation = "lessEqual"; values = list(count($input.value), $input.limit) } → bounded
+    when $bounded:
+      port text.trim { value = $input.value } → normalized
+  when not($normalized):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 400; code = "invalid-input";
+      message = concat($input.name, " must be a non-empty string no longer than ", $input.limit, " characters.") } } → denied
+  let result = $normalized
+
+process workspaceRoute.coordinates:
+  let input = $eventInput
+  port kernel.invoke { query = "controlAccess.boundedText"; input = { value = $input.host; name = "route host"; limit = 253 } } → host
+  port kernel.invoke { query = "controlAccess.boundedText"; input = { value = $input.path; name = "route path"; limit = 2048 } } → path
+  port text.split { value = $host; pattern = ":" } → hosts
+  port text.lowerCase { value = at($hosts, 0) } → normalizedHost
+  port text.split { value = $path; pattern = "[?#]" } → paths
+  let pathname = at($paths, 0)
+  port text.matches { value = $pathname; pattern = "\\A/t/[^/]+/a/[^/]+/p/[^/]+/w/[^/]+/?\\z" } → matched
+  when not($matched):
+    port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+  port text.split { value = $pathname; pattern = "/" } → parts
+  fold list(2, 4, 6, 8) as index; slugs starts list():
+    try:
+      port http.decodePathSegment { value = at($parts, $index) } → slug
+    catch invalid:
+      port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+    port text.matches { value = $slug; pattern = "\\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\z" } → valid
+    when not($valid):
+      port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+    yield append($slugs, list($slug)) → slugs
+  let canonicalHost = concat(at($slugs, 0), ".", $input.baseDomain)
+  when not(eq($normalizedHost, $canonicalHost)):
+    port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+  let result = { tenant = at($slugs, 0); app = at($slugs, 1); project = at($slugs, 2);
+    workspace = at($slugs, 3); canonicalHost = $canonicalHost }
+
+process workspaceRoute.single:
+  let candidates = $eventInput
+  port number.calculate { operation = "lessEqual"; values = list(count($candidates), 1) } → unique
+  assert $unique
+    otherwise "Hosted workspace route has ambiguous lineage."
+  let result = at($candidates, 0)
+  when not($result):
+    port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+  port value.type { value = $result.id } → identity
+  assert and(eq($identity, "string"), $result.id)
+    otherwise "Hosted workspace route row lacks its authority identity."
+
+process workspaceRoute.resolve:
+  let input = $eventInput
+  let coordinates = $input.coordinates
+  let state = $input.snapshot
+  let principal = $input.principal
+  let tenants = filter($state.tenants, "row", and(eq($row.slug, $coordinates.tenant), not($row.deletedAt)))
+  port kernel.invoke { query = "workspaceRoute.single"; input = $tenants } → tenant
+  let memberships = filter($state.memberships, "row", and(eq($row.tenantId, $tenant.id),
+    eq($row.userId, $principal.userId), not($row.revokedAt)))
+  port number.calculate { operation = "lessEqual"; values = list(count($memberships), 1) } → uniqueMembership
+  assert $uniqueMembership
+    otherwise "Hosted workspace route has ambiguous membership."
+  let membership = at($memberships, 0)
+  when $input.database:
+    assert and($tenant.ownerPresent,
+      or(not(eq($principal.kind, "user")), not($membership),
+        and($state.userPresent, includes(list("owner", "admin", "developer", "viewer"), $membership.role))))
+      otherwise "Hosted workspace route requires current tenant and identity records."
+  port kernel.invoke { query = "controlAccess.authorize"; input = { tenantId = $tenant.id; principal = $principal;
+    permission = "workspace.read"; membership = $membership;
+    scope = { projectId = $principal.projectId; workspaceId = $principal.workspaceId } } } → tenantAccess
+  let apps = filter($state.apps, "row", and(eq($row.tenantId, $tenant.id), eq($row.slug, $coordinates.app), not($row.deletedAt)))
+  port kernel.invoke { query = "workspaceRoute.single"; input = $apps } → app
+  let projects = filter($state.projects, "row", and(eq($row.tenantId, $tenant.id), eq($row.appId, $app.id), eq($row.slug, $coordinates.project), not($row.deletedAt)))
+  port kernel.invoke { query = "workspaceRoute.single"; input = $projects } → project
+  let workspaces = filter($state.workspaces, "row", and(eq($row.tenantId, $tenant.id), eq($row.appId, $app.id),
+    eq($row.projectId, $project.id), eq($row.slug, $coordinates.workspace), not($row.deletedAt)))
+  port kernel.invoke { query = "workspaceRoute.single"; input = $workspaces } → workspace
+  port kernel.invoke { query = "controlAccess.authorize"; input = { tenantId = $tenant.id; principal = $principal;
+    permission = "workspace.read"; membership = $membership; scope = { projectId = $project.id; workspaceId = $workspace.id } } } → workspaceAccess
+  port kernel.invoke { query = "workspaceStorage.namespace"; input = { tenantId = $tenant.id; workspaceId = $workspace.id;
+    storageNamespace = $workspace.storageNamespace } } → namespace
+  let result = { tenantId = $tenant.id; appId = $app.id; projectId = $project.id; workspaceId = $workspace.id;
+    region = $workspace.region; storageNamespace = $namespace; canonicalHost = $coordinates.canonicalHost;
+    canonicalPath = concat("/t/", $tenant.slug, "/a/", $app.slug, "/p/", $project.slug, "/w/", $workspace.slug) }
+
+process workspaceRoute.document:
+  let input = $eventInput
+  port kernel.invoke { query = "workspaceRoute.coordinates"; input = $input } → coordinates
+  port kernel.invoke { query = "workspaceRoute.resolve"; input = { coordinates = $coordinates;
+    principal = $input.principal; snapshot = $input.snapshot } } → result
+
+process workspaceRoute.inventory:
+  let input = $eventInput
+  let principal = $input.principal
+  port value.type { value = at($principal, "userId") } → userType
+  when not(and(eq(at($principal, "kind"), "user"), eq($userType, "string"))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 403; code = "user-required";
+      message = "This operation requires an authenticated hosted user." } } → denied
+  let scope = $input.scope
+  let state = $input.snapshot
+  let tenant = at(filter($state.tenants, "row", eq($row.id, $scope.tenantId)), 0)
+  when not($tenant):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "not-found"; message = "Tenant was not found." } } → denied
+  let app = at(filter($state.apps, "row", eq($row.id, $scope.appId)), 0)
+  when and($scope.appId, not(and($app, eq($app.tenantId, $tenant.id)))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "not-found"; message = "App was not found." } } → denied
+  let project = at(filter($state.projects, "row", eq($row.id, $scope.projectId)), 0)
+  when and($scope.projectId, not(and($project, $app, eq($project.appId, $app.id), eq($project.tenantId, $tenant.id)))):
+    port kernel.invoke { query = "controlAccess.refuse"; input = { status = 404; code = "not-found"; message = "Project was not found." } } → denied
+  let membership = at(filter($state.memberships, "row", and(eq($row.tenantId, $tenant.id),
+    eq($row.userId, $principal.userId), not($row.revokedAt))), 0)
+  port kernel.invoke { query = "controlAccess.authorize"; input = { tenantId = $tenant.id; principal = $principal;
+    permission = "workspace.read"; membership = $membership; scope = { projectId = $scope.projectId } } } → access
+  let rows = filter($state.workspaces, "row", and(eq($row.projectId, $scope.projectId), not($row.deletedAt)))
+  port record.fromEntries { entries = map($rows, "row", list($row.slug, $row)) } → indexed
+  port value.sort { values = map($rows, "row", $row.slug); mode = "locale" } → order
+  let result = map($order, "slug", at($indexed, $slug))
+
+process workspaceRoute.databaseSnapshot:
+  let state = $eventInput.snapshot
+  when eq($state, null):
+    port kernel.invoke { query = "workspaceRoute.notFound"; input = null } → denied
+  port kernel.invoke { query = "controlAccess.databaseSnapshot"; input = $state } → admitted
+  each list($state.tenants, $state.apps, $state.projects, $state.workspaces, $state.memberships) as records:
+    port number.calculate { operation = "lessEqual"; values = list(count($records), 128) } → bounded
+    assert and(isArray($records), $bounded)
+      otherwise "Hosted workspace route projection exceeds its row bound."
+  port kernel.invoke { query = "workspaceRoute.resolve"; input = $eventInput } → result
+
+
+process controlAccess.databaseSnapshot:
+  let state = $eventInput
+  port number.isNatural { value = $state.rowRevision } → revision
+  port number.calculate { operation = "lessEqual"; values = list($state.rowRevision, 9007199254740991) } → safe
+  assert and($revision, $safe, eq($state.rowRevision, $state.documentRevision), $state.collectionsPresent,
+    includes(list(1, 2), $state.schemaVersion))
+    otherwise "Hosted access requires a current, supported authority snapshot."
+  let result = true

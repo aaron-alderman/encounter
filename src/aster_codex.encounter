@@ -1,0 +1,517 @@
+process-module "temple/surface-process-module/1"
+
+process asterCodex.route:
+  let result = { status = 405; page = "missing" }
+  when eq($eventInput.method, "GET"):
+    let result = { status = 404; page = "missing" }
+    when eq($eventInput.path, "/aster-codex/"):
+      let result = { status = 200; page = "index" }
+    when eq($eventInput.path, "/aster-codex/chat"):
+      let result = { status = 200; page = "chat" }
+    when eq($eventInput.path, "/aster-codex/markdown.css"):
+      let result = { status = 200; page = "markdown-style" }
+    when eq($eventInput.path, "/aster-codex/status"):
+      let result = { status = 200; page = "status" }
+    when eq($eventInput.path, "/aster-codex/live"):
+      let result = { status = 200; page = "live" }
+    when eq($eventInput.path, "/aster-codex/artifact"):
+      let result = { status = 200; page = "artifact" }
+    when eq($eventInput.path, "/aster-codex/sign-in"):
+      let result = { status = 401; page = "sign-in" }
+
+  when and(eq($eventInput.method, "POST"), eq($eventInput.path, "/aster-codex/stop")):
+    let result = { status = 200; page = "stop" }
+  when and(eq($eventInput.method, "POST"), eq($eventInput.path, "/aster-codex/send")):
+    let result = { status = 200; page = "send" }
+  when and(eq($eventInput.method, "POST"), eq($eventInput.path, "/aster-codex/pin")):
+    let result = { status = 200; page = "pin" }
+
+process asterCodex.rows:
+  let entries = map($rows, "row", {
+    tag = "li"; attrs = { id = concat("chat-entry-", $row.anchor) }; children = list(
+      { tag = "a"; attrs = { class = "custom-service-item"; href = $row.href; "aria-current" = if($row.current, "true", null) }; children = list(
+        { tag = "strong"; children = list({ tag = "code"; children = list($row.title) }) },
+        if($row.badge, { tag = "span"; attrs = { class = "aster-chat-badge"; "data-badge" = $row.badge; title = if(eq($row.badge, "running"), "Running", "Finished, unread") }; children = list(
+          { tag = "span"; attrs = { "aria-hidden" = "true" }; children = list(if(eq($row.badge, "running"), "●", "✓")) },
+          if(eq($row.badge, "running"), " Running", " Finished · unread")
+        ) }, null),
+        { tag = "br" },
+        { tag = "small"; children = list({ tag = "code"; children = list(
+          if($row.time, { tag = "time"; attrs = { datetime = $row.time.dateTime }; children = list($row.time.label) }, null)
+        ) }) }
+      ) }
+    )
+  })
+  let result = { tag = "ul"; children = $entries }
+
+process asterCodex.index:
+  let listView = $eventInput.list
+  let positions = if($listView.chat, list(
+    { tag = "input"; attrs = { type = "hidden"; name = "id"; value = $listView.chat } },
+    if(eq($listView.position, null), null, { tag = "input"; attrs = { type = "hidden"; name = "before"; value = $listView.position } })
+  ), null)
+  let search = list(
+    { tag = "span"; children = list(
+      { tag = "button"; attrs = { id = "chat-search-toggle"; class = "button"; type = "button"; popovertarget = "chat-search-panel";
+          "aria-controls" = "chat-search-panel"; "aria-label" = "Search chat titles"; title = "Search chat titles" }; children = list(
+        { tag = "svg"; attrs = { "aria-hidden" = "true"; width = "18"; height = "18"; viewBox = "0 0 24 24"; fill = "none"; stroke = "currentColor"; "stroke-width" = "2"; "stroke-linecap" = "round" }; children = list(
+          { tag = "circle"; attrs = { cx = "10.5"; cy = "10.5"; r = "5.5" } },
+          { tag = "path"; attrs = { d = "m15 15 5 5" } }
+        ) }
+      ) }
+    ) },
+    { tag = "div"; attrs = { id = "chat-search-panel"; class = "document-menu-panel"; popover = "auto" }; children = list(
+      { tag = "form"; attrs = { action = if($listView.chat, "/aster-codex/chat", "/aster-codex/"); method = "get" }; children = list(
+        { tag = "label"; attrs = { for = "q" }; children = list({ tag = "code"; children = list("Search chat titles") }) },
+        { tag = "br" },
+        { tag = "input"; attrs = { id = "q"; name = "q"; type = "search"; maxlength = "160"; value = $listView.search; autofocus = true } },
+        { tag = "input"; attrs = { type = "hidden"; name = "archived"; value = if($listView.archived, "1", "0") } },
+        $positions,
+        { tag = "button"; attrs = { class = "button"; type = "submit" }; children = list("Find") }
+      ) }
+    ) }
+  )
+  let selector = { tag = "nav"; attrs = { class = "button-row"; "aria-label" = "Chat lists" }; children = list(
+    { tag = "a"; attrs = { class = "button"; href = $listView.alternate }; children = list(if($listView.archived, "Current chats", "Archived chats")) }
+  ) }
+  let notices = map($listView.notifications, "notice", { tag = "li"; children = list(
+    { tag = "a"; attrs = { href = $notice.href }; children = list({ tag = "code"; children = list($notice.title) }) }
+  ) })
+  let unread = count($notices)
+  let inbox = if($unread, { tag = "details"; attrs = { class = "aster-unread"; "aria-label" = "Unread completions" }; children = list(
+    { tag = "summary"; children = list({ tag = "code"; children = list(concat($unread, " ", if(eq($unread, 1), "unread reply", "unread replies"))) }) },
+    { tag = "ul"; children = $notices }
+  ) }, null)
+  let pinned = null
+  when count($listView.pins):
+    let rows = $listView.pins
+    call asterCodex.rows
+    let pinned = { tag = "section"; attrs = { "aria-label" = "Pinned chats" }; children = list(
+      { tag = "h3"; children = list({ tag = "code"; children = list("Pinned") }) }, $result
+    ) }
+  fold $listView.groups as group; groups starts list():
+    let rows = $group.entries
+    call asterCodex.rows
+    yield append($groups, list({ tag = "details"; attrs = { class = "chat-group"; open = $group.open }; children = list(
+      { tag = "summary"; children = list({ tag = "code"; children = list($group.label) }) }, $result
+    ) })) → groups
+  let result = { tag = "section"; attrs = {
+    id = "chat-list"; class = "desktop-scroll-pane manager-tree identity-page-content dialog-body"; "aria-labelledby" = "chat-list-title"; tabindex = "0"
+  }; children = list(
+    { tag = "header"; children = list(
+      { tag = "h2"; attrs = { id = "chat-list-title" }; children = list({ tag = "code"; children = list(if($listView.archived, "Archived chats", "Chats")) }) },
+      $search, $selector
+    ) },
+    $inbox, $pinned, $groups,
+    if(or($pinned, count($groups)), null, { tag = "p"; children = list("No chats found.") }),
+    if($listView.older, { tag = "p"; children = list({ tag = "a"; attrs = { class = "button"; href = $listView.older }; children = list("Older chats") }) }, null)
+  ) }
+
+process asterCodex.composer:
+  let result = if($detail.ticket, { tag = "form"; attrs = { id = "chat-composer"; action = "/aster-codex/send"; method = "post"; "aria-label" = "Reply to Codex" }; children = list(
+    { tag = "input"; attrs = { type = "hidden"; name = "id"; value = $detail.id } },
+    { tag = "input"; attrs = { type = "hidden"; name = "ticket"; value = $detail.ticket } },
+    if($detail.notice, { tag = "p"; attrs = { class = "composer-notice"; role = "status" }; children = list({ tag = "code"; children = list($detail.notice) }) }, null),
+    { tag = "label"; attrs = { for = "aster-prompt" }; children = list({ tag = "code"; children = list("Message Codex") }) },
+    { tag = "textarea"; attrs = { id = "aster-prompt"; name = "prompt"; "data-input-kind" = "code"; rows = "2"; maxlength = "16000"; required = true; placeholder = "Ask Codex…" }; children = list($detail.draft) },
+    { tag = "div"; attrs = { class = "composer-actions" }; children = list(
+      { tag = "button"; attrs = { class = "button"; type = "submit" }; children = list("Send") },
+      { tag = "iframe"; attrs = { title = "Stop current turn"; width = "114"; height = "44"; frameborder = "0"; src = $detail.stopUrl } }
+    ) }
+  ) }, null)
+
+process asterCodex.conversation:
+  let detail = $eventInput.detail
+  let heading = if($eventInput.missing, "Chat unavailable", "Conversation")
+  let subjectTitle = null
+  let status = null
+  let pin = null
+  let composer = null
+  let back = if($eventInput.missing, "/aster-codex/", null)
+  let body = { tag = "p"; children = list(if($eventInput.missing, "This chat could not be opened.", "Select a chat to read its messages.")) }
+  when $detail:
+    let heading = $detail.title
+    let back = $detail.back
+    let subjectTitle = if(eq($detail.title, $detail.fullTitle), null, $detail.fullTitle)
+    let body = { tag = "p"; children = list("The transcript is unavailable on this server.") }
+    when $detail.available:
+      let status = { tag = "iframe"; attrs = { id = "aster-live-status"; title = "Codex connection and turn status"; width = "146"; height = "36"; frameborder = "0"; src = $detail.statusUrl } }
+      let pinLabel = if($detail.pinned, "Unpin chat", "Pin chat")
+      let pin = if($detail.canPin, { tag = "form"; attrs = { class = "pin-chat"; action = "/aster-codex/pin"; method = "post" }; children = list(
+        { tag = "input"; attrs = { type = "hidden"; name = "id"; value = $detail.id } },
+        { tag = "input"; attrs = { type = "hidden"; name = "pin"; value = if($detail.pinned, "0", "1") } },
+        { tag = "button"; attrs = { class = "button"; type = "submit"; "aria-label" = $pinLabel; title = $pinLabel }; children = list(if($detail.pinned, "★", "☆")) }
+      ) }, null)
+      call asterCodex.composer
+      let composer = $result
+      let latestLabel = if($detail.readingLatest, "Refresh chat", "Latest messages")
+      let latest = { tag = "a"; attrs = { class = "button"; href = $detail.latest }; children = list($latestLabel) }
+      let older = if($detail.older, { tag = "a"; attrs = { class = "button"; href = $detail.older }; children = list("Older messages") }, null)
+      let body = list(
+        { tag = "nav"; attrs = { class = "button-row"; "aria-label" = "Transcript navigation" }; children = list($latest, " ", $older) },
+        { tag = "hr" },
+        if($detail.body, $transcriptSlot, { tag = "p"; children = list("No saved messages in this part of the chat.") }),
+        { tag = "details"; attrs = { id = "aster-live-output" }; children = list(
+          { tag = "summary"; children = list({ tag = "code"; children = list("Live output") }) },
+          { tag = "iframe"; attrs = { id = "aster-live-stream"; title = "Live Codex output"; width = "100%"; height = "130"; frameborder = "0"; loading = "lazy"; src = $detail.live } }
+        ) },
+        { tag = "nav"; attrs = { id = "latest"; class = "button-row"; "aria-label" = "More of this chat" }; children = list(
+          $older, " ",
+          { tag = "a"; attrs = { class = "button"; href = $detail.latest; autofocus = $detail.readingLatest }; children = list($latestLabel) }
+        ) }
+      )
+  let result = { tag = "section"; attrs = { id = "conversation"; class = "manager-main dialog-body dialog-page"; "aria-labelledby" = "conversation-title" }; children = list(
+    { tag = "header"; attrs = { class = "manager-location" }; children = list(
+      if($back, { tag = "a"; attrs = { id = "chat-back"; class = "button"; href = $back }; children = list("Chats") }, null),
+      { tag = "h2"; attrs = { id = "conversation-title"; title = $subjectTitle }; children = list({ tag = "code"; children = list($heading) }) },
+      $pin, $status
+    ) },
+    { tag = "div"; attrs = { id = "chat-messages"; class = "desktop-scroll-pane"; "aria-label" = "Messages"; tabindex = "0" }; children = list($body) },
+    $composer
+  ) }
+
+process asterCodex.shell:
+  let transcriptSlot = "SOURCERY-ASTER-RENDERED-TRANSCRIPT"
+  let layout = "manager-single-pane"
+  let view = null
+  let content = { tag = "section"; attrs = { class = "desktop-scroll-pane manager-main dialog-body" }; children = list(
+    { tag = "h1"; children = list("Unavailable") },
+    { tag = "p"; children = list("This saved file could not be opened.") }
+  ) }
+  when $eventInput.signIn:
+    let content = { tag = "section"; attrs = { class = "desktop-scroll-pane manager-main dialog-body" }; children = list(
+      { tag = "h1"; children = list("Sign in to Aster Codex") },
+      { tag = "p"; children = list("Use the Sourcery account that owns these chats.") },
+      { tag = "p"; children = list({ tag = "a"; attrs = { class = "button"; href = "/game/"; target = "_blank"; rel = "noopener" }; children = list("Sign in to Sourcery") }) },
+      { tag = "p"; children = list({ tag = "a"; attrs = { class = "button"; href = "/aster-codex/" }; children = list("Reload chat list") }) }
+    ) }
+  when at($eventInput, "list"):
+    let layout = ""
+    let view = $eventInput.view
+    call asterCodex.index
+    let index = $result
+    call asterCodex.conversation
+    let content = list($index, $result)
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+      { tag = "title"; children = list(concat($eventInput.title, " · Aster Codex")) },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/workspace/sourcery-os/shared.css" } },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/aster-codex/markdown.css" } },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/workspace/sourcery-os/code-input.css" } }
+    ) },
+    { tag = "body"; children = list(
+      { tag = "main"; attrs = { id = "main"; class = concat("manager-panel manager-panes ", $layout); "data-aster-view" = $view }; children = list($content) }
+    ) }
+  ) }
+  call html.serialize
+  let page = $result
+  when $eventInput.detail.body:
+    port text.split { value = $page; pattern = $transcriptSlot } → parts
+    assert eq(count($parts), 2)
+      otherwise "Expected one serialized transcript slot"
+    let page = concat(at($parts, 0), $eventInput.detail.body, at($parts, 1))
+  let result = concat("<!doctype html>", $page)
+
+process asterCodex.article:
+  let message = $eventInput
+  let fragmentSlot = "SOURCERY-ASTER-RENDERED-MARKDOWN"
+  let fragments = map(filter($message.parts, "part", includes(list("markdown", "link", "preview"), $part.kind)), "part", $part.rendered)
+  let parts = map($message.parts, "part",
+    if(eq($part.kind, "markdown"), { tag = "div"; attrs = { class = "aster-markdown" }; children = list($fragmentSlot) },
+    if(eq($part.kind, "limit"), { tag = "p"; attrs = { class = "muted" }; children = list("This message exceeds the display limit.") },
+    if(eq($part.kind, "image"), { tag = "figure"; attrs = { class = "mobile-preparation" }; children = list(
+      { tag = "a"; attrs = { href = $part.href; target = "_blank"; rel = "noopener" }; children = list(
+        { tag = "img"; attrs = { src = $part.href; alt = "Open saved chat image"; loading = "lazy" } }
+      ) },
+      { tag = "figcaption"; attrs = { class = "muted" }; children = list(
+        { tag = "a"; attrs = { href = $part.href; target = "_blank"; rel = "noopener" }; children = list("Open image") }
+      ) }
+    ) },
+    if(eq($part.kind, "download"), { tag = "p"; children = list({ tag = "a"; attrs = { href = $part.href }; children = list("Download saved preview file") }) },
+    if(eq($part.kind, "local"), { tag = "details"; attrs = { class = "panel" }; children = list(
+      { tag = "summary"; children = list("Server-only preview") },
+      { tag = "p"; children = list({ tag = "code"; children = list($part.href) }) },
+      { tag = "p"; children = list("This address needs its original tunnel or an approved Sourcery route.") }
+    ) },
+    { tag = "p"; attrs = { class = if(eq($part.kind, "preview"), "panel", null) }; children = list($fragmentSlot) }))))))
+  let input = { tag = "article"; attrs = { class = concat("panel ", $message.class) }; children = list(
+    { tag = "header"; children = list(
+      { tag = "strong"; children = list({ tag = "code"; children = list($message.label) }) }, " ",
+      { tag = "small"; children = list({ tag = "code"; children = list("· ",
+        if($message.time, { tag = "time"; attrs = { datetime = $message.time.dateTime }; children = list($message.time.label) }, null)
+      ) }) }
+    ) },
+    $parts
+  ) }
+  call html.serialize
+  port text.split { value = $result; pattern = $fragmentSlot } → serializedParts
+  assert eq(count($serializedParts), add(count($fragments), 1))
+    otherwise "Expected a slot for each rendered Markdown fragment"
+  fold $fragments as fragment; joined starts { index = 0; text = at($serializedParts, 0) }:
+    let index = add($joined.index, 1)
+    yield { index = $index; text = concat($joined.text, $fragment, at($serializedParts, $index)) } → rendered
+  let result = if(count($fragments), $rendered.text, at($serializedParts, 0))
+
+process asterCodex.liveStatus:
+  let state = $eventInput.state
+  let labels = { running = "Running"; approval = "Waiting for approval"; input = "Waiting for input";
+    finished = "Finished"; stopped = "Stopped"; failed = "Failed"; idle = "Idle";
+    unavailable = "Live status unavailable"; busy = "Live viewer busy";
+    requested = "Stop requested"; stale = "This turn is no longer active" }
+  let label = at($labels, $state)
+  let input = { tag = "p"; attrs = { role = "status" }; children = list(
+    { tag = "strong"; children = list({ tag = "code"; children = list($label) }) }
+  ) }
+  call html.serialize
+
+process asterCodex.stopForm:
+  let result = if($eventInput.turn, { tag = "form"; attrs = { action = "/aster-codex/stop"; method = "post" }; children = list(
+    { tag = "input"; attrs = { type = "hidden"; name = "id"; value = $eventInput.chat } },
+    { tag = "input"; attrs = { type = "hidden"; name = "turn"; value = $eventInput.turn } },
+    { tag = "button"; attrs = { class = "button"; type = "submit"; "aria-label" = "Stop this turn" }; children = list("Stop") }
+  ) }, null)
+
+process asterCodex.liveDocument:
+  let streamSlot = "SOURCERY-ASTER-LIVE-OUTPUT"
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+      { tag = "title"; children = list("Codex live activity") },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/workspace/sourcery-os/shared.css" } }
+    ) },
+    { tag = "body"; children = list(
+      { tag = "main"; attrs = { class = "manager-panel manager-panes manager-single-pane" }; children = list(
+        { tag = "div"; attrs = { class = "desktop-scroll-pane manager-main dialog-body" }; children = list(
+          if($eventInput.heading, { tag = "h3"; children = list({ tag = "code"; children = list("Live activity") }) }, null),
+          $streamSlot
+        ) }
+      ) }
+    ) }
+  ) }
+  call html.serialize
+  port text.split { value = $result; pattern = $streamSlot } → parts
+  assert eq(count($parts), 2)
+    otherwise "Expected one live output slot"
+  let result = { head = concat("<!doctype html>", at($parts, 0)); tail = at($parts, 1) }
+
+process asterCodex.liveText:
+  let streamSlot = "SOURCERY-ASTER-LIVE-TEXT"
+  let input = list(
+    { tag = "h3"; children = list({ tag = "code"; children = list("Codex") }) },
+    { tag = "pre"; children = list({ tag = "code"; children = list($streamSlot) }) }
+  )
+  call html.serialize
+  port text.split { value = $result; pattern = $streamSlot } → parts
+  assert eq(count($parts), 2)
+    otherwise "Expected one live text slot"
+  let input = { tag = "p"; children = list("Live text limit reached. Refresh the saved transcript.") }
+  call html.serialize
+  let result = { open = at($parts, 0); close = at($parts, 1); limit = $result }
+
+process asterCodex.liveLink:
+  let input = { tag = "p"; children = list(
+    { tag = "a"; attrs = { class = "button"; href = $eventInput.href };
+      children = list(if($eventInput.newTurn, "Check again", "Reconnect")) }
+  ) }
+  call html.serialize
+
+process asterCodex.notice:
+  let input = { tag = "p"; children = list($eventInput) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)
+
+process asterCodex.statusDocument:
+  let state = $eventInput.state
+  let labels = { running = "Running"; approval = "Approval needed"; input = "Input needed";
+    finished = "Finished"; stopped = "Stopped"; failed = "Failed"; idle = "Idle";
+    unavailable = "Disconnected"; requested = "Stop requested"; stale = "Turn already ended" }
+  let label = at($labels, $state)
+  let marker = if(eq($state, "running"), { tag = "span"; attrs = { class = "running-dots"; "aria-hidden" = "true" }; children = list(".....") }, null)
+  let body = { tag = "p"; attrs = { role = "status"; "data-state" = $state }; children = list(
+    { tag = "span"; attrs = { class = "connection-dot"; "aria-hidden" = "true" } },
+    { tag = "code"; children = list($label) }, $marker
+  ) }
+  when $eventInput.control:
+    call asterCodex.stopForm
+    let body = if($eventInput.notice, { tag = "p"; attrs = { role = "status" }; children = list({ tag = "code"; children = list($label) }) }, $result)
+  let refresh = if($eventInput.returnUrl, concat("3;url=", $eventInput.returnUrl), "5")
+  let input = { tag = "html"; attrs = { lang = "en" }; children = list(
+    { tag = "head"; children = list(
+      { tag = "meta"; attrs = { charset = "utf-8" } },
+      { tag = "meta"; attrs = { name = "viewport"; content = "width=device-width,initial-scale=1" } },
+      { tag = "meta"; attrs = { "http-equiv" = "refresh"; content = $refresh } },
+      { tag = "title"; children = list("Codex status") },
+      { tag = "link"; attrs = { rel = "stylesheet"; href = "/workspace/sourcery-os/shared.css" } }
+    ) },
+    { tag = "body"; attrs = { id = "aster-status-document" }; children = list($body) }
+  ) }
+  call html.serialize
+  let result = concat("<!doctype html>", $result)
+
+process asterCodex.markdownLink:
+  let link = $eventInput
+  let fragmentSlot = "SOURCERY-ASTER-MARKDOWN-LABEL"
+  let input = list(
+    { tag = "a"; attrs = { class = "aster-markdown-link"; href = $link.href; target = "_blank"; rel = "noopener noreferrer"; referrerpolicy = "no-referrer" }; children = list($fragmentSlot) },
+    { tag = "span"; attrs = { class = "aster-link-address"; "aria-hidden" = "true" }; children = list($link.href) },
+    { tag = "button"; attrs = { type = "button"; class = "button aster-touch-address"; popovertarget = $link.id; "aria-controls" = $link.id; "aria-label" = "Show link address" }; children = list("Address") },
+    { tag = "span"; attrs = { class = "document-menu-panel aster-address-popover"; id = $link.id; popover = "auto" }; children = list(
+      { tag = "code"; children = list($link.href) }
+    ) }
+  )
+  call asterCodex.markdownBoundary
+
+process asterCodex.markdownBoundary:
+  call html.serialize
+  port text.split { value = $result; pattern = $fragmentSlot } → parts
+  assert eq(count($parts), 2)
+    otherwise "Expected one Markdown content slot"
+  let result = { open = at($parts, 0); close = at($parts, 1) }
+
+process asterCodex.markdownTable:
+  let fragmentSlot = "SOURCERY-ASTER-MARKDOWN-CELLS"
+  let definitions = list(
+    { key = "table"; node = { tag = "div"; attrs = { class = "aster-markdown-table"; tabindex = "0"; role = "region"; "aria-label" = "Markdown table" }; children = list(
+      { tag = "table"; attrs = { class = "sourcery-data-table"; "data-table-layout" = "grid" }; children = list($fragmentSlot) }
+    ) } },
+    { key = "header"; node = { tag = "thead"; children = list({ tag = "tr"; children = list($fragmentSlot) }) } },
+    { key = "body"; node = { tag = "tbody"; children = list($fragmentSlot) } },
+    { key = "row"; node = { tag = "tr"; children = list($fragmentSlot) } }
+  )
+  fold $definitions as definition; boundaries starts { }:
+    let input = $definition.node
+    call asterCodex.markdownBoundary
+    port record.put { record = $boundaries; key = $definition.key; value = $result } → next
+    yield $next → boundaries
+  fold list("left", "center", "right") as alignment; cells starts $boundaries:
+    let input = { tag = "th"; attrs = { scope = "col"; "data-align" = $alignment }; children = list($fragmentSlot) }
+    call asterCodex.markdownBoundary
+    port record.put { record = $cells; key = concat("th-", $alignment); value = $result } → headers
+    let input = { tag = "td"; attrs = { "data-align" = $alignment }; children = list($fragmentSlot) }
+    call asterCodex.markdownBoundary
+    port record.put { record = $headers; key = concat("td-", $alignment); value = $result } → next
+    yield $next → result
+
+process asterCodex.markdownStyles:
+  let cssRuleSeparator = ""
+  let cssRules = list(
+    { selector = ".aster-chat-badge"; declarations = list(
+      { property = "display"; value = "inline-block" },
+      { property = "margin-inline-start"; value = "6px" },
+      { property = "padding"; value = "1px 4px" },
+      { property = "font"; value = "bold 10px monospace" },
+      { property = "white-space"; value = "nowrap" },
+      { property = "border"; value = "1px solid currentColor" }
+    ) },
+    { selector = ".aster-chat-badge[data-badge=running]"; declarations = list(
+      { property = "color"; value = "var(--sourcery-success-ink,#285c37)" },
+      { property = "background"; value = "var(--sourcery-success-paper,#e6f2e6)" }
+    ) },
+    { selector = ".aster-chat-badge[data-badge=running]>span"; declarations = list(
+      { property = "animation"; value = "aster-badge-pulse 1.6s ease-in-out infinite" }
+    ) },
+    { selector = ".aster-chat-badge[data-badge=finished]"; declarations = list(
+      { property = "color"; value = "var(--sourcery-info-ink,#39508d)" },
+      { property = "background"; value = "var(--sourcery-info-paper,#eef2ff)" }
+    ) },
+    { selector = ".aster-unread"; declarations = list(
+      { property = "margin-block"; value = "4px" },
+      { property = "padding"; value = "3px 5px" },
+      { property = "background"; value = "var(--sourcery-info-paper,#eef2ff)" },
+      { property = "border-inline-start"; value = "2px solid var(--sourcery-info-ink,#39508d)" }
+    ) },
+    { selector = ".aster-unread>summary"; declarations = list(
+      { property = "cursor"; value = "pointer" },
+      { property = "font-weight"; value = "bold" }
+    ) },
+    { selector = ".aster-unread a"; declarations = list(
+      { property = "display"; value = "inline-block" },
+      { property = "padding"; value = "3px 0" }
+    ) },
+    { atRule = "keyframes"; prelude = " aster-badge-pulse"; rules = list(
+      { selector = "50%"; declarations = list(
+        { property = "opacity"; value = ".4" }
+      ) }
+    ) },
+    { atRule = "media"; prelude = "(prefers-reduced-motion:reduce)"; rules = list(
+      { selector = ".aster-chat-badge[data-badge=running]>span"; declarations = list(
+        { property = "animation"; value = "none" }
+      ) }
+    ) },
+    { selector = ".aster-markdown"; declarations = list(
+      { property = "font-family"; value = "monospace" },
+      { property = "overflow-wrap"; value = "anywhere" }
+    ) },
+    { selector = ".aster-markdown>:first-child"; declarations = list(
+      { property = "margin-block-start"; value = "0" }
+    ) },
+    { selector = ".aster-markdown>:last-child"; declarations = list(
+      { property = "margin-block-end"; value = "0" }
+    ) },
+    { selector = ".aster-markdown pre"; declarations = list(
+      { property = "box-sizing"; value = "border-box" },
+      { property = "max-inline-size"; value = "100%" },
+      { property = "overflow"; value = "auto" },
+      { property = "white-space"; value = "pre" },
+      { property = "padding"; value = "6px" },
+      { property = "background"; value = "var(--sourcery-panel)" }
+    ) },
+    { selector = ".aster-markdown blockquote"; declarations = list(
+      { property = "margin-inline"; value = "0" },
+      { property = "padding-inline-start"; value = "8px" },
+      { property = "border-inline-start"; value = "2px solid var(--sourcery-line)" }
+    ) },
+    { selector = ".aster-markdown-table"; declarations = list(
+      { property = "max-inline-size"; value = "100%" },
+      { property = "overflow"; value = "auto" }
+    ) },
+    { selector = ".aster-markdown-table table"; declarations = list(
+      { property = "min-inline-size"; value = "12rem" }
+    ) },
+    { selector = ".aster-markdown-table .sourcery-data-table [data-align=right]"; declarations = list(
+      { property = "text-align"; value = "end" }
+    ) },
+    { selector = ".aster-markdown-table .sourcery-data-table [data-align=center]"; declarations = list(
+      { property = "text-align"; value = "center" }
+    ) },
+    { selector = "a.aster-markdown-link"; declarations = list(
+      { property = "color"; value = "var(--sourcery-accent,#080c62)" },
+      { property = "text-decoration"; value = "underline" },
+      { property = "text-underline-offset"; value = ".16em" }
+    ) },
+    { selector = ".aster-link-address"; declarations = list(
+      { property = "display"; value = "none" },
+      { property = "overflow-wrap"; value = "anywhere" },
+      { property = "background"; value = "var(--sourcery-info-paper)" },
+      { property = "color"; value = "var(--sourcery-info-ink)" },
+      { property = "padding-inline"; value = "4px" },
+      { property = "margin-inline-start"; value = "4px" },
+      { property = "font"; value = "inherit" }
+    ) },
+    { selector = ".aster-markdown-link:focus-visible+.aster-link-address"; declarations = list(
+      { property = "display"; value = "inline" }
+    ) },
+    { atRule = "media"; prelude = "(hover:hover)"; rules = list(
+      { selector = ".aster-markdown-link:hover+.aster-link-address"; declarations = list(
+        { property = "display"; value = "inline" }
+      ) }
+    ) },
+    { selector = "#chat-messages button.aster-touch-address"; declarations = list(
+      { property = "display"; value = "none" },
+      { property = "margin-inline-start"; value = "4px" }
+    ) },
+    { selector = ".aster-address-popover"; declarations = list(
+      { property = "white-space"; value = "normal" },
+      { property = "overflow-wrap"; value = "anywhere" },
+      { property = "padding"; value = "6px" }
+    ) },
+    { atRule = "media"; prelude = "(pointer:coarse)"; rules = list(
+      { selector = "#chat-messages button.aster-touch-address"; declarations = list(
+        { property = "display"; value = "inline-block" }
+      ) }
+    ) }
+  )
+  call css.renderCompactRules

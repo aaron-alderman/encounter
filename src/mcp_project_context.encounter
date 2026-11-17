@@ -1,0 +1,47 @@
+process-module "temple/surface-process-module/1"
+
+process mcpProjectContext.issue:
+  let input = $eventInput
+  let access = $input.access
+  assert and(eq($access.protocol, "sourcery-hosted-mcp-workspace-access/1"), includes($access.scopes, "authoring.read"))
+    otherwise "Opening a project requires current hosted authoring read access."
+  port digest.sha256 { text = $access.clientId } → clientIdHash
+  let scope = $access.scope
+  let result = { protocol = "sourcery.hosted/mcp-project-context.v1";
+    userId = $access.principal.userId; clientIdHash = $clientIdHash; familyId = $access.familyId;
+    tenantId = $scope.tenantId; appId = $scope.appId; projectId = $scope.projectId; workspaceId = $scope.workspaceId;
+    expiresAt = add($input.nowMs, 2592000000) }
+
+process mcpProjectContext.coordinates:
+  let input = $eventInput
+  let claims = $input.claims
+  port value.describe { value = $claims } → shape
+  assert $shape.plain
+    otherwise "Invalid hosted MCP project context."
+  port record.entries { value = $claims } → entries
+  assert and(eq(count($entries), 9), eq($claims.protocol, "sourcery.hosted/mcp-project-context.v1"))
+    otherwise "Invalid hosted MCP project context."
+  port number.isNatural { value = $claims.expiresAt } → integer
+  port number.calculate { operation = "greater"; values = list($claims.expiresAt, $input.nowMs) } → current
+  port number.calculate { operation = "lessEqual"; values = list($claims.expiresAt, 9007199254740991) } → bounded
+  assert and($integer, $current, $bounded)
+    otherwise "The hosted MCP project context has expired or has an invalid expiry."
+  let scope = list($claims.tenantId, $claims.appId, $claims.projectId, $claims.workspaceId)
+  each append($scope, list($claims.userId, $claims.clientIdHash, $claims.familyId)) as identity:
+    port value.describe { value = $identity } → identityShape
+    assert and(eq($identityShape.type, "string"), $identity)
+      otherwise "Invalid hosted MCP project context identity."
+  let result = $scope
+
+process mcpProjectContext.verify:
+  let input = $eventInput
+  call mcpProjectContext.coordinates
+  let claims = $input.claims
+  let access = $input.access
+  let scope = $access.scope
+  port digest.sha256 { text = $access.clientId } → clientIdHash
+  assert and(eq($access.protocol, "sourcery-hosted-mcp-workspace-access/1"),
+    eq($claims.userId, $access.principal.userId), eq($claims.clientIdHash, $clientIdHash), eq($claims.familyId, $access.familyId),
+    eq($result, list($scope.tenantId, $scope.appId, $scope.projectId, $scope.workspaceId)))
+    otherwise "The hosted MCP project context belongs to a different connection."
+  let result = $access

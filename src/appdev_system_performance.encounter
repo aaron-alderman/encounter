@@ -1,0 +1,206 @@
+process-module "temple/surface-process-module/1"
+
+process performance.spec:
+  let facts = $input.policy
+  let subject = "policy"
+  let property = "contract"
+  call assurance.fact
+  let contract = "encounter/appdev-system-performance/1"
+  let scope = "disposable AppDev browser fixture"
+  assert eq($result, $contract)
+    otherwise "Unsupported AppDev system performance policy."
+  let property = "journeySamples"
+  call performance.policyInteger
+  let journeyCount = $result
+  port number.calculate { operation = "greaterEqual"; values = list($journeyCount, 3) } → minimum
+  port number.calculate { operation = "lessEqual"; values = list($journeyCount, 10) } → maximum
+  assert and($minimum, $maximum)
+    otherwise "Invalid AppDev journey sample count."
+  let header = list(list("system-performance", "contract", $contract),
+    list("system-performance", "releaseSha256", $input.releaseSha256),
+    list("system-performance", "scope", $scope))
+  let subject = "work.startup"
+  let property = "maximumExchanges"
+  call performance.policyInteger
+  let metrics = list(list("home.desktop.launch", 1440), list("home.mobile.launch", 390),
+    list("work.startup"), list("shop.homeToShopMs", "shop", "homeToShopMs"),
+    list("shop.requestMs", "shop", "requestMs"), list("shop.reopenMs", "shop", "reopenMs"),
+    list("formation.importMs", "formation", "importMs"), list("formation.workReopenMs", "formation", "workReopenMs"),
+    list("formation.offlineReopenMs", "formation", "offlineReopenMs"), list("formation.receiptMs", "formation", "receiptMs"))
+  let budgets = filter($facts, "fact", eq(at($fact, 1), "maximumMs"))
+  assert eq(count($budgets), count($metrics))
+    otherwise "Unexpected AppDev performance budget set."
+  let result = { journeyCount = $journeyCount; header = $header; exchangeBudget = $result;
+    metrics = $metrics; workDelays = list(100, 200) }
+
+process performance.author:
+  let input = $eventInput
+  call performance.rows
+
+process performance.rows:
+  call performance.spec
+  let spec = $result
+  let facts = $input.policy
+  assert eq(count($input.journeys), $spec.journeyCount)
+    otherwise "Invalid AppDev journey sample count."
+  let home = $input.home
+  assert and(eq($home.scope, "fixture"), eq($home.passed, true), eq(count($home.results), 2))
+    otherwise "Invalid Home launch evidence."
+  let work = $input.work
+  assert and(eq($work.scope, "encounter-work-startup"), eq($work.passed, true), eq(count($work.samples), count($spec.workDelays)))
+    otherwise "Invalid Work startup evidence."
+  let exchangeBudget = $spec.exchangeBudget
+  fold $spec.workDelays as delay; workRows starts $spec.header:
+    let index = if(eq($delay, 100), 0, 1)
+    let sample = at($work.samples, $index)
+    assert eq($sample.delayMs, $delay)
+      otherwise "Invalid Work startup delay."
+    let value = $sample.exchanges
+    call performance.observedInteger
+    port number.calculate { operation = "lessEqual"; values = list($value, $exchangeBudget) } → bounded
+    assert $bounded
+      otherwise "Work startup exceeded the exchange budget."
+    let subject = "performance.work.startup"
+    let sampleName = if(eq($index, 0), "sample1", "sample2")
+    let delayProperty = concat($sampleName, "DelayMs")
+    let exchangeProperty = concat($sampleName, "Exchanges")
+    port json.stringify { value = $delay } → delayText
+    port json.stringify { value = $value } → exchangeText
+    yield append($workRows, list(list($subject, $delayProperty, $delayText),
+      list($subject, $exchangeProperty, $exchangeText))) → workRows
+  fold $spec.metrics as metric; rows starts $workRows:
+    let subject = at($metric, 0)
+    let property = "maximumMs"
+    call performance.policyInteger
+    let budget = $result
+    port number.calculate { operation = "greater"; values = list($budget, 0) } → positive
+    assert $positive
+      otherwise "Expected a positive AppDev performance budget."
+    let subject = concat("performance.", $subject)
+    let width = at($metric, 1)
+    let isHome = includes(list(1440, 390), $width)
+    let values = list()
+    let stats = list()
+    when $isHome:
+      let matching = filter($home.results, "case", eq($case.viewport.width, $width))
+      let observed = at($matching, 0)
+      assert and(eq(count($matching), 1), eq($observed.failures, 0), eq($observed.revealMs.count, $observed.tested))
+        otherwise "Incomplete Home launch evidence."
+      let reveal = $observed.revealMs
+      let stats = list($reveal.count, $reveal.p50, $reveal.p95, $reveal.max)
+    when not($isHome):
+      when eq(count($metric), 1):
+        let first = at($work.samples, 0)
+        let second = at($work.samples, 1)
+        let values = list($first.openMs, $second.openMs)
+      when eq(count($metric), 3):
+        let journey = at($metric, 1)
+        let field = at($metric, 2)
+        fold $input.journeys as sample; measurements starts list():
+          yield append($measurements, list(at(at($sample, $journey), $field))) → values
+      call performance.summarize
+      let stats = $result
+    call performance.bounded
+    let properties = list("samples", "p50Ms", "p95Ms", "maxMs", "budgetMs")
+    let valuesToWrite = append($stats, list($budget))
+    fold $values as sample; indexed starts { index = 1; rows = $rows }:
+      port json.stringify { value = $indexed.index } → suffix
+      port json.stringify { value = $sample } → value
+      let rows = append($indexed.rows, list(list($subject, concat("sample", $suffix, "Ms"), $value)))
+      yield { index = add($indexed.index, 1); rows = $rows } → samples
+    fold $properties as property; indexed starts { index = 0; rows = $samples.rows }:
+      port json.stringify { value = at($valuesToWrite, $indexed.index) } → value
+      let rows = append($indexed.rows, list(list($subject, $property, $value)))
+      yield { index = add($indexed.index, 1); rows = $rows } → completed
+    yield $completed.rows → result
+
+process performance.policyInteger:
+  call assurance.fact
+  port text.matches { value = $result; pattern = "\\A(?:0|[1-9][0-9]*)\\z" } → decimal
+  assert $decimal
+    otherwise "Expected a decimal integer in AppDev performance facts."
+  port number.parse { value = $result } → value
+  call performance.observedInteger
+  let result = $value
+
+process performance.observedInteger:
+  port json.stringify { value = $value } → encoded
+  port text.matches { value = $encoded; pattern = "\\A(?:0|[1-9][0-9]*)\\z" } → decimal
+  port number.calculate { operation = "lessEqual"; values = list($value, 9007199254740991) } → safe
+  assert and($decimal, $safe)
+    otherwise "Expected a nonnegative safe integer in AppDev performance evidence."
+
+process performance.summarize:
+  let size = count($values)
+  assert $size
+    otherwise "Missing AppDev performance samples."
+  fold $values as value; checked starts true:
+    call performance.observedInteger
+    yield true → checked
+  port value.sort { values = $values; mode = "numeric" } → sorted
+  port number.calculate { operation = "multiply"; values = list($size, 0.5) } → halfway
+  port number.calculate { operation = "ceil"; values = list($halfway) } → middle
+  port number.calculate { operation = "multiply"; values = list($size, 0.95) } → nearEnd
+  port number.calculate { operation = "ceil"; values = list($nearEnd) } → upper
+  let result = list($size, at($sorted, add($middle, -1)), at($sorted, add($upper, -1)), at($sorted, add($size, -1)))
+
+process performance.bounded:
+  fold $stats as value; checked starts true:
+    call performance.observedInteger
+    yield true → checked
+  let size = at($stats, 0)
+  port number.calculate { operation = "greaterEqual"; values = list($size, 200) } → homeMinimum
+  port number.calculate { operation = "lessEqual"; values = list(at($stats, 1), at($stats, 2)) } → ordered50
+  port number.calculate { operation = "lessEqual"; values = list(at($stats, 2), at($stats, 3)) } → ordered95
+  port number.calculate { operation = "lessEqual"; values = list(at($stats, 3), $budget) } → withinBudget
+  assert and(if($isHome, $homeMinimum, eq($size, count($values))), $ordered50, $ordered95, $withinBudget)
+    otherwise "AppDev performance evidence exceeds a budget or has invalid statistics."
+
+process performance.require:
+  call performance.spec
+  let spec = $result
+  let saved = $input.saved
+  let facts = $saved
+  let homeMetrics = filter($spec.metrics, "metric", eq(count($metric), 2))
+  fold $homeMetrics as metric; homeRows starts list():
+    let subject = concat("performance.", at($metric, 0))
+    fold list("samples", "p50Ms", "p95Ms", "maxMs") as property; stats starts list():
+      call performance.policyInteger
+      yield append($stats, list($result)) → stats
+    let count = at($stats, 0)
+    yield append($homeRows, list({ viewport = { width = at($metric, 1) }; failures = 0; tested = $count;
+      revealMs = { count = $count; p50 = at($stats, 1); p95 = at($stats, 2); max = at($stats, 3) } })) → homeRows
+  let subject = "performance.work.startup"
+  fold list("sample1", "sample2") as sample; workRows starts list():
+    let property = concat($sample, "DelayMs")
+    call performance.policyInteger
+    let delay = $result
+    let property = concat($sample, "Exchanges")
+    call performance.policyInteger
+    let exchanges = $result
+    let property = concat($sample, "Ms")
+    call performance.policyInteger
+    yield append($workRows, list({ delayMs = $delay; exchanges = $exchanges; openMs = $result })) → workRows
+  let journeyMetrics = filter($spec.metrics, "metric", eq(count($metric), 3))
+  fold list(1, 2, 3, 4, 5, 6, 7, 8, 9, 10) as index; journeys starts list():
+    let rows = $journeys
+    when not(eq(count($journeys), $spec.journeyCount)):
+      let property = concat("sample", $index, "Ms")
+      fold $journeyMetrics as metric; journey starts { shop = {}; formation = {} }:
+        let subject = concat("performance.", at($metric, 0))
+        call performance.policyInteger
+        let group = at($metric, 1)
+        port record.put { record = at($journey, $group); key = at($metric, 2); value = $result } → values
+        port record.put { record = $journey; key = $group; value = $values } → result
+        yield $result → sample
+      let rows = append($journeys, list($sample))
+    yield $rows → journeys
+  let input = { policy = $input.policy; releaseSha256 = $input.releaseSha256;
+    home = { scope = "fixture"; passed = true; results = $homeRows };
+    work = { scope = "encounter-work-startup"; passed = true; samples = $workRows };
+    journeys = $journeys }
+  call performance.rows
+  let expected = $result
+  let facts = $saved
+  call assurance.requireRows
+  let result = true

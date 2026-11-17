@@ -1,0 +1,56 @@
+process-module "temple/surface-process-module/1"
+
+process mcpOAuthScope.snapshot:
+  let snapshot = $eventInput
+  let absent = and(eq($snapshot.schemaVersion, null), eq($snapshot.revision, null), eq($snapshot.documentRevision, null))
+  let present = and(eq($snapshot.schemaVersion, 1), eq($snapshot.revision, $snapshot.documentRevision))
+  assert and(eq($snapshot.protocol, "encounter/public-mcp-oauth-scope/1"),
+    or($absent, $present), isArray($snapshot.grants), isArray($snapshot.familyGrants))
+    otherwise "The public OAuth scope projection is missing or crossed."
+  let result = true
+
+process mcpOAuthScope.admit:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  port kernel.invoke { query = "mcpOAuthScope.snapshot"; input = $snapshot } → admitted
+  let contract = $input.contract
+  let scope = $contract.discoveryScope
+  assert and(eq($scope, "authoring.read"), eq(at($contract.scopeImplications, $scope), list()))
+    otherwise "The public OAuth scope contract exceeds the read lane."
+  let result = "unknown"
+  when count($snapshot.grants):
+    let result = "outside"
+  when eq(count($snapshot.grants), 1):
+    let grant = at($snapshot.grants, 0)
+    let valid = and(eq($grant.scopes, list($scope)), eq($grant.resource, $contract.resource))
+    when eq($grant.source, "refresh"):
+      fold $snapshot.familyGrants as member; consistent starts true:
+        yield and($consistent, eq($member.scopes, list($scope)), eq($member.resource, $contract.resource)) → consistent
+      let valid = and($valid, $grant.familyBound, count($snapshot.familyGrants), $consistent)
+    when $valid:
+      let result = "allow"
+
+process mcpOAuthExchange.lifetimes:
+  let lifetimes = $eventInput.lifetimes
+  port number.calculate { operation = "lessEqual"; values = list($lifetimes.accessTokenSeconds, 900) } → access
+  port number.calculate { operation = "lessEqual"; values = list($lifetimes.refreshTokenSeconds, 2592000) } → refresh
+  assert and($access, $refresh)
+    otherwise "Public OAuth token lifetimes exceed the write capability."
+  let result = $lifetimes
+
+process mcpOAuthExchange.plan:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  assert and(eq($snapshot.exchangeProtocol, "encounter/public-mcp-oauth-exchange/1"), isArray($snapshot.candidates))
+    otherwise "Public OAuth exchange projection is missing or crossed."
+  port kernel.invoke { query = "mcpOAuthScope.admit"; input = $input } → scope
+  let result = $scope
+  when eq($scope, "allow"):
+    let candidate = at($snapshot.candidates, 0)
+    port number.calculate { operation = "greater"; values = list(at($candidate, "expiresMs"), $input.nowMs) } → current
+    let result = "unknown"
+    when and(eq(count($snapshot.candidates), 1), eq($candidate.binding, true), $current,
+      or(eq($input.grant, "refresh_token"), not($candidate.used))):
+      let result = "exchange"
+  when not(eq($input.resource, $input.contract.resource)):
+    let result = "target"

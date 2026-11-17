@@ -1,0 +1,96 @@
+process-module "temple/surface-process-module/1"
+
+process mcpProjectPortfolio.definition:
+  let result = {
+    name = "sourcery_project"; title = "List or open a Sourcery project";
+    description = "List the projects currently authorized for this one MCP connection, or open an additive project context. Opening a project does not replace other open project contexts and does not require another OAuth login.";
+    inputSchema = { type = "object"; properties = {
+      action = { type = "string"; enum = list("list", "open") };
+      projectId = { type = "string"; minLength = 1; maxLength = 128 };
+      workspaceId = { type = "string"; minLength = 1; maxLength = 128 } }; additionalProperties = false };
+    annotations = { readOnlyHint = true; destructiveHint = false; idempotentHint = true; openWorldHint = false } }
+
+process mcpProjectPortfolio.request:
+  let request = $eventInput
+  assert and(eq($request.jsonrpc, "2.0"), eq($request.method, "tools/call"), eq($request.params.name, "sourcery_project"))
+    otherwise "Expected one sourcery_project MCP tool call."
+  port value.describe { value = $request.id } → id
+  assert includes(list("number", "string"), $id.type)
+    otherwise "Expected a project tool call with a JSON-RPC request ID."
+  let args = if($request.params.arguments, $request.params.arguments, {})
+  port value.describe { value = $args } → arguments
+  assert $arguments.plain
+    otherwise "Invalid sourcery_project arguments."
+  call mcpProjectPortfolio.definition
+  let schema = $result.inputSchema.properties
+  port record.entries { value = $args } → fields
+  each $fields as field:
+    assert at($schema, at($field, 0))
+      otherwise "Invalid sourcery_project arguments."
+  let action = if($args.action, $args.action, "list")
+  assert includes($schema.action.enum, $action)
+    otherwise "Expected sourcery_project list or open."
+  when eq($action, "list"):
+    assert not(count(filter($fields, "field", includes(list("projectId", "workspaceId"), at($field, 0)))))
+      otherwise "sourcery_project list accepts no project selection."
+  when eq($action, "open"):
+    port value.describe { value = $args.projectId } → project
+    port value.describe { value = $args.workspaceId } → workspace
+    assert and(eq($project.type, "string"), $args.projectId,
+      or(eq($workspace.type, "undefined"), and(eq($workspace.type, "string"), $args.workspaceId)))
+      otherwise "sourcery_project open requires projectId and accepts an optional workspaceId."
+  let result = { id = $request.id; action = $action; projectId = $args.projectId; workspaceId = $args.workspaceId }
+
+process mcpProjectPortfolio.authenticate:
+  let input = $eventInput
+  port kernel.invoke { query = "mcpWorkspaceAccess.authenticate"; input = $input } → auth
+  let required = $input.contract.toolScopes.sourcery_project
+  let result = { auth = $auth; read = and(eq($required, "authoring.read"), includes($auth.granted, $required)) }
+
+process mcpProjectPortfolio.select:
+  let input = $eventInput
+  let snapshot = $input.snapshot
+  let request = $input.request
+  let auth = $input.auth
+  let token = $auth.token
+  port kernel.invoke { query = "mcpWorkspaceAccess.inventory"; input = {
+    snapshot = $snapshot; tenantId = $token.tenantId; appId = $token.appId; allPortfolios = false } } → rows
+  fold $rows as row; projects starts list():
+    port kernel.invoke { query = "mcpWorkspaceAccess.roleScopes"; input = $row.role } → scopes
+    let labels = $row.labels
+    let project = { projectId = $row.projectId; workspaceId = $row.workspaceId;
+      tenant = if($labels.tenant, $labels.tenant, $row.tenantId); app = if($labels.app, $labels.app, $row.appId);
+      project = if($labels.project, $labels.project, $row.projectId); workspace = if($labels.workspace, $labels.workspace, $row.workspaceId);
+      role = $row.role; scopes = $scopes }
+    yield append($projects, list($project)) → projects
+  let result = { projects = $projects }
+  when eq($request.action, "open"):
+    let matches = filter($projects, "project", and(eq($project.projectId, $request.projectId),
+      or(not($request.workspaceId), eq($request.workspaceId, $project.workspaceId))))
+    let result = { denied = if(count($matches), "ambiguous", "unavailable") }
+    when eq(count($matches), 1):
+      let selected = at($matches, 0)
+      let scope = { tenantId = $token.tenantId; appId = $token.appId; projectId = $selected.projectId; workspaceId = $selected.workspaceId }
+      let access = { protocol = "sourcery-hosted-mcp-workspace-access/1"; principal = { kind = "user"; userId = $token.userId };
+        clientId = $token.clientId; familyId = $token.familyId; scope = $scope; scopes = filter($selected.scopes, "scope", includes($auth.granted, $scope)) }
+      let result = { project = $selected; access = $access }
+
+process mcpProjectPortfolio.reply:
+  let input = $eventInput
+  let selection = $input.selection
+  let connection = { mode = "one-authenticated-connection-multiple-project-contexts"; additive = true }
+  let protocol = "sourcery.hosted/mcp-project-portfolio.v1"
+  let text = ""
+  let structured = null
+  when eq($input.request.action, "list"):
+    let text = concat("Found ", count($selection.projects), " projects available to this MCP connection.")
+    let structured = { protocol = $protocol; operation = "list"; connection = $connection; projects = $selection.projects; nextCall = null }
+  when eq($input.request.action, "open"):
+    let project = $selection.project
+    let context = $input.projectContext
+    let text = concat("Opened ", $project.project, " as an additive project context on this MCP connection.")
+    let structured = { protocol = $protocol; operation = "open"; project = $project; projectContext = $context; connection = $connection;
+      nextCall = { tool = "sourcery_authoring_inbox"; args = { projectContext = $context };
+        effect = "inspect-the-selected-project-without-replacing-other-open-project-contexts" } }
+  let result = { jsonrpc = "2.0"; id = $input.request.id;
+    result = { content = list({ type = "text"; text = $text }); structuredContent = $structured; isError = false } }

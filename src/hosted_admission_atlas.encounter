@@ -1,0 +1,135 @@
+process-module "temple/surface-process-module/1"
+
+process admissionAtlas.hash:
+  port json.canonicalCompact { value = $eventInput } → encoded
+  port digest.sha256 { text = $encoded } → result
+
+process admissionAtlas.values:
+  let matches = filter($eventInput.facts, "fact", includes($eventInput.predicates, $fact.p))
+  let objects = distinct(map($matches, "fact", $fact.o))
+  port value.sort { values = $objects; mode = "locale" } → result
+
+process admissionAtlas.first:
+  let candidates = map($eventInput.predicates, "predicate",
+    at(at(filter($eventInput.facts, "fact", eq($fact.p, $predicate)), 0), "o"))
+  let result = or(at(filter($candidates, "candidate", $candidate), 0), null)
+
+process admissionAtlas.omission:
+  let facts = $eventInput.facts
+  port kernel.invoke { query = "admissionAtlas.first";
+    input = { facts = $facts; predicates = list("projection-omission-reason", "governed-omission-reason") } } → reason
+  let result = null
+  when $reason:
+    port kernel.invoke { query = "admissionAtlas.first";
+      input = { facts = $facts; predicates = list("projection-omission-authority", "governed-omission-authority") } } → authority
+    port kernel.invoke { query = "admissionAtlas.first";
+      input = { facts = $facts; predicates = list("projection-omission-review", "governed-omission-review") } } → review
+    port kernel.invoke { query = "admissionAtlas.first";
+      input = { facts = $facts; predicates = list("projection-omission-scope", "governed-omission-scope") } } → scope
+    let result = { subjectId = $eventInput.id; reason = $reason; authority = $authority; review = $review;
+      scope = or($scope, "canonical-projection") }
+
+process admissionAtlas.subject:
+  let id = $eventInput.id
+  let facts = $eventInput.facts
+  let facetPredicates = list(
+    list("type", list("catalogue-type", "isa", "type")),
+    list("capability", list("capability", "has-capability", "provides", "provides-capability", "supports-capability", "authoringGoal")),
+    list("problem", list("problem", "addresses", "addresses-problem", "solves", "goal")),
+    list("lifecycleStage", list("lifecycle-stage", "stage")),
+    list("plugin", list("plugin", "belongs-to-plugin", "provided-by-plugin", "sourcePlugin")),
+    list("audienceLens", list("audience", "audience-lens", "lens", "cohort")),
+    list("maturity", list("maturity", "status")),
+    list("projection", list("projection", "canonical-projection", "alternate-projection")))
+  fold $facetPredicates as facet; entries starts list():
+    port kernel.invoke { query = "admissionAtlas.values";
+      input = { facts = $facts; predicates = at($facet, 1) } } → values
+    yield append($entries, list(list(at($facet, 0), $values))) → entries
+  port record.fromEntries { entries = $entries } → facets
+  let relationTypes = list(
+    list("dependencies", list("depends-on", "dependency", "requires")),
+    list("implementations", list("implemented-by", "implements", "implementation")),
+    list("authority", list("authority", "authorized-by", "governed-by", "owned-by")),
+    list("deeperMechanisms", list("deeper-mechanism", "mechanism-under", "implemented-through")),
+    list("alternateProjections", list("alternate-projection", "projected-as", "projection")))
+  let edges = map($facts, "fact", let("match", at(filter($relationTypes, "relation", includes(at($relation, 1), $fact.p)), 0),
+    { direction = "out"; type = or(at($match, 0), "other"); predicate = $fact.p; source = $id; target = $fact.o }))
+  let outgoing = filter($edges, "edge", if(eq($edge.type, "other"), includes($eventInput.subjectIds, $edge.target), true))
+  port kernel.invoke { query = "admissionAtlas.first"; input = { facts = $facts; predicates = list("title", "name", "label") } } → title
+  port kernel.invoke { query = "admissionAtlas.first";
+    input = { facts = $facts; predicates = list("summary", "description", "doc", "meaning", "purpose") } } → summary
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = list("provenance", "source", "source-application", "origin") } } → provenance
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = append(at(at($relationTypes, 2), 1), list("maintainedBy", "owner")) } } → authority
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = list("evidence", "evidence-hash", "proof", "proof-goal", "proofGoal", "proof-key",
+      "proofKey", "proof-receipt", "receipt") } } → evidence
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = list("assurance", "assurance-status", "assuranceRole", "verification") } } → assurance
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = list("mechanism", "standard-mechanism", "operation", "authorFunction", "implementation",
+      "loweringKey", "renderer") } } → standard
+  port kernel.invoke { query = "admissionAtlas.values";
+    input = { facts = $facts; predicates = append(at(at($relationTypes, 3), 1), list("kernel", "kernelVersion", "runtime")) } } → deeper
+  port kernel.invoke { query = "admissionAtlas.omission"; input = { id = $id; facts = $facts } } → omission
+  let projection = null
+  when not($omission):
+    port text.base64url { value = $id } → coordinate
+    let projection = { kind = "standard-inspect-envelope"; coordinate = concat("system-atlas:subject:", $coordinate);
+      generatedFrom = "current-admitted-fact-corpus" }
+  port kernel.invoke { query = "admissionAtlas.hash"; input = $facts } → factHash
+  let result = { id = $id; title = or($title, $id); summary = $summary; types = $facets.type; facets = $facets;
+    maturity = or(at($facets.maturity, 0), null); provenance = $provenance; authority = $authority; evidence = $evidence;
+    assurance = $assurance; projections = $facets.projection; canonicalProjection = $projection; omission = $omission;
+    mechanisms = { standard = $standard; deeper = $deeper }; outgoing = $outgoing; factCount = count($facts); factHash = $factHash }
+
+process admissionAtlas.verify:
+  let input = $eventInput
+  let strings = map($input.coordinates, "row", {
+    s = concat(at($row, 0)); p = concat(at($row, 1)); o = concat(at($row, 2));
+    pol = if(eq(at($row, 3), "is-not"), "is-not", "is") })
+  port text.trimFields { values = $strings; fields = list("s", "p", "o") } → normalized
+  assert every($normalized, "fact", and($fact.s, $fact.p, $fact.o))
+    otherwise "System Atlas facts require nonempty subjects, predicates and objects."
+  port value.sortJson { values = $normalized } → allFacts
+  let positive = filter($allFacts, "fact", eq($fact.pol, "is"))
+  let negative = filter($allFacts, "fact", eq($fact.pol, "is-not"))
+  let positiveCoordinates = map($positive, "fact", concat($fact.s, "\u0000", $fact.p, "\u0000", $fact.o))
+  let negativeCoordinates = map($negative, "fact", concat($fact.s, "\u0000", $fact.p, "\u0000", $fact.o))
+  let conflicting = distinct(filter($negativeCoordinates, "coordinate", includes($positiveCoordinates, $coordinate)))
+  port value.sort { values = $conflicting; mode = "locale" } → contradictions
+  port value.groupTextPairs { entries = map($positive, "fact", list($fact.s, $fact)) } → groups
+  let subjectIds = map($groups, "group", at($group, 0))
+  fold $groups as group; subjects starts list():
+    port kernel.invoke { query = "admissionAtlas.subject";
+      input = { id = at($group, 0); facts = at($group, 1); subjectIds = $subjectIds } } → subject
+    yield append($subjects, list($subject)) → subjects
+  port kernel.invoke { query = "admissionAtlas.hash"; input = $allFacts } → corpusHash
+  port value.string { value = $input.application } → corpusId
+  let atlas = { protocol = "sourcery-system-atlas/1"; corpusId = $corpusId; artifactHash = null; corpusHash = $corpusHash;
+    factCount = count($allFacts); positiveFactCount = count($positive); negativeFactCount = count($negative);
+    subjectCount = count($subjects); subjects = $subjects; contradictions = $contradictions }
+  port kernel.invoke { query = "admissionAtlas.hash"; input = $atlas } → atlasHash
+  let reportSubjects = map($subjects, "subject", let("omission", $subject.omission,
+    let("governed", and(at($omission, "reason"), at($omission, "authority"), at($omission, "review"),
+      eq(at($omission, "scope"), "canonical-projection")),
+      let("projection", or($subject.canonicalProjection, count($subject.projections)),
+        { subjectId = $subject.id; passed = true; cataloguePlacement = not(not(count($subject.types)));
+          canonicalProjection = not(not($projection)); governedOmission = not(not($governed)); failures = list() }))))
+  assert every($reportSubjects, "subject", and($subject.cataloguePlacement, or($subject.canonicalProjection, $subject.governedOmission)))
+    otherwise "System Atlas admission conformance failed for a missing catalogue placement or projection."
+  assert every($subjects, "subject", or(not($subject.omission), and(
+    at($subject.omission, "reason"), at($subject.omission, "authority"), at($subject.omission, "review"),
+    eq(at($subject.omission, "scope"), "canonical-projection"))))
+    otherwise "System Atlas admission conformance failed for an incomplete governed omission."
+  let report = { protocol = "sourcery-system-atlas-conformance/1"; atlasHash = $atlasHash;
+    criteria = { cataloguePlacement = "at-least-one-explicit-catalogue-type-or-runtime-type";
+      visibility = "at-least-one-canonical-or-alternate-projection-or-complete-positive-governed-omission";
+      governedOmission = "scope-reason-authority-and-review-required" };
+    status = "passed"; subjectCount = count($subjects); passedCount = count($subjects); failedCount = 0; subjects = $reportSubjects }
+  port kernel.invoke { query = "admissionAtlas.hash"; input = $report } → reportHash
+  assert and(eq($input.report.corpusHash, $corpusHash), eq($input.report.atlasHash, $atlasHash),
+    eq($input.report.reportHash, $reportHash))
+    otherwise "The retained System Atlas conformance hashes do not match the admitted corpus."
+  let result = true

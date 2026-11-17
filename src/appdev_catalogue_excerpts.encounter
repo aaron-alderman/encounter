@@ -1,0 +1,75 @@
+process-module "temple/surface-process-module/1"
+
+process catalogueExcerpts.plan:
+  port text.matchAll { value = $eventInput;
+    pattern = "<!--[\\s\\S]*?-->|<(script|style)(?:\\s[^>]*)?>[\\s\\S]*?</\\1\\s*>|<[A-Za-z][A-Za-z0-9:-]*(?=\\s|/?>)(?:\"[^\"]*\"|'[^']*'|[^'\">])*>";
+    flags = "i" } → tags
+  fold $tags as tag; links starts {}:
+    let next = $links
+    port text.matches { value = $tag.text; pattern = "^<button(?=\\s|/?>)"; flags = "i" } → button
+    when $button:
+      port text.matchAll { value = $tag.text; pattern = "\\s([a-zA-Z0-9_:-]+)(?:\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+)))?" } → attrs
+      let catalogue = filter($attrs, "attr", includes(list("data-catalogue-process", "data-catalogue-file", "data-catalogue-source"), at($attr.groups, 0)))
+      let keys = map($catalogue, "attr", at($attr.groups, 0))
+      assert eq(count($keys), count(distinct($keys)))
+        otherwise "Catalogue button repeats a source attribute."
+      port record.fromEntries { entries = map($catalogue, "attr",
+        list(at($attr.groups, 0), or(at($attr.groups, 1), at($attr.groups, 2), at($attr.groups, 3)))) } → fields
+      let process = at($fields, "data-catalogue-process")
+      when $process:
+        port text.matches { value = $process; pattern = "^[A-Za-z][A-Za-z0-9_.-]{0,127}$" } → valid
+        assert $valid
+          otherwise "Invalid Catalogue process name."
+        let link = at($fields, "data-catalogue-source")
+        port text.match { value = or($link, "");
+          pattern = "^Platform/Releases/Home/spec/catalogue-source/((?:version-programme|browser-programme)/applications/(?:[A-Za-z0-9_-]+/)*([A-Za-z0-9_-]+[.]encounter))/([A-Za-z][A-Za-z0-9_.-]*[.]encounter)$" } → path
+        assert and($path, eq(at($path.groups, 1), at($fields, "data-catalogue-file")),
+          eq(at($path.groups, 2), concat($process, ".encounter")))
+          otherwise "Invalid Catalogue source path."
+        let source = at($path.groups, 0)
+        let target = concat($source, "/", $process, ".encounter")
+        port record.put { record = $links; key = $target; value = { source = $source; process = $process } } → next
+    yield $next → links
+  port record.entries { value = $links } → entries
+  assert count($entries)
+    otherwise "Home does not contain Catalogue process links."
+  port number.calculate { operation = "lessEqual"; values = list(count($entries), 256) } → bounded
+  assert $bounded
+    otherwise "Catalogue excerpt plan exceeded its file bound."
+  let result = $links
+
+process catalogueExcerpts.render:
+  let input = $eventInput
+  let breaks = "\\r\\n|[\\n\\r\\x0b\\x0c\\x1c-\\x1e\\x{85}\\x{2028}\\x{2029}]"
+  port text.replace { value = $input.source; pattern = concat("(?:", $breaks, ")\\z"); replacement = "" } → source
+  port text.split { value = $source; pattern = $breaks } → lines
+  let declaration = concat("process ", $input.process, ":")
+  let indices = range(count($lines))
+  let matches = filter($indices, "index", eq(at($lines, add($index, -1)), $declaration))
+  assert eq(count($matches), 1)
+    otherwise "Expected exactly one Catalogue process declaration."
+  let selected = at($matches, 0)
+  port number.calculate { operation = "lessEqual"; values = list($selected, 6) } → nearStart
+  let start = if($nearStart, 1, add($selected, -6))
+  port number.calculate { operation = "less"; values = list(count($lines), add($selected, 30)) } → nearEnd
+  let end = if($nearEnd, count($lines), add($selected, 30))
+  fold range(37) as trim; excerpt starts { start = $start; end = $end; text = null }:
+    let next = $excerpt
+    when not($excerpt.text):
+      port number.calculate { operation = "subtract"; values = list(add($excerpt.end, 1), $excerpt.start) } → count
+      let numbers = range($count)
+      port text.join { values = map($numbers, "index", at($lines, add(add($excerpt.start, $index), -2))); separator = "\n" } → linesText
+      let text = concat("# catalogue-source ", $excerpt.start, "\n", $linesText, "\n")
+      port text.utf8Length { value = $text } → bytes
+      port number.calculate { operation = "lessEqual"; values = list($bytes, 4096) } → fits
+      when $fits:
+        let next = { text = $text }
+      when not($fits):
+        assert not(and(eq($excerpt.start, $selected), eq($excerpt.end, $selected)))
+          otherwise "Catalogue process declaration exceeds the index limit."
+        let next = if(eq($excerpt.end, $selected), { start = add($excerpt.start, 1); end = $excerpt.end },
+          { start = $excerpt.start; end = add($excerpt.end, -1) })
+    yield $next → excerpt
+  assert $excerpt.text
+    otherwise "Catalogue process declaration exceeds the index limit."
+  let result = $excerpt.text

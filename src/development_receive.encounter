@@ -1,0 +1,102 @@
+process-module "temple/surface-process-module/1"
+
+process receive.update:
+  port text.match { value = $eventInput; pattern = "\\A([a-f0-9]{40}) ([a-f0-9]{40}) (refs/[^\\p{Cc}\\s]+)\\z" } → update
+  assert $update
+    otherwise "Invalid canonical Git receive record."
+  let ref = at($update.groups, 2)
+  let revision = at($update.groups, 1)
+  let result = { action = "ignore" }
+  when eq($ref, "refs/heads/codex/self-hosted-production"):
+    let result = if(eq($revision, "0000000000000000000000000000000000000000"), { action = "deleted" },
+      { action = "advance"; revision = $revision; ref = $ref })
+
+process receive.batch:
+  fold $eventInput as line; updates starts list():
+    port kernel.invoke { query = "receive.update"; input = $line } → update
+    let next = $updates
+    when not(eq($update.action, "ignore")):
+      let next = append($updates, list($update))
+    yield $next → updates
+  port number.calculate { operation = "lessEqual"; values = list(count($updates), 1) } → unique
+  assert $unique
+    otherwise "Development receive contains more than one update to the canonical branch."
+  let result = $updates
+
+process receive.configuration:
+  let names = list("core.repositoryformatversion", "core.filemode", "core.bare", "core.logallrefupdates", "core.sharedrepository",
+    "core.ignorecase", "core.precomposeunicode", "core.autocrlf", "receive.denynonfastforwards", "receive.denydeletes",
+    "remote.origin.url", "remote.origin.fetch", "user.name", "user.email")
+  each $eventInput as name:
+    port text.matches { value = $name; pattern = "\\Abranch\\.[A-Za-z0-9_./-]+\\.(?:remote|merge)\\z" } → branch
+    assert or(includes($names, $name), $branch)
+      otherwise "Git configuration contains a setting outside the development receive port."
+  let result = true
+
+process receive.historicalSource:
+  let input = $eventInput
+  port text.matches { value = $input.revision; pattern = "\\A[0-9a-f]{40}\\z" } → revision
+  port text.matches { value = $input.path; pattern = "\\A(?!/)(?!.*(?:^|/)[.]{1,2}(?:/|$))[^/\\x00-\\x1f\\x7f\\\\]+(?:/[^/\\x00-\\x1f\\x7f\\\\]+)*\\z" } → path
+  assert and($revision, $path)
+    otherwise "Expected an exact development commit and relative source path."
+  let result = concat($input.revision, ":", $input.path)
+
+process receive.repositoryStatus:
+  let input = $eventInput
+  let limit = 64
+  fold $input.paths as row; state starts { total = 0; items = list(); pending = null }:
+    let next = $state
+    when $state.pending:
+      assert $row
+        otherwise "Local repository porcelain status path is malformed."
+      port record.put { record = $state.pending; key = "originalPath"; value = $row } → change
+      let items = if($state.total, $state.items, list())
+      port number.calculate { operation = "lessEqual"; values = list($state.total, $limit) } → retained
+      let next = { total = $state.total; items = if($retained, append($items, list($change)), $items); pending = null }
+    when and(not($state.pending), $row):
+      port text.matches { value = $row; pattern = "\\A.. [\\s\\S]+\\z" } → valid
+      assert $valid
+        otherwise "Local repository porcelain status is malformed."
+      port text.slice { value = $row; start = 0; end = 2 } → code
+      port text.slice { value = $row; start = 3 } → path
+      port text.matches { value = $code; pattern = "[RC]" } → renamed
+      let change = { code = $code; kind = if(eq($code, "??"), "untracked", "tracked"); path = $path }
+      port number.calculate { operation = "add"; values = list($state.total, 1) } → total
+      port number.calculate { operation = "lessEqual"; values = list($total, $limit) } → retained
+      let next = { total = $total; items = if(and($retained, not($renamed)), append($state.items, list($change)), $state.items);
+        pending = if($renamed, $change, null) }
+    yield $next → observed
+  assert not($observed.pending)
+    otherwise "Local repository porcelain status path is malformed."
+  let clean = eq($observed.total, 0)
+  port number.calculate { operation = "greater"; values = list($observed.total, $limit) } → truncated
+  let syncStatus = if(not($input.upstream), "no-upstream", if(not($clean), "dirty",
+    if(and($input.ahead, $input.behind), "diverged", if($input.ahead, "ahead", if($input.behind, "behind", "aligned")))))
+  let result = { available = true; head = $input.head; branch = if($input.branch, $input.branch, null);
+    upstream = if($input.upstream, $input.upstream, null); ahead = $input.ahead; behind = $input.behind;
+    clean = $clean; changedPaths = $observed.total; changes = { total = $observed.total; items = $observed.items;
+      limit = $limit; truncated = $truncated }; syncStatus = $syncStatus; automaticAdvanceReady = eq($syncStatus, "aligned") }
+
+process receive.admit:
+  let state = $eventInput
+  assert eq($state.branch, $state.ref)
+    otherwise "Development checkout is on the wrong branch."
+  assert $state.clean
+    otherwise "Development checkout is dirty."
+  assert eq($state.canonical, $state.revision)
+    otherwise "The receive record no longer matches the canonical branch."
+  assert $state.ancestor
+    otherwise "Canonical update is not a fast-forward of the development checkout."
+  let result = if(eq($state.current, $state.revision), "current", "import")
+
+process receive.merge:
+  let state = $eventInput
+  assert and(eq($state.branch, $state.ref), $state.clean, eq($state.current, $state.previous),
+    eq($state.canonical, $state.revision), eq($state.imported, $state.revision))
+    otherwise "Development checkout or canonical release changed before fast-forward."
+  let result = "merge"
+
+process receive.complete:
+  assert and(eq($eventInput.branch, $eventInput.ref), $eventInput.clean, eq($eventInput.current, $eventInput.revision))
+    otherwise "Development checkout did not verify at the received revision."
+  let result = true

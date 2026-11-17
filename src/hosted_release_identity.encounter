@@ -1,0 +1,317 @@
+process-module "temple/surface-process-module/1"
+
+process hostedRelease.entry:
+  let entry = $eventInput
+  let result = "skip"
+  when and(not($entry.state), eq($entry.kind, "directory")):
+    let omitted = if($entry.temple, list(".pnpm-store", "node_modules"), list(".git", ".temple2", "node_modules"))
+    when not(includes($omitted, $entry.name)):
+      let result = "directory"
+  when not($entry.state):
+    let extensions = list("bash", "cjs", "css", "cts", "encounter", "html", "js", "json", "mjs", "mts",
+      "node", "py", "rel", "sh", "sql", "ts", "wasm")
+    let admitted = or($entry.inventory, eq($entry.path, "encounter"), includes($extensions, $entry.extension))
+    when and(eq($entry.kind, "file"), or($entry.temple, $admitted)):
+      let result = "file"
+    when and(not($entry.temple), eq($entry.kind, "other"), $admitted):
+      let result = "reject"
+
+process hostedRelease.executionCandidate:
+  let input = $eventInput
+  let result = null
+  when or($input.shebang, $input.executable, includes(list("bash", "sh", "py", "js", "mjs", "cjs", "ts", "mts", "cts", "node", "wasm", "encounter"), $input.extension)):
+    let kind = if($input.shebang, "shebang", if($input.elf, "elf", if($input.extension, $input.extension, "executable")))
+    let result = { path = $input.path; kind = $kind; executable = $input.executable }
+
+process hostedRelease.freezeSchema:
+  let schema = $eventInput
+  assert and(eq($schema.version, 2), eq($schema.package, "@temple2/platform-sdk"), $schema.lockfiles,
+    $schema.components, $schema.componentFiles, $schema.runtime, $schema.totals)
+    otherwise "Temple FREEZE.json does not match the supported production freeze schema."
+  let result = true
+
+process hostedRelease.freezeRecord:
+  let record = $eventInput
+  port text.matches { value = $record.path; pattern = "\\A[^/\\\\\\p{Cc}]+(?:/[^/\\\\\\p{Cc}]+)*\\z" } → path
+  port text.matches { value = $record.path; pattern = "(?:\\A|/)\\.{1,2}(?:/|\\z)" } → traversal
+  port text.matches { value = $record.sha256; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+  port number.calculate { operation = "lessEqual"; values = list($record.bytes, 9007199254740991) } → bytes
+  assert and($path, not($traversal), $hash, $bytes, $record.unsigned)
+    otherwise "Temple FREEZE.json contains an invalid file record."
+  assert $record.consistent
+    otherwise "Temple FREEZE.json contains conflicting file records."
+  let result = true
+
+process hostedRelease.freezeTotals:
+  let totals = $eventInput
+  assert $totals.observed.files
+    otherwise "Temple FREEZE.json contains no frozen files."
+  assert and(eq($totals.declared.components, $totals.observed.components), eq($totals.declared.componentFiles, $totals.observed.componentFiles),
+    eq($totals.declared.platformRuntimeFiles, $totals.observed.platformRuntimeFiles), eq($totals.declared.files, $totals.observed.files),
+    eq($totals.declared.bytes, $totals.observed.bytes))
+    otherwise "Temple FREEZE.json totals do not match its exact frozen file records."
+  let result = true
+
+process hostedRelease.freezeFile:
+  let result = and(eq($eventInput.declaredBytes, $eventInput.observedBytes), eq($eventInput.declaredSha256, $eventInput.observedSha256))
+
+process hostedRelease.pin:
+  port text.matches { value = $eventInput; pattern = "\\A[a-f0-9]{64}\\z" } → hash
+  assert $hash
+    otherwise "Hosted release requires an expected lowercase SHA-256 hash."
+  let result = true
+
+process hostedRelease.generation:
+  let input = $eventInput
+  port text.matches { value = $input.sourceTreeHash; pattern = "\\A[a-f0-9]{64}\\z" } → source
+  port text.matches { value = $input.releasePointerHash; pattern = "\\A[a-f0-9]{64}\\z" } → release
+  assert and($source, $release)
+    otherwise "Hosted production generation identity requires exact source and release hashes."
+  let identity = { protocol = "sourcery.hosted/production-generation-identity.v1";
+    releasePointerHash = $input.releasePointerHash; sourceTreeHash = $input.sourceTreeHash }
+  port json.stringify { value = $identity } → encoded
+  port digest.sha256 { text = $encoded } → hash
+  port record.put { record = $identity; key = "generationHash"; value = $hash } → result
+
+process hostedRelease.childEndpoint:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.sourceTreeHash } → source
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.releasePointerHash } → release
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.generationHash } → generation
+  port number.calculate { operation = "lessEqual"; values = list($input.timeoutMs, 300000) } → bounded
+  assert and($input.timeoutMs, $bounded)
+    otherwise "Hosted readiness requires a bounded startup timeout."
+  let result = and(includes(list("127.0.0.1", "::1"), $input.host), eq($input.host, $input.expectedHost),
+    $input.port, eq($input.endpointGenerationHash, $input.generationHash))
+
+process hostedRelease.childLaunch:
+  let input = $eventInput
+  let expected = $input.identity
+  port kernel.invoke { query = "hostedRelease.generation"; input = $expected } → identity
+  assert eq($expected, $identity)
+    otherwise "A supervised child requires its exact production generation identity."
+  assert includes(list("127.0.0.1", "::1", "localhost"), $input.bindHost)
+    otherwise "A supervised child requires a loopback supervisor."
+  let host = if(eq($input.bindHost, "::1"), "::1", "127.0.0.1")
+  let result = { profile = "production"; host = $host; port = "0"; identity = $identity;
+    omitEnvironment = list("NODE_OPTIONS", "NODE_PATH", "NODE_V8_COVERAGE", "NODE_COMPILE_CACHE",
+      "NODE_REDIRECT_WARNINGS", "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT",
+      "SOURCERY_SELF_HOSTED_INFRASTRUCTURE_CONFIG") }
+
+process hostedRelease.childRuntime:
+  let input = $eventInput
+  let expected = $input.expected
+  let observed = $input.observed
+  assert and(eq(at($observed, "runtimeVersion"), $expected.runtimeVersion), eq(at($observed, "abi"), $expected.abi),
+    eq(at($observed, "os"), $expected.os), eq(at($observed, "architecture"), $expected.architecture))
+    otherwise "Hosted worker runtime version, ABI, or platform differs from the sealed dependency target."
+  let result = true
+
+process hostedRelease.childPrepared:
+  let input = $eventInput
+  assert eq($input.observed.generationHash, $input.expectedHash)
+    otherwise "Hosted production child prepared a different generation"
+  port kernel.invoke { query = "hostedRelease.childRuntime";
+    input = { expected = $input.platform; observed = $input.observed.runtime } } → result
+
+process hostedRelease.childExecutable:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.expected } → pinned
+  assert eq($input.expected, $input.observed)
+    otherwise "Hosted worker executable differs from the configured runtime SHA-256."
+  let result = true
+
+process hostedRelease.childBasis:
+  let input = $eventInput
+  port text.matches { value = $input.marker; pattern = "\\A[A-Za-z0-9_-]{43}\\z" } → marker
+  assert and(eq($input.ipc, true), $marker, eq($input.profile, "production"), eq($input.port, "0"),
+    includes(list("127.0.0.1", "::1"), $input.host))
+    otherwise "The hosted generation is internal to encounter hosted-production-supervisor; direct and development-profile startup is refused."
+  let expected = { protocol = "sourcery.hosted/production-generation-identity.v1";
+    sourceTreeHash = $input.sourceTreeHash; releasePointerHash = $input.releasePointerHash; generationHash = $input.generationHash }
+  port kernel.invoke { query = "hostedRelease.generation"; input = $expected } → identity
+  assert eq($expected, $identity)
+    otherwise "Production generation requires the supervisor's exact source and admitted release identity."
+  let result = $identity
+
+process hostedRelease.childIdentity:
+  port kernel.invoke { query = "hostedRelease.generation"; input = $eventInput.expected } → identity
+  assert and(eq($eventInput.expected, $identity), eq($eventInput.observed, $identity))
+    otherwise "Production generation source and admitted release identity changed during activation."
+  let result = true
+
+process hostedRelease.generationReady:
+  let input = $eventInput
+  let body = $input.body
+  let production = at($body, "hostedProduction")
+  let observed = at($body, "hostedGeneration")
+  let result = and(eq($input.status, 200), eq(at($body, "status"), "ready"), eq(at($production, "status"), "ready"),
+    eq(at($observed, "protocol"), "sourcery.hosted/production-generation-identity.v1"),
+    eq(at($observed, "sourceTreeHash"), $input.sourceTreeHash),
+    eq(at($observed, "releasePointerHash"), $input.releasePointerHash),
+    eq(at($observed, "generationHash"), $input.generationHash))
+
+process hostedRelease.developmentSourceMatch:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.expected.treeHash } → expected
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.observed.treeHash } → observed
+  let result = and(eq($input.expected.treeHash, $input.observed.treeHash), eq($input.expected.fileCount, $input.observed.fileCount),
+    eq(at($input.expected, "repositoryRevision"), at($input.observed, "repositoryRevision")))
+
+process hostedRelease.developmentReload:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.developmentSourceMatch"; input = $input } → identical
+  let result = "start-candidate"
+  when and($identical, eq($input.activeAlive, true)):
+    let result = "identical-source"
+
+process hostedRelease.developmentCutover:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.developmentSourceMatch"; input = $input } → identical
+  let result = "activate"
+  when not(eq($input.candidateAlive, true)):
+    let result = "candidate-exited"
+  when not($identical):
+    let result = "source-changed"
+  when eq($input.closed, true):
+    let result = "closed"
+
+process hostedRelease.proxyHeaders:
+  let result = {
+    connectionHeader = "connection";
+    strip = list("connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "proxy-connection", "te",
+      "trailer", "transfer-encoding", "upgrade", "forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto");
+    request = { x-forwarded-proto = "https" };
+    response = {}
+  }
+
+process hostedRelease.reload:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.candidate } → candidate
+  port kernel.invoke { query = "hostedRelease.pin"; input = $input.accepted } → accepted
+  when $input.rejected:
+    port kernel.invoke { query = "hostedRelease.pin"; input = $input.rejected } → rejected
+  let result = "replace"
+  when $input.active:
+    when eq($input.candidate, $input.accepted):
+      let result = "identical-release"
+    when and(not(eq($input.candidate, $input.accepted)), eq($input.candidate, $input.rejected)):
+      let result = "candidate-quarantined"
+
+process hostedRelease.admissionPointer:
+  let observed = $eventInput
+  let pointer = $observed.pointer
+  port value.type { value = $pointer } → kind
+  assert and(eq($kind, "object"), not(eq($pointer, null)), not(isArray($pointer)))
+    otherwise "The hosted admitted release pointer must be a JSON object."
+  port record.entries { value = $pointer } → fields
+  port value.type { value = $pointer.application } → application
+  port value.type { value = $pointer.artifactHash } → artifactType
+  port value.type { value = $pointer.receiptHash } → receiptType
+  assert and(eq(count($fields), 6), eq($pointer.protocol, "sourcery-admission-pointer/1"),
+    eq($application, "string"), $pointer.application, eq($artifactType, "string"), eq($receiptType, "string"))
+    otherwise "The hosted release pointer is not an exact Sourcery admission pointer."
+  port text.matches { value = $pointer.artifactHash; pattern = "\\A[a-f0-9]{64}\\z" } → artifactHash
+  port text.matches { value = $pointer.receiptHash; pattern = "\\A[a-f0-9]{64}\\z" } → receiptHash
+  assert and($artifactHash, $receiptHash, eq($pointer.artifact, concat($pointer.artifactHash, ".sapp")),
+    eq($pointer.receipt, concat($pointer.artifactHash, ".admission.json")))
+    otherwise "The hosted release pointer is not an exact Sourcery admission pointer."
+  let result = { pointer = $pointer; identity = { pointerHash = $observed.sha256; bytes = $observed.bytes;
+    application = $pointer.application; artifactHash = $pointer.artifactHash; receiptHash = $pointer.receiptHash } }
+
+process hostedRelease.admissionArtifact:
+  let observed = $eventInput
+  let pointer = $observed.pointer
+  let artifact = $observed.artifact
+  let receipt = $observed.receipt
+  assert and(eq($artifact.sha256, $pointer.artifactHash), eq($receipt.artifactHash, $pointer.artifactHash))
+    otherwise "The hosted admission artifact does not match its content address."
+  assert and(eq($artifact.protocol, "sourcery-admitted-application/1"), not(eq($artifact.factCount, null)),
+    eq($receipt.protocol, "sourcery-application-admission-receipt/1"),
+    eq($artifact.application, $pointer.application), eq($receipt.application, $pointer.application),
+    eq($artifact.bytes, $receipt.artifactBytes), eq($artifact.factCount, $receipt.factCount))
+    otherwise "The hosted admission receipt does not describe the exact artifact."
+  port record.entries { value = $receipt } → fields
+  let committed = filter($fields, "field", not(eq(at($field, 0), "receiptHash")))
+  port record.fromEntries { entries = $committed } → receiptBody
+  port json.canonical { value = $receiptBody } → encoded
+  port digest.sha256 { text = $encoded } → receiptHash
+  assert and(eq($receiptHash, $receipt.receiptHash), eq($receiptHash, $pointer.receiptHash))
+    otherwise "The hosted admission receipt does not match the pointer."
+  assert and(
+    eq(or($artifact.snapshotHash, null), or($receipt.authoringSnapshotHash, null)),
+    eq(or($artifact.intentHash, null), or($receipt.authoringIntentHash, null)),
+    eq(or($artifact.stewardshipHash, null), or($receipt.stewardshipManifestHash, null)),
+    eq(or($artifact.lineageHash, null), or($receipt.lineageHash, null)),
+    eq(or($artifact.authorizationHash, null), or($receipt.governanceAuthorizationReceiptHash, null)),
+    eq(or($artifact.conformanceHash, null), or($receipt.systemAtlasConformanceReportHash, null)))
+    otherwise "The hosted admission receipt does not bind the artifact's governance evidence."
+  let result = true
+
+process hostedRelease.pointerUnchanged:
+  assert eq($eventInput.before, $eventInput.after)
+    otherwise "The hosted release pointer changed during admission inspection."
+  let result = true
+
+process hostedRelease.admissionParent:
+  let parent = $eventInput
+  assert and(eq($parent.observed, $parent.expected), eq($parent.protocol, "sourcery-admitted-application/1"), $parent.facts)
+    otherwise "The retained parent artifact does not match its admitted content address."
+  let result = true
+
+process hostedRelease.atlasRequirement:
+  let required = some($eventInput.facts, "fact", and(
+    eq(concat(at($fact, 1)), "system-atlas-conformance"),
+    eq(concat(at($fact, 2)), "required"),
+    not(eq(at($fact, 3), "is-not"))))
+  assert or(not($required), $eventInput.report)
+    otherwise "The admitted fact corpus requires a System Atlas conformance report."
+  assert or($required, not($eventInput.report))
+    otherwise "The admitted fact corpus does not require the supplied System Atlas conformance report."
+  let result = $required
+
+process hostedRelease.freezeAttest:
+  let observed = $eventInput
+  let result = { code = "hosted-temple-freeze-mismatch"; expectedTreeHash = $observed.expected; actualTreeHash = $observed.treeHash }
+  when eq($observed.expected, $observed.treeHash):
+    let result = { protocol = "sourcery.hosted/temple-freeze.v1"; status = "frozen"; root = $observed.root;
+      fileCount = $observed.fileCount; treeHash = $observed.treeHash }
+
+process hostedRelease.runtimeStage:
+  assert eq($eventInput.expected, $eventInput.observed)
+    otherwise "Hosted Encounter executable differs from the selected release pin."
+  let result = { status = "staged"; sha256 = $eventInput.observed; bytes = $eventInput.bytes; path = $eventInput.path }
+
+process hostedRelease.archivePin:
+  assert eq($eventInput.expected, $eventInput.observed)
+    otherwise "Temple archive SHA-256 does not match."
+  let result = { status = "verified"; archiveSha256 = $eventInput.observed }
+
+process hostedRelease.archivePath:
+  let member = $eventInput
+  port text.matches { value = $member.path; pattern = "\\A[^/\\p{Cc}\\\\][^\\p{Cc}\\\\]{0,4095}\\z" } → safe
+  assert $safe
+    otherwise "Temple archive contains an unsafe member path."
+  port text.split { value = $member.path; pattern = "/" } → components
+  assert not(includes($components, ".."))
+    otherwise "Temple archive contains an unsafe member path."
+  let parts = filter($components, "part", and(not(eq($part, "")), not(eq($part, "."))))
+  assert or(count($parts), $member.directory)
+    otherwise "Temple archive file must have a path."
+  port text.join { values = $parts; separator = "/" } → result
+
+process hostedRelease.cutover:
+  let input = $eventInput
+  port kernel.invoke { query = "hostedRelease.generation"; input = $input.generation } → identity
+  assert eq($identity, $input.generation)
+    otherwise "Cutover requires the exact prepared production generation identity."
+  let result = "release-unavailable-during-startup"
+  when not(eq($input.pointerHash, null)):
+    port kernel.invoke { query = "hostedRelease.pin"; input = $input.pointerHash } → pinValid
+    let result = "activate"
+    when not(eq($input.candidateAlive, true)):
+      let result = "candidate-exited"
+    when not(eq($input.pointerHash, $identity.releasePointerHash)):
+      let result = "release-changed-during-startup"
+  when eq($input.closed, true):
+    let result = "closed"
