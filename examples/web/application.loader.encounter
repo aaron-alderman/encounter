@@ -1,0 +1,13 @@
+process-module "temple/surface-process-module/1"
+
+process loader.declaration:
+  let result = {
+    sections = list(
+      {
+        subject = "application";
+        stateProfile = "encounter/example-web/1";
+        module = "page.encounter";
+        entry = list("app.newSession", "app.request", "ui.styles")
+      }
+    )
+  }

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Encounter browser host example</title>
+<script type="module" src="/_encounter/browser.mjs"></script>
+<main>
+  <h1>Saved child source</h1>
+  <form id="workspace">
+    <label for="source">Encounter source</label>
+    <textarea id="source" rows="6" cols="54"></textarea>
+    <button>Save and run</button>
+  </form>
+  <label for="admission">Admission to check (blank uses the current session)</label>
+  <input id="admission">
+  <button data-verify>Check admission</button>
+  <button data-verify data-model="true">Check raw model</button>
+  <p>Result <output id="output"></output></p>
+  <output id="ticket" hidden></output>
+  <p role="status" data-temple-errors></p>
+</main>

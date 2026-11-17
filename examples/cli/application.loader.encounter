@@ -1,0 +1,14 @@
+process-module "temple/surface-process-module/1"
+
+process loader.declaration:
+  let result = {
+    sections = list(
+      {
+        subject = "application";
+        stateProfile = "encounter/example-cli/1";
+        module = "greet.encounter";
+        entry = list("cli.main", "test.greeting", "test.usage");
+        grant = list("kernel.invoke", "text.trim")
+      }
+    )
+  }
