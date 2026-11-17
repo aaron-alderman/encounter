@@ -1,0 +1,22 @@
+[Unit]
+Description=Sourcery hosted MCP OAuth client metadata resolver
+After=network.target
+
+[Service]
+Type=exec
+User=sourcery-mcp-client
+Group=sourcery-dev
+RuntimeDirectory=sourcery-mcp-client
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/sourcery-dev/public-mcp-authorization.env
+EnvironmentFile=/etc/sourcery-dev/hosted-mcp-client.env
+ExecStart=/usr/local/libexec/sourcery-public-mcp-read hosted-mcp-client serve /run/sourcery-mcp-client/client.sock ${SOURCERY_MCP_CLIENT_CONSUMER_UID} ${SOURCERY_MCP_CLIENTS} ${SOURCERY_MCP_CLIENTS_SHA256} ${SOURCERY_MCP_METADATA_HOSTS} ${SOURCERY_MCP_METADATA_HOSTS_SHA256} ${SOURCERY_MCP_SCHEMA} ${SOURCERY_MCP_SCHEMA_SHA256} ${SOURCERY_MCP_POLICY} ${SOURCERY_MCP_POLICY_SHA256}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+InaccessiblePaths=-/etc/sourcery-dev/hosted-mcp-project.env -/run/sourcery-mcp-project
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=128M

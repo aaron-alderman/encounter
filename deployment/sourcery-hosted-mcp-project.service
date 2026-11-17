@@ -1,0 +1,23 @@
+[Unit]
+Description=Sourcery hosted MCP project authority
+After=postgresql.service sourcery-hosted-mcp-client.service
+Requires=sourcery-hosted-mcp-client.service
+
+[Service]
+Type=exec
+User=sourcery
+Group=sourcery-dev
+RuntimeDirectory=sourcery-mcp-project
+RuntimeDirectoryMode=0750
+EnvironmentFile=/etc/sourcery-dev/public-mcp-authorization.env
+EnvironmentFile=/etc/sourcery-dev/hosted-mcp-project.env
+EnvironmentFile=/etc/sourcery-dev/hosted-mcp-client.env
+ExecStart=/usr/local/libexec/sourcery-public-mcp-read hosted-mcp-project serve /run/sourcery-mcp-project/project.sock ${SOURCERY_MCP_GATEWAY_UID} ${SOURCERY_MCP_PROJECT_KEY} ${SOURCERY_MCP_CONSENT_KEY} ${SOURCERY_MCP_CONSENT_COMMIT_KEY} ${SOURCERY_MCP_DATABASE_SOCKET} ${SOURCERY_MCP_DATABASE_PORT} ${SOURCERY_MCP_DATABASE_NAME} ${SOURCERY_MCP_DATABASE_ROLE} ${SOURCERY_MCP_SCHEMA} ${SOURCERY_MCP_SCHEMA_SHA256} ${SOURCERY_MCP_POLICY} ${SOURCERY_MCP_POLICY_SHA256} /run/sourcery-mcp-client/client.sock ${SOURCERY_MCP_CLIENT_UID} ${SOURCERY_MCP_CLIENTS_SHA256} ${SOURCERY_MCP_METADATA_HOSTS_SHA256}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX
+MemoryMax=256M

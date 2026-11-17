@@ -1,0 +1,17 @@
+[Unit]
+Description=Measure allocated disk space in AppDev storage areas
+
+[Service]
+Type=oneshot
+User=ubuntu
+StateDirectory=sourcery-appdev-workloads
+StateDirectoryMode=0755
+Environment=APPDEV_OBSERVED_WORKSPACE=/home/ubuntu/workspaces/aaron-active/dev/dev-20261108-a
+ExecStart=/usr/bin/python3 /usr/local/libexec/sourcery-appdev-storage-observer.py
+TimeoutStartSec=90
+Nice=15
+IOSchedulingClass=idle
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes

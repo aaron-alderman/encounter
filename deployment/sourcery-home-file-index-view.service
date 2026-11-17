@@ -1,0 +1,22 @@
+[Unit]
+Description=Sourcery Home private file index reader
+Wants=sourcery-home-file-index-watch.service
+After=sourcery-home-file-index-watch.service
+
+[Service]
+User=ubuntu
+Group=sourcery-file-index
+SupplementaryGroups=ubuntu
+RuntimeDirectory=sourcery-file-index
+RuntimeDirectoryMode=2750
+UMask=0077
+ExecStart=/usr/local/libexec/sourcery-home-file-index-view file-index --serve /etc/sourcery-file-index/sources.rel /var/lib/sourcery-file-index/cache /run/sourcery-file-index/view.sock
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

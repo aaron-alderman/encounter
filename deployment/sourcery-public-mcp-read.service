@@ -1,0 +1,22 @@
+[Unit]
+Description=Sourcery public MCP read-only boundary
+After=network.target sourcery-hosted-mcp-project.service
+Requires=sourcery-hosted-mcp-project.service
+
+[Service]
+Type=simple
+User=sourcery-dev
+Group=sourcery-dev
+EnvironmentFile=/etc/sourcery-dev/public-mcp-authorization.env
+ExecStart=/usr/local/libexec/sourcery-public-mcp-read public-mcp-read 8151 ${SOURCERY_MCP_SCHEMA} ${SOURCERY_MCP_SCHEMA_SHA256} ${SOURCERY_MCP_POLICY} ${SOURCERY_MCP_POLICY_SHA256} /run/sourcery-mcp-project/project.sock ${SOURCERY_MCP_PROJECT_UID}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

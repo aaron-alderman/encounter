@@ -1,0 +1,20 @@
+[Unit]
+Description=Loopback-only Sourcery assurance view
+After=network.target sourcery-disk-pressure-assurance.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/sourcery-assurance-view assurance-view /srv/sourcery/assurance/current 8145
+User=www-data
+Group=www-data
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/srv/sourcery/assurance/current
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

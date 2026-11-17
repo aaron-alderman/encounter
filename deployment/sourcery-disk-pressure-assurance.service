@@ -1,0 +1,25 @@
+[Unit]
+Description=Sourcery dry-run disk-pressure assurance
+After=local-fs.target sourcery-runtime-authority.service
+Wants=sourcery-runtime-authority.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/sourcery-disk-pressure-assurance disk-pressure-publish /etc/sourcery-assurance/policy.json
+TimeoutStartSec=20min
+User=sourcery-dev
+Group=sourcery-dev
+UMask=0022
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/srv/sourcery/assurance/current /srv/sourcery/assurance/history
+InaccessiblePaths=/etc/shadow /etc/gshadow /etc/ssh /etc/sourcery-dev/person-authority
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
