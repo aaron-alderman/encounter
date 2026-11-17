@@ -46,9 +46,24 @@ impl Operators {
         Ok(Self(entries))
     }
 
+    pub fn roles(&self) -> Value {
+        json!(self.0.iter().map(|(id, _, role)| json!({"id":id,"role":role})).collect::<Vec<_>>())
+    }
+
     pub fn verify(&self, authorization: Option<&str>) -> Option<Value> {
         let (scheme, token) = authorization?.split_once(' ')?;
-        if !scheme.eq_ignore_ascii_case("basic") || token.len() < 44 || token.len() > 512
+        if !scheme.eq_ignore_ascii_case("basic") { return None; }
+        self.verify_token(token)
+    }
+
+    pub fn session_actor(&self, name: &str, binding: &str) -> Option<Value> {
+        self.0.iter().find(|(id, pin, _)| id == name
+            && bool::from(rel::hash(&hex::encode(pin)).as_bytes().ct_eq(binding.as_bytes())))
+            .map(|(id, _, role)| json!({"id":id,"role":role}))
+    }
+
+    pub fn verify_token(&self, token: &str) -> Option<Value> {
+        if token.len() < 44 || token.len() > 512
             || !token.bytes().all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c))
         {
             return None;

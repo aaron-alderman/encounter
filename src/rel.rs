@@ -40,7 +40,7 @@ impl Reader<'_> {
         Ok(value)
     }
 
-    fn tuple(&mut self) -> Result<([String; 3], Option<String>)> {
+    fn tuple(&mut self) -> Result<([String; 3], Option<String>, Option<String>)> {
         self.expect('(')?;
         let subject = self.atom()?;
         self.expect(',')?;
@@ -48,12 +48,13 @@ impl Reader<'_> {
         self.expect(',')?;
         let object = self.atom()?;
         let polarity = if self.take(',') { Some(self.atom()?) } else { None };
+        let metadata = if self.take(',') { Some(self.atom()?) } else { None };
         self.expect(')')?;
-        Ok(([subject, predicate, object], polarity))
+        Ok(([subject, predicate, object], polarity, metadata))
     }
 }
 
-fn tuples(text: &str) -> impl Iterator<Item = Result<([String; 3], Option<String>)>> + '_ {
+fn tuples(text: &str) -> impl Iterator<Item = Result<([String; 3], Option<String>, Option<String>)>> + '_ {
     let mut reader = Reader { rest: text };
     std::iter::from_fn(move || {
         reader.whitespace();
@@ -66,17 +67,44 @@ fn tuples(text: &str) -> impl Iterator<Item = Result<([String; 3], Option<String
 
 fn triples(text: &str) -> impl Iterator<Item = Result<[String; 3]>> + '_ {
     tuples(text).map(|row| {
-        let (fields, polarity) = row?;
+        let (fields, polarity, _) = row?;
         if polarity.is_some() { return Err(fail("expected a three-atom REL tuple")); }
         Ok(fields)
     })
 }
 
+pub(crate) fn relation_atoms(text: &str) -> impl Iterator<Item = Result<([String; 3], &'static str)>> + '_ {
+    tuples(text).map(|row| checked_atoms(row?, false))
+}
+
+fn checked_atoms((atoms, polarity, metadata): ([String; 3], Option<String>, Option<String>),
+    allow_metadata: bool) -> Result<([String; 3], &'static str)> {
+    let pol = match polarity.as_deref() {
+        None | Some("is") => "is",
+        Some("is-not") => "is-not",
+        _ => return Err(fail("invalid REL polarity")),
+    };
+    if let Some(metadata) = metadata {
+        if !allow_metadata { return Err(fail("unexpected REL metadata")); }
+        let metadata: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&metadata)?;
+        if ["s", "p", "o", "pol"].iter().any(|key| metadata.contains_key(*key)) {
+            return Err(fail("REL metadata cannot override relation coordinates"));
+        }
+    }
+    Ok((atoms, pol))
+}
+
 pub fn relations(text: &str) -> Result<serde_json::Value> {
-    let rows = tuples(text).map(|row| {
-        let ([s, p, o], polarity) = row?;
-        let pol = polarity.as_deref().unwrap_or("is");
-        if !matches!(pol, "is" | "is-not") { return Err(fail("invalid REL polarity")); }
+    relation_values(relation_atoms(text))
+}
+
+pub(crate) fn project_relations(text: &str) -> Result<serde_json::Value> {
+    relation_values(tuples(text).map(|row| checked_atoms(row?, true)))
+}
+
+fn relation_values(rows: impl Iterator<Item = Result<([String; 3], &'static str)>>) -> Result<serde_json::Value> {
+    let rows = rows.map(|row| {
+        let ([s, p, o], pol) = row?;
         Ok(serde_json::json!({"s":s,"p":p,"o":o,"pol":pol}))
     }).collect::<Result<Vec<_>>>()?;
     Ok(serde_json::Value::Array(rows))
@@ -241,11 +269,19 @@ pub(crate) fn quote(value: &str) -> String {
 }
 
 pub fn encode(value: &serde_json::Value, kind: &str) -> Result<String> {
+    encode_value(value, kind, true)
+}
+
+pub(crate) fn encode_ordered(value: &serde_json::Value, kind: &str) -> Result<String> {
+    encode_value(value, kind, false)
+}
+
+fn encode_value(value: &serde_json::Value, kind: &str, sort: bool) -> Result<String> {
     use serde_json::Value;
     fn fact(out: &mut String, s: &str, p: &str, o: &str) {
         out.push_str(&format!("({}, {}, {})\n", quote(s), quote(p), quote(o)));
     }
-    fn node(out: &mut String, value: &Value, serial: &mut usize, depth: usize) -> Result<String> {
+    fn node(out: &mut String, value: &Value, serial: &mut usize, depth: usize, sort: bool) -> Result<String> {
         if depth > 256 || *serial > 200_000 { return Err(fail("REL value bound exceeded")); }
         let id = format!("v{serial}");
         *serial += 1;
@@ -256,7 +292,9 @@ pub fn encode(value: &serde_json::Value, kind: &str) -> Result<String> {
         fact(out, &id, "type", kind);
         match value {
             Value::Object(record) => {
-                for (key, value) in record {
+                let mut entries = record.iter().collect::<Vec<_>>();
+                if sort { entries.sort_unstable_by_key(|(key, _)| *key); }
+                for (key, value) in entries {
                     if key.contains('\0') || matches!(key.as_str(), "__proto__" | "prototype" | "constructor") {
                         return Err(fail("forbidden REL record field"));
                     }
@@ -265,13 +303,13 @@ pub fn encode(value: &serde_json::Value, kind: &str) -> Result<String> {
                     fact(out, &id, "entry", &entry);
                     fact(out, &entry, "type", "Entry");
                     fact(out, &entry, "key", key);
-                    let value_id = node(out, value, serial, depth + 1)?;
+                    let value_id = node(out, value, serial, depth + 1, sort)?;
                     fact(out, &entry, "value", &value_id);
                 }
             }
             Value::Array(items) => {
                 for item in items {
-                    let item_id = node(out, item, serial, depth + 1)?;
+                    let item_id = node(out, item, serial, depth + 1, sort)?;
                     fact(out, &id, "item", &item_id);
                 }
             }
@@ -283,7 +321,7 @@ pub fn encode(value: &serde_json::Value, kind: &str) -> Result<String> {
     }
     let mut out = String::new();
     fact(&mut out, "rel.document", "kind", kind);
-    let id = node(&mut out, value, &mut 0, 0)?;
+    let id = node(&mut out, value, &mut 0, 0, sort)?;
     fact(&mut out, "rel.document", "root", &id);
     Ok(out)
 }

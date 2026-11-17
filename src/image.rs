@@ -14,13 +14,15 @@ const FORMAT: &str = "encounter/application-image/2";
 const PROGRAMME_KIND: &str = "EncounterCompiledProgramme";
 const LIMIT: u64 = 64_000_000;
 
-fn runtime_pin() -> Result<String> {
+pub(crate) fn runtime_pin() -> Result<String> {
     // On Linux this resolves the actual running executable even after a
     // rebuild has replaced its original pathname.
     Ok(rel::hash(fs::read("/proc/self/exe")?))
 }
 
 pub fn build(root: &Path, declaration: &str, output: &Path) -> Result<String> {
+    crate::package::check(root)?;
+    crate::package::check_path(output)?;
     let (app, files) = Application::capture(root, declaration)?;
     let programme = app.admit(&mut Meter::new(20_000_000))?.compiled();
     let programme_sha256 = rel::hash(rel::encode(&programme, PROGRAMME_KIND)?);
@@ -66,6 +68,9 @@ pub struct LoadedImage {
 }
 
 pub fn load(path: &Path, expected: &str) -> Result<LoadedImage> {
+    crate::package::check_path(path)?;
+    let package_root = path.canonicalize()?.parent().ok_or_else(|| fail("missing image package directory"))?.to_path_buf();
+    crate::package::check(&package_root)?;
     if expected.len() != 64 || !expected.bytes().all(|byte|
         byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
@@ -107,6 +112,14 @@ pub fn load(path: &Path, expected: &str) -> Result<LoadedImage> {
         return Err(fail("compiled programme hash differs from its pin"));
     }
     let mut meter = Meter::new(20_000_000);
-    let programme = app.load_compiled(compiled, &mut meter)?;
+    let mut programme = app.load_compiled(compiled, &mut meter)?;
+    if app.declared_grants().contains("reflection.image") {
+        let inventory = files.iter().map(|(path, entry)| json!({"path":path,"sha256":entry["sha256"]})).collect::<Vec<_>>();
+        programme.bind_image_reflection(json!({
+            "sha256":expected, "runtimeSha256":image["runtimeSha256"], "programmeSha256":image["programmeSha256"],
+            "basis":app.basis, "declaration":declaration, "files":inventory, "grants":app.declared_grants(),
+            "operators":[]
+        }), image["files"].clone());
+    }
     Ok(LoadedImage { app, programme, meter })
 }

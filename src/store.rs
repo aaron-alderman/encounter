@@ -16,7 +16,8 @@ const METADATA: [&str; 7] = ["basis", "profile", "reason", "target", "goal", "so
 impl Store {
     pub fn open(directory: &Path, profile: &str, basis: &str) -> Result<Self> {
         fs::create_dir_all(directory)?;
-        let db = Db::open(&directory.join("workspace.sqlite"))?;
+        let db = Db::open_workspace(&directory.join("workspace.sqlite"))?;
+        db.enable_wal()?;
         db.exec(include_str!("revision-schema.sql"))?;
         let store = Self {
             db, profile: profile.to_owned(), basis: basis.to_owned(),

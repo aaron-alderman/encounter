@@ -116,6 +116,10 @@ impl Programme {
         json!(self.steps.iter().map(|(name, body)| (name, steps(body))).collect::<BTreeMap<_, _>>())
     }
 
+    pub(crate) fn compiled_process(&self, name: &str) -> Value {
+        self.steps.get(name).map(|body| json!(steps(body))).unwrap_or(Value::Null)
+    }
+
     pub(crate) fn from_compiled(
         compiled: &Value, entries: &[&str], grants: &BTreeSet<&str>, source_bytes: usize, meter: &mut Meter,
     ) -> Result<Self> {
@@ -141,6 +145,6 @@ impl Programme {
             }
         }
         if reached.len() != steps.len() { return Err(fail("unreachable compiled processes")); }
-        Ok(Self { steps, datasets: BTreeMap::new(), store: None, attachment: None, catalogue: None })
+        Ok(Self::from_steps(steps))
     }
 }

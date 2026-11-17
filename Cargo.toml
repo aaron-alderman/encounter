@@ -5,12 +5,33 @@ edition = "2024"
 publish = false
 
 [features]
+default = ["hosted"]
+hosted = []
 test-faults = []
 
+[[bin]]
+name = "encounter"
+path = "src/main.rs"
+required-features = ["hosted"]
+
 [dependencies]
-serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
 sha2 = "0.10"
 hex = "0.4"
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc", "fast", "pkcs8", "zeroize"] }
 getrandom = "0.2"
 libc = "0.2"
 subtle = "2.6"
+base64ct = { version = "1.8.3", features = ["alloc"] }
+zeroize = "1.8"
+pcre2 = "0.2"
+ryu-js = "1"
+num-bigint = "0.4"
+icu_collator = "2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+form_urlencoded = "1"
+png = "0.17"
+flate2 = "1"
+qrcodegen = "1.8"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }

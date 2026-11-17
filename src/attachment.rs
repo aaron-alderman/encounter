@@ -1,7 +1,7 @@
 // Resolve an application-selected immutable file within the operator's mount.
-use crate::{Result, fail, rel};
+use crate::{Result, fail, http, rel};
 use serde_json::Value;
-use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
+use std::{fs::OpenOptions, io::Read, net::TcpStream, os::unix::fs::OpenOptionsExt, path::{Path, PathBuf}};
 
 const LIMIT: u64 = 16 * 1024 * 1024;
 
@@ -13,10 +13,40 @@ pub struct Attachment {
     pub disposition: String,
 }
 
+impl Attachment {
+    pub fn send_review(&self, stream: &mut TcpStream, media_type: &str, range: Option<&str>) -> Result<()> {
+        let size = self.body.len();
+        let headers = "Accept-Ranges: bytes\r\nContent-Disposition: inline\r\n";
+        match range {
+            None => http::send_bytes(stream, "200 OK", media_type, headers, &self.body),
+            Some(value) => match byte_range(value, size) {
+                Some((start, end)) => http::send_bytes(stream, "206 Partial Content", media_type,
+                    &format!("{headers}Content-Range: bytes {start}-{end}/{size}\r\n"),
+                    &self.body[start..=end]),
+                None => http::send_bytes(stream, "416 Range Not Satisfiable", media_type,
+                    &format!("{headers}Content-Range: bytes */{size}\r\n"), &[]),
+            },
+        }
+    }
+}
+
+fn byte_range(value: &str, size: usize) -> Option<(usize, usize)> {
+    let last = size.checked_sub(1)?;
+    let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+    if start.is_empty() {
+        let suffix: usize = end.parse().ok()?;
+        return (suffix > 0).then_some((size.saturating_sub(suffix), last));
+    }
+    let start = start.parse().ok()?;
+    let end = if end.is_empty() { last } else { last.min(end.parse().ok()?) };
+    (start <= end).then_some((start, end))
+}
+
 impl Mount {
     pub fn open(root: &Path) -> Result<Self> {
         let root = root.canonicalize()?;
         if !root.is_dir() { return Err(fail("attachment root must be a directory")); }
+        crate::package::check(&root)?;
         Ok(Self(root))
     }
 
@@ -33,6 +63,7 @@ impl Mount {
             return Err(fail("invalid attachment path"));
         }
         let file = self.0.join(path);
+        crate::package::check_path(&file)?;
         if file.canonicalize()? != file { return Err(fail("attachment path changed")); }
         let opened = OpenOptions::new().read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(file)?;

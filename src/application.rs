@@ -50,7 +50,7 @@ pub(crate) fn validate_path(relative: &str, extension: &str) -> Result<()> {
 fn read_disk(root: &Path, relative: &str, extension: &str, limit: usize) -> Result<(PathBuf, String)> {
     validate_path(relative, extension)?;
     let path = root.join(relative).canonicalize()?;
-    if !path.starts_with(root) || !path.is_file() {
+    if !path.starts_with(root) || !path.is_file() || path.extension() != Path::new(relative).extension() {
         return Err(fail("declared path outside workspace"));
     }
     if fs::metadata(&path)?.len() > limit as u64 {
@@ -73,6 +73,32 @@ fn dataset(path: &str, text: &str, format: Option<&str>, pin: Option<&str>) -> R
         _ => return Err(fail(format!("unsupported application data format {format}"))),
     };
     Ok(Dataset { format: format.to_owned(), digest, value })
+}
+
+pub(crate) fn browser_profile_port(name: &str) -> bool {
+    (supports_port(name) || crate::browser_host::supports_port(name))
+        && !matches!(name, "storage.snapshot" | "storage.operation" | "storage.cas" | "storage.history"
+            | "attachment.verify" | "reflection.image" | "json.canonical")
+}
+
+#[derive(Clone, Copy)]
+pub enum CheckProfile {
+    Application,
+    Browser,
+    DurableBrowser,
+    TempleBrowser,
+}
+
+impl CheckProfile {
+    fn supports(self, name: &str) -> bool {
+        match self {
+            Self::Application => supports_port(name),
+            Self::Browser => browser_profile_port(name),
+            Self::DurableBrowser => browser_profile_port(name)
+                || matches!(name, "storage.snapshot" | "storage.operation" | "storage.cas" | "storage.history"),
+            Self::TempleBrowser => Self::DurableBrowser.supports(name) || crate::peer_host::supports_port(name),
+        }
+    }
 }
 
 impl Application {
@@ -179,6 +205,7 @@ impl Application {
                 (module["path"].as_str().unwrap_or_default(), rel::hash(module["text"].as_str().unwrap_or_default())))
                 .collect::<Vec<_>>());
         }
+        identity.sort_all_objects();
         let basis = rel::hash(serde_json::to_vec(&identity)?);
         Ok(Self {
             state_profile, basis, sources, catalogue:Value::Array(catalogue), entries: entries.into_iter().map(str::to_owned).collect(),
@@ -200,14 +227,22 @@ impl Application {
         Ok(programme)
     }
 
+    pub(crate) fn browser_styles_entry(&self) -> &'static str {
+        if self.has_entry("ui.presentationStyles") { "ui.presentationStyles" } else { "ui.styles" }
+    }
+
     pub(crate) fn bind_browser(&self, programme: &mut Programme) -> Result<()> {
-        let entries = ["app.newSession", "app.request", "ui.styles"];
+        let entries = ["app.newSession", "app.request", self.browser_styles_entry()];
         if entries.iter().any(|entry| !self.has_entry(entry)) {
             return Err(fail("expected the browser application entry points"));
         }
         self.bind_data(programme);
         Ok(())
     }
+
+    pub(crate) fn declared_entries(&self) -> &[String] { &self.entries }
+
+    pub(crate) fn declared_grants(&self) -> &BTreeSet<String> { &self.grants }
 
     pub(crate) fn bind_data(&self, programme: &mut Programme) {
         if self.grants.contains("source.catalogue") {
@@ -232,39 +267,67 @@ impl Application {
         Ok(grants)
     }
 
+    pub fn admit_native_browser(&self, meter: &mut Meter, profile: CheckProfile) -> Result<Programme> {
+        if !self.has_entry("browser.boot") {
+            return Err(fail("expected a declared browser.boot entry"));
+        }
+        let grants = self.grants.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        if matches!(profile, CheckProfile::TempleBrowser) && !self.has_entry("peer.receive") {
+            return Err(fail("expected a declared peer.receive entry"));
+        }
+        if let Some(port) = grants.iter().find(|name| !profile.supports(name)) {
+            return Err(fail(format!("unsupported declared browser grant: {port}")));
+        }
+        let entries = self.entries.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut programme = Programme::admit_entries(&self.sources, &entries, &grants, meter)?;
+        if matches!(profile, CheckProfile::TempleBrowser) && self.has_entry(crate::peer_host::RETRY_ENTRY) {
+            crate::peer_host::require_retry_grants(&programme)?;
+        }
+        self.bind_data(&mut programme);
+        Ok(programme)
+    }
+
     pub fn admit(&self, meter: &mut Meter) -> Result<Programme> {
         let grants = self.checked_grants()?;
         let entries = self.entries.iter().map(String::as_str).collect::<Vec<_>>();
         Programme::admit_entries(&self.sources, &entries, &grants, meter)
     }
 
-    pub fn check(&self) -> Result<bool> {
+    pub fn check(&self, profile: CheckProfile) -> Result<bool> {
+        let native_browser = !matches!(profile, CheckProfile::Application);
         let grants = self.grants.iter().map(String::as_str).collect::<BTreeSet<_>>();
-        let missing = grants.iter().copied().filter(|name| !supports_port(name)).collect::<Vec<_>>();
+        let supported = |name| profile.supports(name);
+        let missing = grants.iter().copied().filter(|name| !supported(*name)).collect::<Vec<_>>();
         let restricted = grants.iter().filter_map(|name| {
             let limit = match *name {
-                "text.matches" => "bounded text lengths, HTML, dates, identifiers, hex tokens and HTTP URL patterns only",
-                "number.calculate" => "divide, subtract, remainder, multiply, round, floor, min, max and ordered comparisons only",
-                "text.slice" => "nonnegative indices only",
                 "source.observe" | "encounter.execute" => "one pure scalar expression with entry run",
-                "text.split" => "LF and CRLF pattern only",
+                "text.matches" | "text.match" | "text.matchAll" | "text.replace" | "text.split" => "bounded regular-expression profile",
+                "kernel.execute" if native_browser => "session ticket from kernel.prepare; raw or prelowered models are refused",
                 _ => return None,
             };
             Some(json!({"port":name,"limit":limit}))
         }).collect::<Vec<_>>();
+        let native_grants = grants.iter().copied().filter(|port| supported(*port)).collect();
         let entries = self.entries.iter().map(|entry| {
-            let error = Programme::admit(&self.sources, entry, &grants, &mut Meter::new(20_000_000))
-                .err().map(|error| error.to_string());
+            let error = Programme::admit(&self.sources, entry, &native_grants, &mut Meter::new(20_000_000))
+                .and_then(|programme| {
+                    if matches!(profile, CheckProfile::TempleBrowser) && entry == crate::peer_host::RETRY_ENTRY {
+                        crate::peer_host::require_retry_grants(&programme)?;
+                    }
+                    Ok(())
+                }).err().map(|error| error.to_string());
             json!({"entry":entry,"admitted":error.is_none(),"blocker":error})
         }).collect::<Vec<_>>();
-        let admitted = missing.is_empty() && entries.iter().all(|entry| entry["admitted"] == true);
+        let missing_boot = native_browser && !self.has_entry("browser.boot");
+        let missing_peer = matches!(profile, CheckProfile::TempleBrowser) && !self.has_entry("peer.receive");
+        let admitted = !missing_boot && !missing_peer && missing.is_empty() && entries.iter().all(|entry| entry["admitted"] == true);
         let syntax = Programme::syntax_inventory(&self.sources)?;
         println!("{}", serde_json::to_string_pretty(&json!({
             "stateProfile":self.state_profile,"modules":self.sources.len(),
             "datasets":self.datasets.iter().map(|(name, data)|
                 json!({"name":name,"format":data.format,"sha256":data.digest})).collect::<Vec<_>>(),
             "entries":entries,"unboundGrants":missing,"limitedGrants":restricted,
-            "moduleSyntaxInventory":syntax,"admitted":admitted
+            "missingBrowserBoot":missing_boot,"missingPeerReceive":missing_peer,"moduleSyntaxInventory":syntax,"admitted":admitted
         }))?);
         Ok(admitted)
     }
