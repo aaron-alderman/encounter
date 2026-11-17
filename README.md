@@ -9,6 +9,12 @@ admission and replay. The sibling research checkout supplies the independent
 JS verification model. The JS host and Node test transports exercise the
 shared contracts.
 
+The Encounter repository owns changes to the native executable. Home, Portfolio
+and Work Boards source, their shared application modules, and their release
+catalogue live in the [Encounter Platform repository](https://github.com/aaron-alderman/encounter-platform).
+Build the runtime here and pass the executable and its build digest to the
+Platform packager.
+
 ## Four small examples
 
 Build on Linux with Rust 1.85 or newer and SQLite development libraries.
