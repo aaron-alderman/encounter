@@ -141,6 +141,6 @@ impl Programme {
             }
         }
         if reached.len() != steps.len() { return Err(fail("unreachable compiled processes")); }
-        Ok(Self { steps, datasets: BTreeMap::new(), store: None, attachment: None, catalogue: None })
+        Ok(Self { steps, datasets: BTreeMap::new(), store: None, attachment: None, game_kernel: None, catalogue: None })
     }
 }

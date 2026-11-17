@@ -5,7 +5,7 @@
 mod compiled;
 use crate::{attachment::Mount, Result, fail, rel, store::Store};
 use serde_json::{Map, Value, json};
-use std::{collections::{BTreeMap, BTreeSet}, rc::Rc};
+use std::{cell::RefCell, collections::{BTreeMap, BTreeSet}, rc::Rc};
 
 type Env = BTreeMap<String, Rc<Value>>;
 type Lines<'a> = Vec<(usize, &'a str)>;
@@ -46,10 +46,30 @@ impl std::fmt::Display for RuntimeLimit {
 impl std::error::Error for RuntimeLimit {}
 
 #[derive(Clone)]
-pub struct Meter(usize);
+pub struct Meter(usize, Option<Rc<RefCell<ExecutionTrace>>>);
+
+#[derive(Default)]
+struct ExecutionTrace {
+    processes: BTreeSet<String>,
+    events: Vec<Value>,
+    dropped: usize,
+}
+
+impl ExecutionTrace {
+    fn record(&mut self, process: &str, address: &[usize], kind: &str, data: Value) {
+        if self.events.len() == 256 {
+            self.dropped += 1;
+            return;
+        }
+        self.events.push(json!({
+            "sequence":self.events.len() + 1, "process":process,
+            "address":address, "kind":kind, "data":data
+        }));
+    }
+}
 
 impl Meter {
-    pub fn new(limit: usize) -> Self { Self(limit) }
+    pub fn new(limit: usize) -> Self { Self(limit, None) }
 
     fn charge(&mut self, count: usize) -> Result<()> {
         self.0 = self.0.checked_sub(count).ok_or(RuntimeLimit("meter-exhausted"))?;
@@ -314,14 +334,45 @@ fn block(lines: &[(usize, &str)], cursor: &mut usize, indent: usize, in_fold: bo
     Ok(steps)
 }
 
+fn verify_ed25519(args: &Value) -> Result<bool> {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let message = text(&args["text"])?;
+    let key = text(&args["publicKey"])?;
+    let signature = text(&args["signature"])?;
+    let lower_hex = |value: &str, size: usize| {
+        value.len() == size && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if message.len() > 16_384 || !lower_hex(key, 64) || !lower_hex(signature, 128) {
+        return Ok(false);
+    }
+    let mut key_bytes = [0; 32];
+    let mut signature_bytes = [0; 64];
+    if hex::decode_to_slice(key, &mut key_bytes).is_err()
+        || hex::decode_to_slice(signature, &mut signature_bytes).is_err() {
+        return Ok(false);
+    }
+    let mut public_y = key_bytes;
+    public_y[31] &= 0x7f;
+    let mut prime = [0xff; 32];
+    prime[0] = 0xed;
+    prime[31] = 0x7f;
+    if public_y.iter().rev().cmp(prime.iter().rev()) != std::cmp::Ordering::Less {
+        return Ok(false);
+    }
+    let Ok(key) = VerifyingKey::from_bytes(&key_bytes) else { return Ok(false) };
+    Ok(key.verify_strict(message.as_bytes(), &Signature::from_bytes(&signature_bytes)).is_ok())
+}
+
 pub fn supports_port(name: &str) -> bool {
-    matches!(name, "kernel.invoke" | "text.trim" | "text.matches" | "record.entries"
-        | "record.fromEntries" | "record.put" | "digest.sha256" | "application.data" | "text.slice" | "text.lowerCase"
+    matches!(name, "kernel.invoke" | "execution.observe" | "text.trim" | "text.matches" | "record.entries"
+        | "record.fromEntries" | "record.put" | "digest.sha256" | "signature.ed25519.verify" | "application.data" | "text.slice" | "text.lowerCase"
         | "text.indexOf" | "number.calculate" | "rel.encode" | "rel.decode" | "scalar.read"
         | "storage.snapshot" | "storage.operation" | "storage.cas" | "storage.history"
         | "text.join" | "text.replaceAll" | "value.describe" | "value.string" | "value.type"
         | "record.get" | "scalar.quoteValue" | "text.split" | "source.observe"
-        | "source.catalogue" | "encounter.execute" | "attachment.verify")
+        | "game.kernel" | "json.parse" | "json.format"
+        | "source.catalogue" | "source.module" | "encounter.execute" | "attachment.verify")
 }
 
 fn callees(steps: &[Step], grants: &BTreeSet<&str>, calls: &mut Vec<String>) -> Result<()> {
@@ -338,7 +389,7 @@ fn callees(steps: &[Step], grants: &BTreeSet<&str>, calls: &mut Vec<String>) -> 
                 if !supports_port(name) {
                     return Err(fail(format!("unsupported source port: {name}")));
                 }
-                if name == "kernel.invoke" {
+                if matches!(name.as_str(), "kernel.invoke" | "execution.observe") {
                     let Expr::Record(fields) = args else { return Err(fail("call must use a literal query")); };
                     let Some((_, Expr::Literal(Value::String(query)))) = fields.iter().find(|(field, _)| field == "query") else {
                         return Err(fail("call must use a literal query"));
@@ -357,6 +408,7 @@ pub struct Programme {
     datasets: BTreeMap<String, Value>,
     store: Option<Store>,
     attachment: Option<Mount>,
+    game_kernel: Option<crate::game_kernel::Binding>,
     catalogue: Option<Value>,
 }
 
@@ -396,7 +448,7 @@ impl Programme {
         for root in roots {
             visit(root, &definitions, grants, &mut BTreeSet::new(), &mut admitted)?;
         }
-        Ok(Self { steps: admitted, datasets: BTreeMap::new(), store: None, attachment: None, catalogue: None })
+        Ok(Self { steps: admitted, datasets: BTreeMap::new(), store: None, attachment: None, game_kernel: None, catalogue: None })
     }
 
     // Supplement admission's first error with an inventory of the declared
@@ -443,6 +495,8 @@ impl Programme {
 
     pub fn bind_attachment(&mut self, mount: Option<Mount>) { self.attachment = mount; }
 
+    pub fn bind_game_kernel(&mut self, binding: Option<crate::game_kernel::Binding>) { self.game_kernel = binding; }
+
     pub fn bind_store(&mut self, store: Store) {
         self.store = Some(store);
     }
@@ -460,39 +514,63 @@ impl Programme {
     fn invoke(&self, name: &str, input: Value, mut env: Env, meter: &mut Meter, depth: usize) -> Result<Value> {
         let steps = self.steps.get(name).ok_or_else(|| fail("missing-process"))?;
         env.insert("eventInput".to_owned(), Rc::new(input));
-        self.execute(steps, &mut env, meter, depth)?;
+        self.execute(steps, &mut env, meter, depth, name, &[])?;
         env.remove("result").map(Rc::unwrap_or_clone).ok_or_else(|| fail("missing result"))
     }
 
-    fn execute(&self, steps: &[Step], env: &mut Env, meter: &mut Meter, depth: usize) -> Result<()> {
+    fn execute(&self, steps: &[Step], env: &mut Env, meter: &mut Meter, depth: usize,
+        process: &str, parent: &[usize]) -> Result<()> {
         if depth > 96 { return Err(Box::new(RuntimeLimit("process depth limit"))); }
-        for step in steps {
+        let trace = meter.1.as_ref().filter(|trace| trace.borrow().processes.contains(process)).cloned();
+        for (offset, step) in steps.iter().enumerate() {
             meter.charge(1)?;
+            let address = if trace.is_some() {
+                let mut address = parent.to_vec();
+                address.push(offset);
+                address
+            } else { Vec::new() };
+            let nested = |lane| {
+                let mut path = address.clone();
+                if !path.is_empty() { path.push(lane); }
+                path
+            };
+            let record = |kind, data| {
+                if let Some(trace) = &trace { trace.borrow_mut().record(process, &address, kind, data); }
+            };
             match step {
                 Step::Let(name, expr) => { env.insert(name.clone(), Rc::new(value(expr, env, meter)?)); }
                 Step::Assert(expr, message) => {
-                    if !truth(&value(expr, env, meter)?) { return Err(fail(message)); }
+                    let checked = value(expr, env, meter);
+                    if trace.is_some() {
+                        record("assert", json!({"passed":checked.as_ref().is_ok_and(truth),"fault":checked.is_err()}));
+                    }
+                    if !truth(&checked?) { return Err(fail(message)); }
                 }
                 Step::When(expr, body) => {
-                    if truth(&value(expr, env, meter)?) { self.execute(body, env, meter, depth)?; }
+                    let checked = value(expr, env, meter);
+                    if trace.is_some() {
+                        record("when", json!({"taken":checked.as_ref().is_ok_and(truth),"fault":checked.is_err()}));
+                    }
+                    if truth(&checked?) { self.execute(body, env, meter, depth, process, &nested(2))?; }
                 }
                 Step::Call(name) => {
                     let steps = self.steps.get(name).ok_or_else(|| fail("missing-process"))?;
-                    self.execute(steps, env, meter, depth + 1)?;
+                    self.execute(steps, env, meter, depth + 1, name, &[])?;
                 }
                 Step::Each { items, item, body } => {
                     let values = value(items, env, meter)?;
                     for row in list(&values)? {
                         let mut local = env.clone();
                         local.insert(item.clone(), Rc::new(row.clone()));
-                        self.execute(body, &mut local, meter, depth)?;
+                        self.execute(body, &mut local, meter, depth, process, &nested(3))?;
                     }
                 }
                 Step::Try { body, error, catch } => {
-                    if let Err(fault) = self.execute(body, env, meter, depth) {
+                    if let Err(fault) = self.execute(body, env, meter, depth, process, &nested(1)) {
                         if fault.is::<RuntimeLimit>() { return Err(fault); }
                         env.insert(error.clone(), Rc::new(json!({"name":"Error","message":fault.to_string()})));
-                        self.execute(catch, env, meter, depth)?;
+                        if trace.is_some() { record("catch", json!({})); }
+                        self.execute(catch, env, meter, depth, process, &nested(3))?;
                     }
                 }
                 Step::Fold { items, item, accumulator, initial, body, yielded, into } => {
@@ -502,132 +580,185 @@ impl Programme {
                         let mut local = env.clone();
                         local.insert(item.clone(), Rc::new(row.clone()));
                         local.insert(accumulator.clone(), Rc::new(acc));
-                        self.execute(body, &mut local, meter, depth)?;
+                        self.execute(body, &mut local, meter, depth, process, &nested(5))?;
                         acc = value(yielded, &local, meter)?;
                     }
                     env.insert(into.clone(), Rc::new(acc));
                 }
                 Step::Port { name, args, into } => {
                     let args = value(args, env, meter)?;
-                    let result = match name.as_str() {
-                        "kernel.invoke" => self.invoke(text(&args["query"])?, args.get("input").cloned().unwrap_or(json!({})), env.clone(), meter, depth + 1)?,
-                        "attachment.verify" => json!(self.attachment.as_ref().is_some_and(|mount| mount.read(&args).is_ok())),
-                        "storage.snapshot" => self.storage()?.snapshot(args.get("revision"))?,
-                        "storage.operation" => self.storage()?.operation(&args["operationId"])?,
-                        "storage.cas" => self.storage()?.cas(&args)?,
-                        "storage.history" => self.storage()?.history()?,
-                        "rel.encode" => json!(rel::encode(&args["value"], text(&args["kind"])?)?),
-                        "rel.decode" => rel::decode(text(&args["text"])?, text(&args["kind"])?)?,
-                        "scalar.read" => rel::scalar(text(&args["text"])?)?,
-                        "scalar.quoteValue" => json!(rel::literal(&args["value"])?),
-                        "record.get" => args["record"].get(text(&args["key"])?).cloned().unwrap_or(Value::Null),
-                        "text.split" if args["pattern"] == r"\r?\n" => {
-                            let mut parts = text(&args["value"])?.split('\n').peekable();
-                            let mut result = Vec::new();
-                            while let Some(part) = parts.next() {
-                                result.push(if parts.peek().is_some() { part.strip_suffix('\r').unwrap_or(part) } else { part });
-                            }
-                            json!(result)
-                        }
-                        "source.catalogue" if args.as_object().is_some_and(Map::is_empty) =>
-                            self.catalogue.clone().ok_or_else(|| fail("missing source catalogue binding"))?,
-                        "source.observe" => {
-                            let source = text(&args["text"])?;
-                            if text(&args["file"])?.encode_utf16().count() > 4096 {
-                                return Err(fail("source identity length limit"));
-                            }
-                            let (_, expression) = authored_action(source, meter)?;
-                            json!({"sourceHash":rel::hash(source),"module":{
-                                "protocol":"temple/surface-process-module/1",
-                                "queries":{"run":[{"let":"result","value":expression}]}
-                            }})
-                        }
-                        "encounter.execute" => {
-                            if !args.as_object().is_some_and(|fields| fields.len() == 3)
-                                || args["entry"] != "run" || !args.as_object().is_some_and(|fields| fields.contains_key("input")) {
-                                return Err(fail("expected source, run entry and input"));
-                            }
-                            let (expression, _) = authored_action(text(&args["text"])?, meter)?;
-                            let locals = Env::from([("eventInput".to_owned(), Rc::new(args["input"].clone()))]);
-                            value(&expression, &locals, meter)?
-                        }
-                        "text.join" => json!(list(&args["values"])?.iter().map(join_part)
-                            .collect::<Vec<_>>().join(text(&args["separator"])?)),
-                        "text.replaceAll" => json!(text(&args["value"])?.replace(text(&args["search"])?, text(&args["replacement"])?)),
-                        "value.type" => json!(js_type(&args["value"])),
-                        "value.string" => json!(js_string(&args["value"])),
-                        "value.describe" => json!({"type":js_type(&args["value"]),
-                            "array":args["value"].is_array(),"null":args["value"].is_null(),
-                            "plain":args["value"].is_object() && !is_absent(&args["value"]),
-                            "finite":args["value"].is_number(),"dataOnly":true,"dense":true}),
-                        "record.put" => {
-                            let mut record = args["record"].as_object()
-                                .ok_or_else(|| fail("expected record"))?.clone();
-                            let key = text(&args["key"])?;
-                            if key.contains('\0') { return Err(fail("reserved record key")); }
-                            let value = args.get("value").ok_or_else(|| fail("missing record value"))?;
-                            record.insert(key.to_owned(), value.clone());
-                            Value::Object(record)
-                        }
-                        "digest.sha256" => json!(rel::hash(text(&args["text"])?)),
-                        "record.entries" => {
-                            let value = &args["value"];
-                            if let Some(items) = value.as_array() {
-                                json!(items.iter().enumerate().map(|(index, item)| json!([index.to_string(), item]))
-                                    .collect::<Vec<_>>())
-                            } else {
-                                let record = value.as_object().filter(|_| !is_absent(value))
-                                    .ok_or_else(|| fail("expected record"))?;
-                                Value::Array(record.iter().map(|(key, value)| json!([key, value])).collect())
-                            }
-                        }
-                        "application.data" => {
-                            let fields = args.as_object().ok_or_else(|| fail("expected data arguments"))?;
-                            let dataset = match fields.get("name") {
-                                None if fields.is_empty() => "",
-                                Some(name) if fields.len() == 1 => text(name)?,
-                                _ => return Err(fail("unsupported data arguments")),
-                            };
-                            self.datasets.get(dataset).cloned()
-                                .ok_or_else(|| fail(format!("unknown application dataset {dataset}")))?
-                        }
-                        "record.fromEntries" => {
-                            let mut result = Map::new();
-                            for entry in list(&args["entries"])? {
-                                let [key, value] = list(entry)? else { return Err(fail("expected pair")); };
-                                let key = text(key)?;
-                                if key.contains('\0') { return Err(fail("reserved record key")); }
-                                result.insert(key.to_owned(), value.clone());
-                            }
-                            Value::Object(result)
-                        }
-                        "text.lowerCase" => json!(text(&args["value"])?.to_lowercase()),
-                        "text.indexOf" => {
-                            let value = text(&args["value"])?;
-                            let index = value.find(text(&args["search"])?)
-                                .map(|offset| value[..offset].encode_utf16().count() as i64).unwrap_or(-1);
-                            json!(index)
-                        }
-                        "text.slice" => {
-                            let value = text(&args["value"])?;
-                            let start = index(&args["start"])?;
-                            let end = match args.get("end") {
-                                Some(end) => index(end)?,
-                                None => value.encode_utf16().count(),
-                            };
-                            let units: Vec<_> = value.encode_utf16().skip(start).take(end.saturating_sub(start)).collect();
-                            json!(String::from_utf16_lossy(&units))
-                        }
-                        "number.calculate" => calculate(text(&args["operation"])?, list(&args["values"])?)?,
-                        "text.trim" => json!(text(&args["value"])?.trim_matches(js_space)),
-                        "text.matches" => json!(bounded_match(text(&args["value"])?, text(&args["pattern"])?, args.get("flags").and_then(Value::as_str).unwrap_or(""))?),
-                        _ => return Err(fail(format!("unbound port {name}"))),
-                    };
+                    let result = self.execute_port(name, &args, env, meter, depth);
+                    if trace.is_some() {
+                        let output = result.as_ref().ok();
+                        record("port-end", json!({
+                            "port":name, "ok":result.is_ok(),
+                            "query":if name == "kernel.invoke" { args["query"].as_str() } else { None },
+                            "revision":if name == "storage.cas" { output.and_then(|v| v["revision"].as_u64()) } else { None },
+                            "status":if name == "game.kernel" {
+                                output.and_then(|v| v["status"].as_str()).filter(|status| matches!(*status, "accepted" | "rejected" | "failed"))
+                            } else { None }
+                        }));
+                    }
+                    let result = result?;
                     env.insert(into.clone(), Rc::new(result));
                 }
             }
         }
         Ok(())
+    }
+
+    fn execute_port(&self, name: &str, args: &Value, env: &Env, meter: &mut Meter, depth: usize) -> Result<Value> {
+        Ok(match name {
+            "execution.observe" => self.observe_execution(args, env, meter, depth)?,
+            "kernel.invoke" => self.invoke(text(&args["query"])?, args.get("input").cloned().unwrap_or(json!({})), env.clone(), meter, depth + 1)?,
+            "attachment.verify" => json!(self.attachment.as_ref().is_some_and(|mount| mount.read(args).is_ok())),
+            "game.kernel" => self.game_kernel.as_ref().ok_or_else(|| fail("missing game kernel binding"))?.run(args)?,
+            "json.parse" => {
+                let input = text(&args["text"])?;
+                if input.len() > 32_768 { return Err(fail("JSON input exceeds the port bound")); }
+                serde_json::from_str(input).map_err(|_| fail("Enter a valid JSON value."))?
+            }
+            "json.format" => json!(serde_json::to_string_pretty(&args["value"])?),
+            "text.split" if args["pattern"] == "/" => json!(text(&args["value"])?.split('/').collect::<Vec<_>>()),
+            "storage.snapshot" => self.storage()?.snapshot(args.get("revision"))?,
+            "storage.operation" => self.storage()?.operation(&args["operationId"])?,
+            "storage.cas" => self.storage()?.cas(args)?,
+            "storage.history" => self.storage()?.history()?,
+            "rel.encode" => json!(rel::encode(&args["value"], text(&args["kind"])?)?),
+            "rel.decode" => rel::decode(text(&args["text"])?, text(&args["kind"])?)?,
+            "scalar.read" => rel::scalar(text(&args["text"])?)?,
+            "scalar.quoteValue" => json!(rel::literal(&args["value"])?),
+            "record.get" => args["record"].get(text(&args["key"])?).cloned().unwrap_or(Value::Null),
+            "text.split" if args["pattern"] == r"\r?\n" => {
+                let mut parts = text(&args["value"])?.split('\n').peekable();
+                let mut result = Vec::new();
+                while let Some(part) = parts.next() {
+                    result.push(if parts.peek().is_some() { part.strip_suffix('\r').unwrap_or(part) } else { part });
+                }
+                json!(result)
+            }
+            "source.module" => {
+                let path = text(&args["file"])?;
+                let entries = self.catalogue.as_ref().ok_or_else(|| fail("missing admitted source binding"))?;
+                let entry = list(entries)?.iter().find(|entry| entry["path"] == path)
+                    .ok_or_else(|| fail("source is outside the admitted application"))?;
+                let text = text(&entry["text"])?;
+                json!({"text":text,"sha256":rel::hash(text)})
+            }
+            "source.catalogue" if args.as_object().is_some_and(Map::is_empty) =>
+                self.catalogue.clone().ok_or_else(|| fail("missing source catalogue binding"))?,
+            "source.observe" => {
+                let source = text(&args["text"])?;
+                if text(&args["file"])?.encode_utf16().count() > 4096 {
+                    return Err(fail("source identity length limit"));
+                }
+                let (_, expression) = authored_action(source, meter)?;
+                json!({"sourceHash":rel::hash(source),"module":{
+                    "protocol":"temple/surface-process-module/1",
+                    "queries":{"run":[{"let":"result","value":expression}]}
+                }})
+            }
+            "encounter.execute" => {
+                if !args.as_object().is_some_and(|fields| fields.len() == 3)
+                    || args["entry"] != "run" || !args.as_object().is_some_and(|fields| fields.contains_key("input")) {
+                    return Err(fail("expected source, run entry and input"));
+                }
+                let (expression, _) = authored_action(text(&args["text"])?, meter)?;
+                let locals = Env::from([("eventInput".to_owned(), Rc::new(args["input"].clone()))]);
+                value(&expression, &locals, meter)?
+            }
+            "text.join" => json!(list(&args["values"])?.iter().map(join_part)
+                .collect::<Vec<_>>().join(text(&args["separator"])?)),
+            "text.replaceAll" => json!(text(&args["value"])?.replace(text(&args["search"])?, text(&args["replacement"])?)),
+            "value.type" => json!(js_type(&args["value"])),
+            "value.string" => json!(js_string(&args["value"])),
+            "value.describe" => json!({"type":js_type(&args["value"]),
+                "array":args["value"].is_array(),"null":args["value"].is_null(),
+                "plain":args["value"].is_object() && !is_absent(&args["value"]),
+                "finite":args["value"].is_number(),"dataOnly":true,"dense":true}),
+            "record.put" => {
+                let mut record = args["record"].as_object()
+                    .ok_or_else(|| fail("expected record"))?.clone();
+                let key = text(&args["key"])?;
+                if key.contains('\0') { return Err(fail("reserved record key")); }
+                let value = args.get("value").ok_or_else(|| fail("missing record value"))?;
+                record.insert(key.to_owned(), value.clone());
+                Value::Object(record)
+            }
+            "digest.sha256" => json!(rel::hash(text(&args["text"])?)),
+            "signature.ed25519.verify" => json!(verify_ed25519(&args)?),
+            "record.entries" => {
+                let value = &args["value"];
+                if let Some(items) = value.as_array() {
+                    json!(items.iter().enumerate().map(|(index, item)| json!([index.to_string(), item]))
+                        .collect::<Vec<_>>())
+                } else {
+                    let record = value.as_object().filter(|_| !is_absent(value))
+                        .ok_or_else(|| fail("expected record"))?;
+                    Value::Array(record.iter().map(|(key, value)| json!([key, value])).collect())
+                }
+            }
+            "application.data" => {
+                let fields = args.as_object().ok_or_else(|| fail("expected data arguments"))?;
+                let dataset = match fields.get("name") {
+                    None if fields.is_empty() => "",
+                    Some(name) if fields.len() == 1 => text(name)?,
+                    _ => return Err(fail("unsupported data arguments")),
+                };
+                self.datasets.get(dataset).cloned()
+                    .ok_or_else(|| fail(format!("unknown application dataset {dataset}")))?
+            }
+            "record.fromEntries" => {
+                let mut result = Map::new();
+                for entry in list(&args["entries"])? {
+                    let [key, value] = list(entry)? else { return Err(fail("expected pair")); };
+                    let key = text(key)?;
+                    if key.contains('\0') { return Err(fail("reserved record key")); }
+                    result.insert(key.to_owned(), value.clone());
+                }
+                Value::Object(result)
+            }
+            "text.lowerCase" => json!(text(&args["value"])?.to_lowercase()),
+            "text.indexOf" => {
+                let value = text(&args["value"])?;
+                let index = value.find(text(&args["search"])?)
+                    .map(|offset| value[..offset].encode_utf16().count() as i64).unwrap_or(-1);
+                json!(index)
+            }
+            "text.slice" => {
+                let value = text(&args["value"])?;
+                let start = index(&args["start"])?;
+                let end = match args.get("end") {
+                    Some(end) => index(end)?,
+                    None => value.encode_utf16().count(),
+                };
+                let units: Vec<_> = value.encode_utf16().skip(start).take(end.saturating_sub(start)).collect();
+                json!(String::from_utf16_lossy(&units))
+            }
+            "number.calculate" => calculate(text(&args["operation"])?, list(&args["values"])?)?,
+            "text.trim" => json!(text(&args["value"])?.trim_matches(js_space)),
+            "text.matches" => json!(bounded_match(text(&args["value"])?, text(&args["pattern"])?, args.get("flags").and_then(Value::as_str).unwrap_or(""))?),
+            _ => return Err(fail(format!("unbound port {name}"))),
+        })
+    }
+
+    fn observe_execution(&self, args: &Value, env: &Env, meter: &mut Meter, depth: usize) -> Result<Value> {
+        let query = text(&args["query"])?;
+        let scope = list(&args["processes"])?;
+        if meter.1.is_some() || scope.is_empty() || scope.len() > 32 {
+            return Err(fail("invalid execution observation scope"));
+        }
+        let processes = scope.iter().map(|name| {
+            let name = text(name)?;
+            if !self.steps.contains_key(name) { return Err(fail("unknown observed process")); }
+            Ok(name.to_owned())
+        }).collect::<Result<BTreeSet<_>>>()?;
+        let trace = Rc::new(RefCell::new(ExecutionTrace { processes, ..ExecutionTrace::default() }));
+        meter.1 = Some(trace.clone());
+        let result = self.invoke(query, args.get("input").cloned().unwrap_or(Value::Null), env.clone(), meter, depth + 1);
+        meter.1 = None;
+        let trace = trace.borrow();
+        Ok(json!({"result":result?,"events":trace.events,"dropped":trace.dropped}))
     }
 }
 
@@ -816,6 +947,7 @@ fn bounded_match(value: &str, pattern: &str, flags: &str) -> Result<bool> {
             && chars.all(|b| b.is_ascii_alphanumeric() || b == b'-')),
         ("^[a-zA-Z_:][a-zA-Z0-9_:.-]*$", "") => return Ok(chars.next().is_some_and(|b| b.is_ascii_alphabetic() || b"_:".contains(&b))
             && chars.all(|b| b.is_ascii_alphanumeric() || b"_:.-".contains(&b))),
+        (r"^/[\s\S]{0,511}$", "") => return Ok(value.starts_with('/') && value.encode_utf16().count() <= 512),
         ("^[a-f0-9]{64}$", "") => return Ok(value.len() == 64
             && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))),
         (r"^https?://[^\s]+$", "") => {
@@ -988,5 +1120,47 @@ fn value(expr: &Expr, env: &Env, meter: &mut Meter) -> Result<Value> {
                 _ => Err(fail("unsupported expression")),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_observation_preserves_nested_addresses_and_effect_faults() -> Result<()> {
+        let source = r#"process-module "temple/surface-process-module/1"
+
+process observer:
+  port execution.observe { query = "command"; input = $eventInput; processes = list("command") } → result
+
+process command:
+  let result = "unchanged"
+  try:
+    when true:
+      port scalar.read { text = $eventInput } → result
+    when false:
+      assert false
+        otherwise "unreachable"
+  catch fault:
+    let result = "refused"
+"#;
+        let mut meter = Meter::new(20_000);
+        let programme = Programme::admit(&[source.to_owned()], "observer",
+            &BTreeSet::from(["execution.observe", "scalar.read"]), &mut meter)?;
+        let input = json!("not a scalar secret");
+        let observed = programme.run("observer", input.clone(), &mut meter)?;
+        assert_eq!(observed["result"], programme.run("command", input, &mut meter)?);
+        assert_eq!(observed["dropped"], 0);
+        assert_eq!(observed["events"], json!([
+            {"sequence":1, "process":"command", "address":[1,1,0], "kind":"when", "data":{"taken":true,"fault":false}},
+            {"sequence":2, "process":"command", "address":[1,1,0,2,0], "kind":"port-end",
+                "data":{"port":"scalar.read","ok":false,"query":null,"revision":null,"status":null}},
+            {"sequence":3, "process":"command", "address":[1], "kind":"catch", "data":{}}
+        ]));
+        let observed = programme.run("observer", json!("42"), &mut meter)?;
+        assert_eq!(observed["result"], 42);
+        assert_eq!(observed["events"][2]["data"]["taken"], false);
+        Ok(())
     }
 }

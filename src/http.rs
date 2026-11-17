@@ -135,9 +135,25 @@ pub fn send_headers(stream: &mut TcpStream, status: &str, content_type: &str, he
 }
 
 pub fn send_bytes(stream: &mut TcpStream, status: &str, content_type: &str, headers: &str, body: &[u8]) -> Result<()> {
+    send_bytes_with_images(stream, status, content_type, headers, body, false)
+}
+
+pub fn send_bytes_with_images(stream: &mut TcpStream, status: &str, content_type: &str, headers: &str, body: &[u8], images: bool) -> Result<()> {
+    send_page(stream, status, content_type, headers, body, images, false)
+}
+
+pub fn send_page(stream: &mut TcpStream, status: &str, content_type: &str, headers: &str, body: &[u8], images: bool, asset_preview: bool) -> Result<()> {
+    let media = if asset_preview {
+        " img-src 'self' blob: data:; script-src 'self'; connect-src 'self' blob:; worker-src 'self';"
+    } else if images { " img-src 'self';" } else { "" };
+    let policy = format!("default-src 'none';{media} style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'");
+    send_bytes_with_policy(stream, status, content_type, headers, body, &policy)
+}
+
+pub fn send_bytes_with_policy(stream: &mut TcpStream, status: &str, content_type: &str, headers: &str, body: &[u8], policy: &str) -> Result<()> {
     write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
         Connection: close\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n\
-        Content-Security-Policy: default-src 'none'; style-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n{headers}\r\n", body.len())?;
+        Content-Security-Policy: {policy}\r\n{headers}\r\n", body.len())?;
     stream.write_all(body)?;
     Ok(())
 }

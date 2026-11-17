@@ -3,7 +3,7 @@ use crate::{Result, fail, rel::Facts};
 use std::path::{Path, PathBuf};
 
 pub enum Launch {
-    Image { image: PathBuf, pin: String, store: PathBuf, port: u16, attachment_root: Option<PathBuf>, operators: Option<PathBuf> },
+    Image { image: PathBuf, pin: String, store: PathBuf, port: u16, attachment_root: Option<PathBuf>, operators: Option<PathBuf>, game_kernel: Option<(PathBuf, String)> },
     Workgarden { root: PathBuf, journal: PathBuf, port: u16 },
 }
 
@@ -18,7 +18,7 @@ impl Launch {
         }
         let mode = field("mode")?;
         let fields: &[&str] = match mode {
-            "image" => &["image", "sha256", "store", "attachmentRoot", "operators"],
+            "image" => &["image", "sha256", "store", "attachmentRoot", "operators", "gameKernel", "gameKernelSha256"],
             "workgarden-journal" => &["runtimeRoot", "journal"],
             _ => return Err(fail("unsupported launch configuration mode")),
         };
@@ -45,6 +45,11 @@ impl Launch {
             "image" => Ok(Self::Image {
                 image: path("image")?, pin: field("sha256")?.to_owned(), store: path("store")?, port,
                 attachment_root: optional_path("attachmentRoot")?, operators: optional_path("operators")?,
+                game_kernel: match (optional_path("gameKernel")?, facts.values("launch", "gameKernelSha256").as_slice()) {
+                    (None, []) => None,
+                    (Some(path), [pin]) => Some((path, pin.to_string())),
+                    _ => return Err(fail("expected paired gameKernel and gameKernelSha256")),
+                },
             }),
             _ => Ok(Self::Workgarden { root: path("runtimeRoot")?, journal: path("journal")?, port }),
         }

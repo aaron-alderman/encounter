@@ -3,7 +3,7 @@
 const { execFileSync, spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { once } = require('node:events');
-const { copyFile, mkdir, mkdtemp, readFile, rm, stat } = require('node:fs/promises');
+const { copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { createInterface } = require('node:readline');
@@ -115,9 +115,24 @@ async function run() {
       },
       'release.fileHash': ({ release, relative }) => hashFile(file(release, relative)),
       'release.version': ({ release }) => command(release, ['--version']),
-      'release.buildImage': ({ release, app, project, declaration }) => {
+      'release.buildImage': async ({ release, app, sourceImage, declaration }) => {
+        const contents = await readFile(file(sourceImage.file));
+        if (digest(contents) !== sourceImage.pin) throw Error('Historical source image differs from its pin.');
+        const image = decode(contents.toString('utf8'), 'EncounterApplicationImage');
+        if (image.declaration !== declaration || !Object.hasOwn(image.files, declaration)) {
+          throw Error('Historical source image selects a different declaration.');
+        }
+        const sourceRoot = file('baseline-source-' + app);
+        for (const [relative, source] of Object.entries(image.files)) {
+          if (!relative.split('/').every(part => /^[a-zA-Z0-9_.-]+$/.test(part) && part !== '.' && part !== '..')
+              || typeof source.text !== 'string' || digest(source.text) !== source.sha256) {
+            throw Error('Invalid historical source record: ' + relative);
+          }
+          const target = path.join(sourceRoot, relative);
+          await mkdir(path.dirname(target), { recursive: true });
+          await writeFile(target, source.text, { flag: 'wx' });
+        }
         const output = 'baseline-' + app + '.rel';
-        const sourceRoot = path.resolve(__dirname, '../..', project);
         return { file: output, pin: command(release, ['build', sourceRoot, declaration, file(output)]) };
       },
       'release.image': async ({ file: image }) => {

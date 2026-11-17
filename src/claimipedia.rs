@@ -12,6 +12,7 @@ pub fn serve(port: u16) -> Result<()> {
     if !application_root.canonicalize()?.starts_with(applications) {
         return Err(fail("application root outside workspace"));
     }
+    crate::package::check(&application_root)?;
     let app = Application::load(&application_root, web.one("web", "application")?)?;
     let page = Page::load(PROFILE, Some(app.release()?))?;
     // Resolve the catalogue before advertising a listener.

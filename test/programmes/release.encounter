@@ -55,7 +55,8 @@ process release.install:
     let app = $application.s
     let selected = null
     when and(eq($version, "0.1.1"), not(includes($originalApps, $app))):
-      port release.buildImage { release = $release; app = $app; project = $application.p; declaration = $application.o } → selected
+      let sourceImage = at($upgrade.images, $app)
+      port release.buildImage { release = $release; app = $app; sourceImage = $sourceImage; declaration = $application.o } → selected
     when not($selected):
       let relative = concat("images/", $app, ".rel")
       assert eq(at($fields, concat($app, "/image")), $relative)
@@ -548,19 +549,19 @@ process release.snapshot:
 process test.release:
   call release.catalogue
   let originalApps = list("workgarden", "claimipedia")
-  let release = "baseline"
-  call release.install
-  let baseline = $installed
   let release = "upgrade"
   call release.install
   let upgrade = $installed
+  let release = "baseline"
+  call release.install
+  let baseline = $installed
   assert and(not(eq($baseline.version, $upgrade.version)), not(eq($baseline.runtimePin, $upgrade.runtimePin)))
     otherwise "The rehearsal must compare distinct runtime binaries."
   let supplemental = add(count($apps), -2)
   when eq($baseline.version, "0.1.1"):
     port test.report { text = concat("0.1.1 baseline uses its two shipped images and ", $supplemental, " supplemental images built with its archived binary.") } → _
   let image = $baseline.images.workgarden
-  port release.cross { release = $release; image = $image; directory = "crossed" } → crossed
+  port release.cross { release = $upgrade.release; image = $image; directory = "crossed" } → crossed
   assert and(eq($crossed.status, 1), includes($crossed.error, "runtime pin differs"), eq($crossed.exists, false))
     otherwise "A crossed runtime/image pin must refuse before creating a store."
   port release.launch { width = 390; height = 844 } → _

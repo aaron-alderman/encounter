@@ -1,4 +1,4 @@
-use crate::{Result, fail, profile::Profile};
+use crate::{Result, fail, profile::Profile, workgarden_relation};
 use serde_json::{Value, json};
 use std::path::Path;
 use temple3::{commitment, federation, identity, journal::FileJournal, kernel};
@@ -23,7 +23,7 @@ fn utf16hex(text: &str) -> String {
     hex::encode(text.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<_>>())
 }
 
-// Bound of Temple3's workgarden-command-v1 relation.
+// Bound of the Workgarden proof relation.
 const CAPACITY: usize = 8;
 
 fn item_from_row(row: &Value) -> temple3::Result<Value> {
@@ -51,9 +51,9 @@ fn state_after(before: &Value, items: &[Value]) -> temple3::Result<Value> {
 }
 
 fn evaluate(temple: &Value, payload: &Value) -> temple3::Result<kernel::Transition> {
-    kernel::evaluate_transition(temple, &json!({
+    kernel::evaluate_transition_with_relations(temple, &json!({
         "identity":payload["actor"],"delta":payload["delta"],"context":payload["context"]
-    }))
+    }), workgarden_relation::resolve)
 }
 
 struct Head {
@@ -70,7 +70,7 @@ fn restore(genesis: &Value, records: &[Value]) -> temple3::Result<Head> {
     }
     // Temple3 authenticates the record chain and witnesses. Its replay API
     // returns a summary, so reapply verified accepts to obtain the full state.
-    let replay = identity::replay(&json!(records), &json!({"expectedTempleId":expected}))?;
+    let replay = identity::replay_with_relations(&json!(records), &json!({"expectedTempleId":expected}), workgarden_relation::resolve)?;
     for record in records.iter().filter(|record| {
         record["entry"]["receipt"]["purpose"] == "finalized-witness"
     }) {

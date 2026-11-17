@@ -3,18 +3,17 @@
 The Linux `encounter` executable builds pinned application images and serves
 them with SQLite stores. The release contains compiled images for all 13
 applications. The executable also runs the Workgarden Add command against a
-Temple3 journal through the CLI or browser. Cargo links the versioned Temple3
-library from the sibling research checkout. The independent JS host and Node
-test transports exercise the shared contracts.
+Temple3 journal through the CLI or browser. The journal adapter owns the
+Workgarden proof relation and uses a pinned Git dependency on Temple3 for
+admission and replay. The sibling research checkout supplies the independent
+JS verification model. The JS host and Node test transports exercise the
+shared contracts.
 
 ## Four small examples
 
 Build on Linux with Rust 1.85 or newer and SQLite development libraries.
-The Cargo manifest expects the Temple3 source checkout at
-`../../research/temple3` relative to the Encounter checkout. For example,
-place this repository under `applications/encounter` and Temple3 under
-`research/temple3` in the same workspace. The Temple3 source is a separate
-dependency. The examples use the Encounter executable after it is built.
+Cargo fetches the pinned Temple3 package on the first build. The examples
+use the Encounter executable after it is built.
 
 ```bash
 cargo build --locked --release
@@ -49,6 +48,15 @@ Stop the foreground instance before starting the supervised instance on
 the same port. `examples/smoke.sh "$encounter"` exercises stdout, CLI
 arguments and failures, the declared tests, and a pinned compiled web
 image on an ephemeral port.
+
+The CLI, hello and web example declarations are authored in
+`examples/*/application.loader.encounter`. In the shared development checkout,
+run these commands from this package to regenerate or check their loader REL.
+
+```bash
+node ../../encounter-platform/shared/node/loader-declarations.cjs --write examples/{cli,hello,web}/application.rel
+node ../../encounter-platform/shared/node/loader-declarations.cjs --check examples/{cli,hello,web}/application.rel
+```
 
 The remaining sections describe integration checks that use the wider
 development workspace, including the application collection and the
@@ -170,6 +178,33 @@ matches, follows a result to release history and verifies write refusal.
 The web projection has a separate pinned profile, so browser UI changes
 can be qualified independently of the command profile that anchors the journal.
 
+## Loader declarations
+
+The Workgarden profiles, Claimipedia web profile and release catalogue are
+authored in `*.loader.encounter` files next to their generated REL. From this
+package, regenerate or check all five projections with the shared tool.
+
+```bash
+node ../../encounter-platform/shared/node/loader-declarations.cjs --write \
+  profiles/{claimipedia-web,workgarden,workgarden-web,workgarden-covenant}.rel release-applications.rel
+node ../../encounter-platform/shared/node/loader-declarations.cjs --check \
+  profiles/{claimipedia-web,workgarden,workgarden-web,workgarden-covenant}.rel release-applications.rel
+```
+
+Standalone Authoring, Work Boards and Portfolio also keep their Encounter
+manifest beside each generated `application.rel`. From this runtime package,
+regenerate those manifests with the same tool.
+
+```bash
+node ../../encounter-platform/shared/node/loader-declarations.cjs --write \
+  ../{encounter,encounter-work-boards,encounter-portfolio}/bootstrap/application.rel \
+  ../encounter-{work-boards,portfolio}/products/*/application.rel
+```
+
+Use `--check` with the same paths to verify the projections. Release packaging
+checks these application manifests and the runtime declarations before building
+the images.
+
 ## Verification scope
 
 The differential, browser, release and transfer reconciliation programmes
@@ -218,12 +253,20 @@ and Claimipedia pilot profiles continue to use narrower entry sets.
 
 ## Package and verify a Linux release
 
-From this directory, with the aaron-dev Rust toolchain loaded:
+From this directory, with the aaron-dev Rust toolchain loaded, build the
+Encounter Core runtime and use it to package the current application sources:
 
 ```bash
-cargo build --locked --offline --release
-./package-release.sh 0.1.14 target/release/encounter ../../../builds/encounter-releases
+cargo build --locked --offline --release --manifest-path ../../encounter-core/Cargo.toml
+runtime=../../encounter-core/target/release/encounter
+"$runtime" package-release . 0.1.15 "$runtime" ../../../builds/encounter-releases
 ```
+
+The packager verifies loader projections, Authoring and Claimipedia guard
+locks, and the sources captured in their compiled images. Encounter writes
+the archive and checksum directly. For a separate release executable,
+supply its trusted build artifact SHA-256 as the final argument and use
+application sources compatible with that executable.
 
 The archive has a versioned directory, a Rust executable, compiled images for
 all 13 applications in `release-applications.rel`, and `release.rel` with their
@@ -236,15 +279,16 @@ With the browser profile loaded, run the existing workflows against a fresh
 archive extraction and disposable stores:
 
 ```bash
-cargo build --locked --offline --release --features test-faults --target-dir target/fault-tests
+cargo build --locked --offline --release --features test-faults --manifest-path ../../encounter-core/Cargo.toml --target-dir ../../encounter-core/target/fault-tests
 releases=../../../builds/encounter-releases
-test/release-workflows.sh "$releases/encounter-0.1.14-linux-x86_64.tar.gz" target/fault-tests/release/encounter
+test/release-workflows.sh "$releases/encounter-0.1.15-linux-x86_64.tar.gz" ../../encounter-core/target/fault-tests/release/encounter
 ```
 
 The browser transport starts the extracted executable with each packaged
-image and its manifest pin. Restarts reuse the same packaged image. The
-reconciliation scenario runs separately with the supplied fault-test binary
-and a matching image built for it.
+image and its manifest pin. Claimipedia's reader and temporary signing fixture
+use disposable images built by that executable for those test cases. Restarts
+reuse the selected image. The reconciliation scenario runs separately with the
+supplied fault-test binary and a matching image built for it.
 
 Run the 0.1.1 to 0.1.2 browser upgrade check for all 13 applications:
 
@@ -254,9 +298,10 @@ node test/release.cjs "$releases/encounter-0.1.1-linux-x86_64.tar.gz" "$releases
 ```
 
 The 0.1.1 archive supplies the Workgarden and Claimipedia images. Its archived
-executable builds the other 11 baseline images from the application source in
-the workspace into a temporary directory. The test checks that each app has
-the same source basis and compiled programme in both versions, and uses the
+executable builds the other 11 baseline images from the source records captured
+in the verified 0.1.2 images. The test verifies each captured source hash
+before rebuilding it in a temporary directory. It checks that each app has the
+same source basis and compiled programme in both versions, and uses the
 matching runtime-pinned image at each step.
 
 Each baseline store is populated through the browser. The test shuts down the
@@ -411,8 +456,8 @@ target/release/encounter serve --image "$workspace/workgarden.rel" "$pin" \
   "$workspace/store" 24211
 ```
 
-For Claimipedia, use package root `../encounter-claimipedia` and declaration
-`products/claimipedia/application.rel`. Use a separate store directory.
+For Claimipedia, use the [guarded release command](../encounter-libraries/guards/README.md)
+with the `claimipedia` profile. Use a separate store directory.
 Build parses, links and admits the declared entries from Encounter source.
 The version 2 REL image contains the resulting instruction programme, the
 declaration, source, datasets and any declared source catalogue. Builds from

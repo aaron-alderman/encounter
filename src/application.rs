@@ -51,6 +51,9 @@ pub(crate) fn validate_path(relative: &str, extension: &str) -> Result<()> {
 fn read_disk(root: &Path, relative: &str, extension: &str, limit: usize) -> Result<(PathBuf, String)> {
     validate_path(relative, extension)?;
     let path = contained(root, relative)?;
+    if path.extension() != Path::new(relative).extension() {
+        return Err(fail("declared path extension differs from the resolved file"));
+    }
     if fs::metadata(&path)?.len() > limit as u64 {
         return Err(fail(format!("application file size limit at {relative}")));
     }
@@ -215,7 +218,7 @@ impl Application {
     }
 
     pub(crate) fn bind_data(&self, programme: &mut Programme) {
-        if self.grants.contains("source.catalogue") {
+        if self.grants.contains("source.catalogue") || self.grants.contains("source.module") {
             programme.bind_catalogue(self.catalogue.clone());
         }
         for (name, dataset) in &self.datasets {
@@ -248,11 +251,11 @@ impl Application {
         let missing = grants.iter().copied().filter(|name| !supports_port(name)).collect::<Vec<_>>();
         let restricted = grants.iter().filter_map(|name| {
             let limit = match *name {
-                "text.matches" => "bounded text lengths, HTML, Timesheet, identifiers, hex tokens and HTTP URL patterns only",
+                "text.matches" => "bounded text lengths, HTML, Timesheet, identifiers, hex tokens, JSON Pointers and HTTP URL patterns only",
                 "number.calculate" => "divide, subtract, remainder, multiply, round, floor, min, max and ordered comparisons only",
                 "text.slice" => "nonnegative indices only",
                 "source.observe" | "encounter.execute" => "one pure scalar expression with entry run",
-                "text.split" => "LF and CRLF pattern only",
+                "text.split" => "LF/CRLF and literal slash patterns only",
                 _ => return None,
             };
             Some(json!({"port":name,"limit":limit}))

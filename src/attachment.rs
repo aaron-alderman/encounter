@@ -6,18 +6,42 @@ use std::{fs::OpenOptions, io::Read, os::unix::fs::OpenOptionsExt, path::{Path, 
 const LIMIT: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone)]
-pub struct Mount(PathBuf);
+pub struct Mount {
+    root: PathBuf,
+    downloads: bool,
+}
 
 pub struct Attachment {
     pub body: Vec<u8>,
     pub disposition: String,
 }
 
+impl Attachment {
+    pub fn image_type(&self) -> Option<&'static str> {
+        if self.body.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some("image/png")
+        } else if self.body.starts_with(b"\xff\xd8\xff") {
+            Some("image/jpeg")
+        } else {
+            None
+        }
+    }
+}
+
 impl Mount {
     pub fn open(root: &Path) -> Result<Self> {
         let root = root.canonicalize()?;
         if !root.is_dir() { return Err(fail("attachment root must be a directory")); }
-        Ok(Self(root))
+        crate::package::check(&root)?;
+        Ok(Self { root, downloads: false })
+    }
+
+    // Download data lives in a mutable kernel store, outside the application
+    // package. Only pinned GLB outputs can leave this mount.
+    pub fn game_downloads(root: &Path) -> Result<Self> {
+        let root = root.canonicalize()?;
+        if !root.is_dir() { return Err(fail("game downloads root must be a directory")); }
+        Ok(Self { root, downloads: true })
     }
 
     pub fn read(&self, descriptor: &Value) -> Result<Attachment> {
@@ -32,7 +56,11 @@ impl Mount {
         {
             return Err(fail("invalid attachment path"));
         }
-        let file = self.0.join(path);
+        let file = self.root.join(path);
+        if self.downloads && file.extension().and_then(|ext| ext.to_str()) != Some("glb") {
+            return Err(fail("game downloads must be GLB"));
+        }
+        crate::package::check_path(&file)?;
         if file.canonicalize()? != file { return Err(fail("attachment path changed")); }
         let opened = OpenOptions::new().read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(file)?;
@@ -42,6 +70,9 @@ impl Mount {
         opened.take(size + 1).read_to_end(&mut body)?;
         if body.len() as u64 != size || rel::hash(&body) != pin {
             return Err(fail("attachment bytes differ from the declared pin"));
+        }
+        if self.downloads && !body.starts_with(b"glTF") {
+            return Err(fail("invalid GLB download"));
         }
         let name = path.rsplit('/').next().unwrap_or_default();
         let mut disposition = String::from("attachment; filename*=UTF-8''");

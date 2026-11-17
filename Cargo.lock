@@ -129,6 +129,7 @@ dependencies = [
 name = "encounter"
 version = "0.1.14"
 dependencies = [
+ "ed25519-dalek",
  "getrandom",
  "hex",
  "libc",
@@ -372,6 +373,7 @@ dependencies = [
 [[package]]
 name = "temple3"
 version = "0.1.0"
+source = "git+https://github.com/aaron-alderman/temple3.git?rev=f0be50d2099f2424fa45f0d8a6fe2c8a24ab7169#f0be50d2099f2424fa45f0d8a6fe2c8a24ab7169"
 dependencies = [
  "ed25519-dalek",
  "hex",

@@ -1,9 +1,11 @@
 mod application;
+mod package;
 mod attachment;
 mod claimipedia;
 mod command;
 mod declared_web;
 mod http;
+mod game_kernel;
 mod image;
 mod launch;
 mod operator;
@@ -14,6 +16,7 @@ mod sqlite;
 mod store;
 mod verification;
 mod workgarden;
+mod workgarden_relation;
 mod web;
 
 use launch::Launch;
@@ -25,8 +28,8 @@ fn fail(message: impl Into<String>) -> Box<dyn std::error::Error> { message.into
 
 fn execute_config(file: &Path, args: &[String]) -> Result<ExitCode> {
     match (Launch::read(file)?, args) {
-        (Launch::Image { image, pin, store, port, attachment_root, operators }, [command]) if command == "serve" =>
-            declared_web::serve_image(image::load(&image, &pin)?, &store, port, attachment_root.as_deref(), operators.as_deref())?,
+        (Launch::Image { image, pin, store, port, attachment_root, operators, game_kernel }, [command]) if command == "serve" =>
+            declared_web::serve_image(image::load(&image, &pin)?, &store, port, attachment_root.as_deref(), operators.as_deref(), game_kernel)?,
         (Launch::Workgarden { root, journal, port }, [command]) if command == "serve" =>
             web::serve_in(&root, &journal, port)?,
         (Launch::Workgarden { root, journal, .. }, [command, basis, operation, title]) if command == "run" =>
@@ -70,7 +73,7 @@ fn execute(args: &[String]) -> Result<ExitCode> {
         }
         [command, flag, file, pin, directory, port]
             if command == "serve" && flag == "--image" =>
-            declared_web::serve_image(image::load(Path::new(file), pin)?, Path::new(directory), port.parse()?, None, None)
+            declared_web::serve_image(image::load(Path::new(file), pin)?, Path::new(directory), port.parse()?, None, None, None)
                 .map(|_| ExitCode::SUCCESS),
         [command, flag, root, declaration, directory, port]
             if command == "serve" && flag == "--declaration" =>
@@ -78,12 +81,14 @@ fn execute(args: &[String]) -> Result<ExitCode> {
                 .map(|_| ExitCode::SUCCESS),
         [command, journal] if command == "serve" => web::serve(Path::new(journal), 4187).map(|_| ExitCode::SUCCESS),
         [command, journal, port] if command == "serve" => web::serve(Path::new(journal), port.parse()?).map(|_| ExitCode::SUCCESS),
+        [command, root] if command == "check-package" =>
+            package::check(Path::new(root)).map(|_| ExitCode::SUCCESS),
         [command, root, declaration] if command == "check" => {
             let admitted = application::Application::load(Path::new(root), declaration)?.check()?;
             Ok(if admitted { ExitCode::SUCCESS } else { ExitCode::from(2) })
         }
         [command] if command == "test" => verification::run(&profile::root()).map(|_| ExitCode::SUCCESS),
-        _ => Err(fail("usage: encounter --version | encounter --config FILE COMMAND | encounter run --declaration APP_ROOT DECLARATION [ARG ...] | encounter test --declaration APP_ROOT DECLARATION | encounter run JOURNAL BASIS OPERATION TITLE | encounter serve JOURNAL [PORT] | encounter serve --app claimipedia [PORT] | encounter serve --declaration APP_ROOT DECLARATION STORE PORT | encounter build APP_ROOT DECLARATION OUTPUT | encounter serve --image IMAGE SHA256 STORE PORT | encounter check APP_ROOT DECLARATION | encounter test")),
+        _ => Err(fail("usage: encounter --version | encounter --config FILE COMMAND | encounter run --declaration APP_ROOT DECLARATION [ARG ...] | encounter test --declaration APP_ROOT DECLARATION | encounter run JOURNAL BASIS OPERATION TITLE | encounter serve JOURNAL [PORT] | encounter serve --app claimipedia [PORT] | encounter serve --declaration APP_ROOT DECLARATION STORE PORT | encounter build APP_ROOT DECLARATION OUTPUT | encounter serve --image IMAGE SHA256 STORE PORT | encounter check-package PACKAGE_DIRECTORY | encounter check APP_ROOT DECLARATION | encounter test")),
     }
 }
 
