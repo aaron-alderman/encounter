@@ -217,7 +217,7 @@ fn serve_with_history(app: &Path, socket: &Path, history: impl Fn(&Mailbox) -> R
 #[cfg(test)]
 #[test]
 fn native_mailbox_preserves_warning_delta_and_read_marker() -> Result<()> {
-    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects").canonicalize()?;
+    let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects").canonicalize()?;
     let mailbox = Mailbox::load(&app)?;
     let now = u64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_micros())?;
     let run = |stamp, open| json!({"stamp":stamp,"capacity":false,"release":"fixture","confirmation":null,

@@ -283,9 +283,8 @@ mod tests {
             write_stage(&legacy.join("google.env"), OLD_ENV, uid, gid, 0o640)?;
             write_stage(&legacy.join("client-secret"), SECRET, uid, gid, 0o640)?;
             write_stage(&unit, OLD_UNIT, uid, gid, 0o644)?;
-            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../game-migration/sourcery-platform/deployment/hosted/sourcery-google-identity.service");
-            write_stage(&release_unit, &fs::read(source)?, uid, gid, 0o644)?;
+            let source = include_bytes!("../tests/fixtures/sourcery-google-identity.service");
+            write_stage(&release_unit, source, uid, gid, 0o644)?;
             Ok(Self { _scratch: scratch, legacy, canonical, unit, release_unit, uid, gid })
         }
 

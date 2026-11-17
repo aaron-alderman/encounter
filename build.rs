@@ -27,6 +27,10 @@ fn main() {
         PLATFORM_SOURCES.iter().all(|(_, file)| root.join(file).is_file())
     }).expect("Set ENCOUNTER_PLATFORM_ROOT to an Encounter Platform checkout containing the AppDev sources");
 
+    let source_root = path::absolute(&applications).expect("absolute Platform applications path");
+    let source_root = source_root.to_str().expect("UTF-8 Platform applications path");
+    println!("cargo:rustc-env=ENCOUNTER_APPDEV_SOURCE={source_root}");
+
     for (key, file) in PLATFORM_SOURCES {
         let source = path::absolute(applications.join(file)).expect("absolute Platform source path");
         let source = source.to_str().expect("UTF-8 Platform source path");

@@ -3,7 +3,7 @@ use super::{Path, Result, Value, json};
 #[test]
 fn synthetic_sign_in_preserves_only_the_declared_return_route() -> Result<()> {
     use crate::command::Evaluator;
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects");
+    let root = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects");
     let workflow = Evaluator::load(&root, "release/workflow.rel")?;
     let route = |path, query| workflow.run("previewBroker.route", json!({
         "localHost":true, "method":"GET", "path":path, "query":query, "account":null

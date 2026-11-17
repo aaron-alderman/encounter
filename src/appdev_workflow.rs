@@ -1506,7 +1506,7 @@ mod tests {
 
     #[test]
     fn activation_readiness_uses_the_selected_release_plan() -> Result<()> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects/release");
+        let root = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects/release");
         let policy = command::Evaluator::load(&root, "activation.rel")?;
         let home = system_steps(&policy, false)?;
         let system = system_steps(&policy, true)?;
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[test]
     fn activation_binds_services_to_the_shared_native_launcher() -> Result<()> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects/release");
+        let root = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects/release");
         let policy = command::Evaluator::load(&root, "activation.rel")?;
         let bindings = policy.run("release.unitBindings", Value::Null)?;
         let unit = |binding: &Value, observed: Value, needs_standalone: bool| policy.run("release.unitFollows", json!({
@@ -1606,7 +1606,7 @@ mod tests {
 
     #[test]
     fn package_pins_require_the_exact_bundled_work_and_catalogue() -> Result<()> {
-        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects");
+        let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects");
         let workflow = command::Evaluator::load(&app, "release/workflow.rel")?;
         let candidate = Scratch::create(&env::temp_dir(), "appdev-package-pins-")?;
         let home = candidate.path();
@@ -1802,7 +1802,7 @@ mod tests {
 
     #[test]
     fn system_plan_requires_registry_performance_as_final_gate() -> Result<()> {
-        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects");
+        let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects");
         let workflow = command::Evaluator::load(&app, "release/workflow.rel")?;
         let mut facts = Facts::read(&app.join("release/plan.rel"))?;
         let selected = plan(&workflow, &facts, "check-system", false)?;
@@ -1967,7 +1967,7 @@ mod tests {
 
     #[test]
     fn system_switch_restores_previous_release_on_reconcile_failure() -> Result<()> {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects/release");
+        let root = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects/release");
         let policy = command::Evaluator::load(&root, "activation.rel")?;
         let plans = [system_steps(&policy, false)?, system_steps(&policy, true)?];
         let scratch = Scratch::create(&env::temp_dir(), "appdev-system-switch-test-")?;

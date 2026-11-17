@@ -118,7 +118,7 @@ fn sweep_journal_projects_channels_in_invocation_order() -> Result<()> {
         entry["index"] = json!(index);
         entry
     }).collect::<Vec<_>>();
-    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects");
+    let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects");
     let policy = evaluator(&app.canonicalize()?)?;
     assert_eq!(project_sweep_history(&policy, entries.clone(), Some(true))?, [json!({"stamp":20,"release":"expected",
         "confirmation":null,"samples":latest["samples"]})]);
@@ -242,7 +242,7 @@ Path({}).write_text("usage_usec 1201\n")
 print("[]")
 "#, json!(release), json!(release.join("encounter")), json!(cpu)))?;
 
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects").canonicalize()?;
+    let source = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects").canonicalize()?;
     let policy = evaluator(&source)?;
     let mut supervisor = Supervisor::new();
     let run_probe = |release: &Path| capacity_observation(&app, release, &group);
@@ -311,7 +311,7 @@ fn index_memory() -> Vec<Value> {
 #[cfg(test)]
 #[test]
 fn launch_memory_samples_require_active_stable_services() -> Result<()> {
-    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects").canonicalize()?;
+    let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects").canonicalize()?;
     let policy = evaluator(&app)?;
     let sample = |reader_state: &str| json!({"pids":[10,20],"bytes":[100,200],"states":["active",reader_state]});
     let report = |samples| -> Result<Value> {
@@ -479,7 +479,7 @@ fn launch_sweep_discards_observations_on_release_switch() -> Result<()> {
         symlink(release, &link)?;
         Ok(fs::rename(link, &active)?)
     };
-    let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects").canonicalize()?;
+    let app = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects").canonicalize()?;
     let policy = evaluator(&app)?;
     let driver = "/usr/local/libexec/sourcery-appdev-activate-system";
     let work = |bundled, browser, gateway| policy.run("launch.work", json!({
@@ -519,7 +519,7 @@ assert.deepEqual(process.argv.slice(2), ['--summary', {}]);
 console.log(JSON.stringify({{scope:'fixture', passed:true}}));
 "#, json!(release)))?;
 
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects").canonicalize()?;
+    let source = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects").canonicalize()?;
     let policy = evaluator(&source)?;
     let plan = policy.run("launch.probes", Value::Null)?;
     let fixture = plan.as_array().and_then(|probes| probes.iter().find(|probe| probe["probe"] == "fixture"))
@@ -569,7 +569,7 @@ fn registry_gate_binds_probe_output_to_work_evidence() -> Result<()> {
     let routes = verification.join("workspace-routes");
     fs::create_dir_all(&performance)?;
     fs::create_dir_all(&routes)?;
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("../applications/appdev-projects/verification/performance");
+    let source = Path::new(env!("ENCOUNTER_APPDEV_SOURCE")).join("appdev-projects/verification/performance");
     for name in ["measurements.rel", "measurements.encounter", "capacity-sweep.encounter", "launch-sweep.encounter",
         "mailbox-model.encounter", "performance-checks.rel"] {
         fs::copy(source.join(name), performance.join(name))?;
